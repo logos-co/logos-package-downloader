@@ -19,6 +19,10 @@ static char* to_c_string(const std::string& s) {
     return result;
 }
 
+static std::string safe_tag(const char* release_tag) {
+    return release_tag ? release_tag : "";
+}
+
 struct lgpd_context_opaque {
     PackageDownloaderLib lib;
 };
@@ -33,26 +37,27 @@ void lgpd_free(lgpd_context_t ctx) {
     delete ctx;
 }
 
-void lgpd_set_release(lgpd_context_t ctx, const char* release_tag) {
-    if (ctx && release_tag) ctx->lib.setRelease(release_tag);
-}
-
-char* lgpd_get_packages(lgpd_context_t ctx) {
+char* lgpd_get_packages(lgpd_context_t ctx, const char* release_tag) {
     if (!ctx) { set_error("Invalid context"); return nullptr; }
-    return to_c_string(ctx->lib.getPackages());
+    return to_c_string(ctx->lib.getPackages(safe_tag(release_tag)));
 }
 
-char* lgpd_get_packages_by_category(lgpd_context_t ctx, const char* category) {
+char* lgpd_get_packages_by_category(lgpd_context_t ctx, const char* release_tag, const char* category) {
     if (!ctx) { set_error("Invalid context"); return nullptr; }
-    return to_c_string(ctx->lib.getPackages(category ? category : ""));
+    return to_c_string(ctx->lib.getPackages(safe_tag(release_tag), category ? category : ""));
 }
 
-char* lgpd_get_categories(lgpd_context_t ctx) {
+char* lgpd_get_categories(lgpd_context_t ctx, const char* release_tag) {
     if (!ctx) { set_error("Invalid context"); return nullptr; }
-    return to_c_string(ctx->lib.getCategories());
+    return to_c_string(ctx->lib.getCategories(safe_tag(release_tag)));
 }
 
-char* lgpd_resolve_dependencies(lgpd_context_t ctx, const char** names, size_t count) {
+char* lgpd_get_releases(lgpd_context_t ctx) {
+    if (!ctx) { set_error("Invalid context"); return nullptr; }
+    return to_c_string(ctx->lib.getReleases());
+}
+
+char* lgpd_resolve_dependencies(lgpd_context_t ctx, const char* release_tag, const char** names, size_t count) {
     if (!ctx) { set_error("Invalid context"); return nullptr; }
 
     std::vector<std::string> nameVec;
@@ -60,13 +65,13 @@ char* lgpd_resolve_dependencies(lgpd_context_t ctx, const char** names, size_t c
         if (names[i]) nameVec.push_back(names[i]);
     }
 
-    return to_c_string(ctx->lib.resolveDependencies(nameVec));
+    return to_c_string(ctx->lib.resolveDependencies(safe_tag(release_tag), nameVec));
 }
 
-char* lgpd_download_package(lgpd_context_t ctx, const char* name) {
+char* lgpd_download_package(lgpd_context_t ctx, const char* release_tag, const char* name) {
     if (!ctx || !name) { set_error("Invalid arguments"); return nullptr; }
 
-    std::string result = ctx->lib.downloadPackage(name);
+    std::string result = ctx->lib.downloadPackage(safe_tag(release_tag), name);
     if (result.empty()) {
         set_error("Failed to download package: " + std::string(name));
         return nullptr;

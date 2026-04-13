@@ -9,30 +9,30 @@ public:
     PackageDownloaderLib();
     ~PackageDownloaderLib();
 
-    // Release tag (defaults to "latest")
-    void setRelease(const std::string& releaseTag);
-    std::string release() const { return m_releaseTag; }
-
     // Package catalog (returns JSON strings)
-    std::string getPackages();
-    std::string getPackages(const std::string& category);
-    std::string getCategories();
+    // releaseTag: GitHub release tag; empty string resolves to "latest"
+    std::string getPackages(const std::string& releaseTag);
+    std::string getPackages(const std::string& releaseTag, const std::string& category);
+    std::string getCategories(const std::string& releaseTag);
+
+    // GitHub releases (returns JSON array string of releases, up to 30 most recent)
+    // Each entry: { tag_name, name, published_at, prerelease, html_url }
+    std::string getReleases();
 
     // Dependency resolution (returns JSON array string of resolved names)
-    std::string resolveDependencies(const std::vector<std::string>& packageNames);
+    std::string resolveDependencies(const std::string& releaseTag, const std::vector<std::string>& packageNames);
 
     // Download (synchronous)
     // Returns path to downloaded file, or empty string on error
     // If outputDir is non-empty, downloads to that directory; otherwise uses system temp dir
-    std::string downloadPackage(const std::string& packageName);
-    std::string downloadPackage(const std::string& packageName, const std::string& outputDir);
+    std::string downloadPackage(const std::string& releaseTag, const std::string& packageName);
+    std::string downloadPackage(const std::string& releaseTag, const std::string& packageName, const std::string& outputDir);
     bool downloadFile(const std::string& url, const std::string& destinationPath);
 
 private:
-    std::string m_releaseTag;
-
-    std::string downloadBaseUrl() const;
-    std::string fetchPackageListFromOnline();
+    static std::string resolveTag(const std::string& releaseTag);
+    static std::string downloadBaseUrl(const std::string& releaseTag);
+    std::string fetchPackageListFromOnline(const std::string& releaseTag);
 
     std::string findPackageByName(const std::string& packagesJson, const std::string& packageName);
     std::string filterPackagesByCategory(const std::string& packagesJson, const std::string& category);
@@ -42,4 +42,6 @@ private:
 
     // HTTP helper (uses libcurl)
     bool httpGet(const std::string& url, std::string& responseBody);
+    bool httpGet(const std::string& url, std::string& responseBody,
+                 const std::vector<std::string>& extraHeaders);
 };

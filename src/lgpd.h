@@ -44,27 +44,30 @@ typedef struct {
 LGPD_EXPORT lgpd_context_t lgpd_create(void);
 LGPD_EXPORT void lgpd_free(lgpd_context_t ctx);
 
-/* Configuration */
-LGPD_EXPORT void lgpd_set_release(lgpd_context_t ctx, const char* release_tag);
-
 /**
  * Get package catalog (returns JSON array string, caller frees with lgpd_free_string).
+ * release_tag: GitHub release tag; NULL or empty string resolves to "latest".
  */
-LGPD_EXPORT char* lgpd_get_packages(lgpd_context_t ctx);
-LGPD_EXPORT char* lgpd_get_packages_by_category(lgpd_context_t ctx, const char* category);
-LGPD_EXPORT char* lgpd_get_categories(lgpd_context_t ctx);
+LGPD_EXPORT char* lgpd_get_packages(lgpd_context_t ctx, const char* release_tag);
+LGPD_EXPORT char* lgpd_get_packages_by_category(lgpd_context_t ctx, const char* release_tag, const char* category);
+LGPD_EXPORT char* lgpd_get_categories(lgpd_context_t ctx, const char* release_tag);
+
+/**
+ * Get list of GitHub releases (returns JSON array string, caller frees with lgpd_free_string).
+ */
+LGPD_EXPORT char* lgpd_get_releases(lgpd_context_t ctx);
 
 /**
  * Resolve dependencies for the given package names.
  * Returns JSON array string of resolved names (caller frees with lgpd_free_string).
  */
-LGPD_EXPORT char* lgpd_resolve_dependencies(lgpd_context_t ctx, const char** names, size_t count);
+LGPD_EXPORT char* lgpd_resolve_dependencies(lgpd_context_t ctx, const char* release_tag, const char** names, size_t count);
 
 /**
  * Download a package by name. Returns path to downloaded file (caller frees with lgpd_free_string),
  * or NULL on error.
  */
-LGPD_EXPORT char* lgpd_download_package(lgpd_context_t ctx, const char* name);
+LGPD_EXPORT char* lgpd_download_package(lgpd_context_t ctx, const char* release_tag, const char* name);
 
 /**
  * Download a file from URL to destination path.
