@@ -11,6 +11,7 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 static const std::string MODULES_REPO_BASE = "https://github.com/logos-co/logos-modules/releases";
+static const std::string MODULES_REPO_API_RELEASES = "https://api.github.com/repos/logos-co/logos-modules/releases";
 
 // libcurl write callback
 static size_t curlWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
@@ -20,7 +21,6 @@ static size_t curlWriteCallback(void* contents, size_t size, size_t nmemb, void*
 }
 
 PackageDownloaderLib::PackageDownloaderLib()
-    : m_releaseTag("latest")
 {
 }
 
@@ -28,20 +28,27 @@ PackageDownloaderLib::~PackageDownloaderLib()
 {
 }
 
-void PackageDownloaderLib::setRelease(const std::string& releaseTag)
+std::string PackageDownloaderLib::resolveTag(const std::string& releaseTag)
 {
-    m_releaseTag = releaseTag.empty() ? "latest" : releaseTag;
+    return releaseTag.empty() ? "latest" : releaseTag;
 }
 
-std::string PackageDownloaderLib::downloadBaseUrl() const
+std::string PackageDownloaderLib::downloadBaseUrl(const std::string& releaseTag)
 {
-    if (m_releaseTag == "latest") {
+    std::string tag = resolveTag(releaseTag);
+    if (tag == "latest") {
         return MODULES_REPO_BASE + "/latest/download";
     }
-    return MODULES_REPO_BASE + "/download/" + m_releaseTag;
+    return MODULES_REPO_BASE + "/download/" + tag;
 }
 
 bool PackageDownloaderLib::httpGet(const std::string& url, std::string& responseBody)
+{
+    return httpGet(url, responseBody, {});
+}
+
+bool PackageDownloaderLib::httpGet(const std::string& url, std::string& responseBody,
+                                   const std::vector<std::string>& extraHeaders)
 {
     CURL* curl = curl_easy_init();
     if (!curl) return false;
@@ -54,17 +61,26 @@ bool PackageDownloaderLib::httpGet(const std::string& url, std::string& response
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "lgpd/1.0");
 
+    struct curl_slist* headerList = nullptr;
+    for (const auto& h : extraHeaders) {
+        headerList = curl_slist_append(headerList, h.c_str());
+    }
+    if (headerList) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+    }
+
     CURLcode res = curl_easy_perform(curl);
     long httpCode = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     curl_easy_cleanup(curl);
+    if (headerList) curl_slist_free_all(headerList);
 
     return res == CURLE_OK && httpCode >= 200 && httpCode < 300;
 }
 
-std::string PackageDownloaderLib::fetchPackageListFromOnline()
+std::string PackageDownloaderLib::fetchPackageListFromOnline(const std::string& releaseTag)
 {
-    std::string url = downloadBaseUrl() + "/list.json";
+    std::string url = downloadBaseUrl(releaseTag) + "/list.json";
     std::string body;
 
     if (!httpGet(url, body)) {
@@ -81,9 +97,9 @@ std::string PackageDownloaderLib::fetchPackageListFromOnline()
     }
 }
 
-std::string PackageDownloaderLib::getPackages()
+std::string PackageDownloaderLib::getPackages(const std::string& releaseTag)
 {
-    std::string rawJson = fetchPackageListFromOnline();
+    std::string rawJson = fetchPackageListFromOnline(releaseTag);
     json onlinePackages;
     try {
         onlinePackages = json::parse(rawJson);
@@ -108,15 +124,16 @@ std::string PackageDownloaderLib::getPackages()
         resultPackage["dependencies"] = packageObj.value("dependencies", json::array());
         resultPackage["package"] = packageFile;
         resultPackage["variants"] = packageObj.value("variants", json::array());
+        resultPackage["manifest"] = packageObj.value("manifest", json::object());
         packagesArray.push_back(resultPackage);
     }
 
     return packagesArray.dump();
 }
 
-std::string PackageDownloaderLib::getPackages(const std::string& category)
+std::string PackageDownloaderLib::getPackages(const std::string& releaseTag, const std::string& category)
 {
-    std::string allPackages = getPackages();
+    std::string allPackages = getPackages(releaseTag);
 
     if (category.empty()) return allPackages;
 
@@ -128,10 +145,43 @@ std::string PackageDownloaderLib::getPackages(const std::string& category)
     return filterPackagesByCategory(allPackages, category);
 }
 
-std::string PackageDownloaderLib::getCategories()
+std::string PackageDownloaderLib::getCategories(const std::string& releaseTag)
 {
-    std::string packagesJson = fetchPackageListFromOnline();
+    std::string packagesJson = fetchPackageListFromOnline(releaseTag);
     return extractCategories(packagesJson);
+}
+
+std::string PackageDownloaderLib::getReleases()
+{
+    std::string body;
+    std::vector<std::string> headers = {
+        "Accept: application/vnd.github+json",
+        "X-GitHub-Api-Version: 2022-11-28"
+    };
+    if (!httpGet(MODULES_REPO_API_RELEASES, body, headers)) {
+        return "[]";
+    }
+
+    json doc;
+    try {
+        doc = json::parse(body);
+    } catch (...) {
+        return "[]";
+    }
+    if (!doc.is_array()) return "[]";
+
+    json result = json::array();
+    for (const auto& rel : doc) {
+        if (rel.value("draft", false)) continue;
+        json entry;
+        entry["tag_name"] = rel.value("tag_name", "");
+        entry["name"] = rel.value("name", "");
+        entry["published_at"] = rel.value("published_at", "");
+        entry["prerelease"] = rel.value("prerelease", false);
+        entry["html_url"] = rel.value("html_url", "");
+        result.push_back(entry);
+    }
+    return result.dump();
 }
 
 std::string PackageDownloaderLib::findPackageByName(const std::string& packagesJson, const std::string& packageName)
@@ -147,9 +197,9 @@ std::string PackageDownloaderLib::findPackageByName(const std::string& packagesJ
     return "{}";
 }
 
-std::string PackageDownloaderLib::resolveDependencies(const std::vector<std::string>& packageNames)
+std::string PackageDownloaderLib::resolveDependencies(const std::string& releaseTag, const std::vector<std::string>& packageNames)
 {
-    std::string allPackagesJson = fetchPackageListFromOnline();
+    std::string allPackagesJson = fetchPackageListFromOnline(releaseTag);
 
     json allPackages;
     try {
@@ -196,14 +246,14 @@ bool PackageDownloaderLib::downloadFile(const std::string& url, const std::strin
     return file.good();
 }
 
-std::string PackageDownloaderLib::downloadPackage(const std::string& packageName)
+std::string PackageDownloaderLib::downloadPackage(const std::string& releaseTag, const std::string& packageName)
 {
-    return downloadPackage(packageName, "");
+    return downloadPackage(releaseTag, packageName, "");
 }
 
-std::string PackageDownloaderLib::downloadPackage(const std::string& packageName, const std::string& outputDir)
+std::string PackageDownloaderLib::downloadPackage(const std::string& releaseTag, const std::string& packageName, const std::string& outputDir)
 {
-    std::string allPackagesJson = getPackages();
+    std::string allPackagesJson = getPackages(releaseTag);
     std::string packageJson = findPackageByName(allPackagesJson, packageName);
 
     json packageObj;
@@ -230,7 +280,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& packageName
         destDir = tmpDir;
     }
 
-    std::string downloadUrl = downloadBaseUrl() + "/" + packageFile;
+    std::string downloadUrl = downloadBaseUrl(releaseTag) + "/" + packageFile;
     std::string destinationPath = (fs::path(destDir) / packageFile).string();
 
     if (!downloadFile(downloadUrl, destinationPath)) return {};

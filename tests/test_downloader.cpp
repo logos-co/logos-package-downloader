@@ -7,32 +7,13 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-TEST(DownloaderTest, DefaultReleaseIsLatest) {
-    PackageDownloaderLib dl;
-    EXPECT_EQ(dl.release(), "latest");
-}
-
-TEST(DownloaderTest, SetRelease) {
-    PackageDownloaderLib dl;
-    dl.setRelease("v2.0.0");
-    EXPECT_EQ(dl.release(), "v2.0.0");
-}
-
-TEST(DownloaderTest, SetEmptyReleaseFallsBackToLatest) {
-    PackageDownloaderLib dl;
-    dl.setRelease("");
-    EXPECT_EQ(dl.release(), "latest");
-}
-
 TEST(DownloaderTest, ResolveDependenciesReturnsInputOnEmptyPackageList) {
     // When the catalog can't be fetched, resolveDependencies should
     // return the requested names as-is.
     PackageDownloaderLib dl;
-    // Use a non-existent release to force catalog fetch failure
-    dl.setRelease("__nonexistent_release_tag__");
 
     std::vector<std::string> names = {"pkg_a", "pkg_b"};
-    std::string result = dl.resolveDependencies(names);
+    std::string result = dl.resolveDependencies("__nonexistent_release_tag__", names);
     json resolved = json::parse(result);
 
     ASSERT_TRUE(resolved.is_array());
@@ -43,9 +24,8 @@ TEST(DownloaderTest, ResolveDependenciesReturnsInputOnEmptyPackageList) {
 
 TEST(DownloaderTest, DownloadPackageReturnsEmptyForNonExistent) {
     PackageDownloaderLib dl;
-    dl.setRelease("__nonexistent_release_tag__");
 
-    std::string result = dl.downloadPackage("nonexistent_package_xyz");
+    std::string result = dl.downloadPackage("__nonexistent_release_tag__", "nonexistent_package_xyz");
     EXPECT_TRUE(result.empty());
 }
 
@@ -66,18 +46,15 @@ TEST(DownloaderTest, DownloadFileFailsForInvalidUrl) {
 TEST(DownloaderTest, GetPackagesReturnsJsonArray) {
     PackageDownloaderLib dl;
     // Even if fetch fails, should return valid JSON array
-    dl.setRelease("__nonexistent_release_tag__");
-
-    std::string result = dl.getPackages();
+    std::string result = dl.getPackages("__nonexistent_release_tag__");
     json packages = json::parse(result);
     EXPECT_TRUE(packages.is_array());
 }
 
 TEST(DownloaderTest, GetCategoriesReturnsJsonArray) {
     PackageDownloaderLib dl;
-    dl.setRelease("__nonexistent_release_tag__");
 
-    std::string result = dl.getCategories();
+    std::string result = dl.getCategories("__nonexistent_release_tag__");
     json cats = json::parse(result);
     EXPECT_TRUE(cats.is_array());
     // Should at least contain "All"
@@ -87,9 +64,38 @@ TEST(DownloaderTest, GetCategoriesReturnsJsonArray) {
 
 TEST(DownloaderTest, GetPackagesByCategoryReturnsJsonArray) {
     PackageDownloaderLib dl;
-    dl.setRelease("__nonexistent_release_tag__");
 
-    std::string result = dl.getPackages("networking");
+    std::string result = dl.getPackages("__nonexistent_release_tag__", "networking");
     json packages = json::parse(result);
     EXPECT_TRUE(packages.is_array());
+}
+
+TEST(DownloaderTest, EmptyReleaseTagResolvesToLatest) {
+    PackageDownloaderLib dl;
+    // Passing empty string should behave identically to "latest"
+    // Both should return valid JSON arrays (we just verify no crash / valid structure)
+    std::string result1 = dl.getPackages("");
+    std::string result2 = dl.getPackages("latest");
+    json p1 = json::parse(result1);
+    json p2 = json::parse(result2);
+    EXPECT_TRUE(p1.is_array());
+    EXPECT_TRUE(p2.is_array());
+    EXPECT_EQ(p1.size(), p2.size());
+}
+
+TEST(DownloaderTest, GetReleasesReturnsJsonArray) {
+    PackageDownloaderLib dl;
+
+    // Hits the GitHub API; if offline / rate-limited the lib falls back to
+    // an empty array, so we only assert structure: must always be valid
+    // JSON, must always be an array, must never throw.
+    std::string result = dl.getReleases();
+    json releases;
+    ASSERT_NO_THROW(releases = json::parse(result));
+    EXPECT_TRUE(releases.is_array());
+
+    // If we got any entries, each must have a tag_name field.
+    for (const auto& rel : releases) {
+        EXPECT_TRUE(rel.contains("tag_name"));
+    }
 }

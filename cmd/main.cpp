@@ -21,8 +21,8 @@ static void printPackageTable(const json& packages) {
     }
 }
 
-static int cmdSearch(PackageDownloaderLib& dl, const std::string& query, bool jsonOutput) {
-    std::string allPackagesJson = dl.getPackages();
+static int cmdSearch(PackageDownloaderLib& dl, const std::string& releaseTag, const std::string& query, bool jsonOutput) {
+    std::string allPackagesJson = dl.getPackages(releaseTag);
     json allPackages = json::parse(allPackagesJson);
     json results = json::array();
 
@@ -57,12 +57,12 @@ static int cmdSearch(PackageDownloaderLib& dl, const std::string& query, bool js
     return 0;
 }
 
-static int cmdList(PackageDownloaderLib& dl, const std::string& category, bool jsonOutput) {
+static int cmdList(PackageDownloaderLib& dl, const std::string& releaseTag, const std::string& category, bool jsonOutput) {
     std::string packagesJson;
     if (category.empty()) {
-        packagesJson = dl.getPackages();
+        packagesJson = dl.getPackages(releaseTag);
     } else {
-        packagesJson = dl.getPackages(category);
+        packagesJson = dl.getPackages(releaseTag, category);
     }
 
     json packages = json::parse(packagesJson);
@@ -82,8 +82,8 @@ static int cmdList(PackageDownloaderLib& dl, const std::string& category, bool j
     return 0;
 }
 
-static int cmdCategories(PackageDownloaderLib& dl, bool jsonOutput) {
-    std::string categoriesJson = dl.getCategories();
+static int cmdCategories(PackageDownloaderLib& dl, const std::string& releaseTag, bool jsonOutput) {
+    std::string categoriesJson = dl.getCategories(releaseTag);
     json categories = json::parse(categoriesJson);
 
     if (jsonOutput) {
@@ -98,8 +98,8 @@ static int cmdCategories(PackageDownloaderLib& dl, bool jsonOutput) {
     return 0;
 }
 
-static int cmdInfo(PackageDownloaderLib& dl, const std::string& packageName, bool jsonOutput) {
-    std::string allPackagesJson = dl.getPackages();
+static int cmdInfo(PackageDownloaderLib& dl, const std::string& releaseTag, const std::string& packageName, bool jsonOutput) {
+    std::string allPackagesJson = dl.getPackages(releaseTag);
     json allPackages = json::parse(allPackagesJson);
 
     json found;
@@ -142,14 +142,49 @@ static int cmdInfo(PackageDownloaderLib& dl, const std::string& packageName, boo
     return 0;
 }
 
-static int cmdDownload(PackageDownloaderLib& dl, const std::string& packageName, const std::string& outputPath) {
+static int cmdReleases(PackageDownloaderLib& dl, bool jsonOutput) {
+    std::string releasesJson = dl.getReleases();
+    json releases;
+    try {
+        releases = json::parse(releasesJson);
+    } catch (...) {
+        std::cerr << "Error: failed to parse releases response\n";
+        return 1;
+    }
+
+    if (releases.empty()) {
+        std::cout << "No releases found\n";
+        return 0;
+    }
+
+    if (jsonOutput) {
+        std::cout << releases.dump(2) << "\n";
+        return 0;
+    }
+
+    printf("%-25s %-30s %-22s %-3s\n", "TAG", "NAME", "PUBLISHED", "PRE");
+    std::cout << std::string(82, '-') << "\n";
+    for (const auto& rel : releases) {
+        std::string tag = rel.value("tag_name", "");
+        std::string name = rel.value("name", "");
+        std::string published = rel.value("published_at", "");
+        bool prerelease = rel.value("prerelease", false);
+        if (name.size() > 30) name = name.substr(0, 30);
+        printf("%-25s %-30s %-22s %-3s\n",
+               tag.c_str(), name.c_str(), published.c_str(),
+               prerelease ? "yes" : "no");
+    }
+    return 0;
+}
+
+static int cmdDownload(PackageDownloaderLib& dl, const std::string& releaseTag, const std::string& packageName, const std::string& outputPath) {
     std::cout << "Downloading package: " << packageName << "..." << std::flush;
 
     std::string filePath;
     if (!outputPath.empty()) {
-        filePath = dl.downloadPackage(packageName, outputPath);
+        filePath = dl.downloadPackage(releaseTag, packageName, outputPath);
     } else {
-        filePath = dl.downloadPackage(packageName);
+        filePath = dl.downloadPackage(releaseTag, packageName);
     }
     if (filePath.empty()) {
         std::cout << " FAILED\n";
@@ -170,6 +205,7 @@ static void printHelp() {
               << "  search <query>          Search packages by name or description\n"
               << "  list                    List all available packages\n"
               << "  categories              List available categories\n"
+              << "  releases                List recent GitHub releases (up to 30)\n"
               << "  info <package>          Show package details from catalog\n"
               << "  download <package>      Download .lgx package\n"
               << "\n"
@@ -219,31 +255,30 @@ int main(int argc, char* argv[]) {
 
     PackageDownloaderLib dl;
 
-    if (!releaseTag.empty())
-        dl.setRelease(releaseTag);
-
     if (command == "search") {
         if (positionalArgs.empty()) {
             std::cerr << "Error: search requires a query argument\n";
             return 1;
         }
-        return cmdSearch(dl, positionalArgs[0], jsonOutput);
+        return cmdSearch(dl, releaseTag, positionalArgs[0], jsonOutput);
     } else if (command == "list") {
-        return cmdList(dl, categoryFilter, jsonOutput);
+        return cmdList(dl, releaseTag, categoryFilter, jsonOutput);
     } else if (command == "categories") {
-        return cmdCategories(dl, jsonOutput);
+        return cmdCategories(dl, releaseTag, jsonOutput);
+    } else if (command == "releases") {
+        return cmdReleases(dl, jsonOutput);
     } else if (command == "info") {
         if (positionalArgs.empty()) {
             std::cerr << "Error: info requires a package name\n";
             return 1;
         }
-        return cmdInfo(dl, positionalArgs[0], jsonOutput);
+        return cmdInfo(dl, releaseTag, positionalArgs[0], jsonOutput);
     } else if (command == "download") {
         if (positionalArgs.empty()) {
             std::cerr << "Error: download requires a package name\n";
             return 1;
         }
-        return cmdDownload(dl, positionalArgs[0], outputPath);
+        return cmdDownload(dl, releaseTag, positionalArgs[0], outputPath);
     } else {
         std::cerr << "Error: unknown command '" << command << "'\n";
         std::cerr << "Run 'lgpd --help' for usage information\n";
