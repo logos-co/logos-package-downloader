@@ -125,6 +125,8 @@ std::string PackageDownloaderLib::getPackages(const std::string& releaseTag)
         resultPackage["package"] = packageFile;
         resultPackage["variants"] = packageObj.value("variants", json::array());
         resultPackage["manifest"] = packageObj.value("manifest", json::object());
+        resultPackage["size"] = packageObj.value("size", 0);
+        resultPackage["dateUpdated"] = packageObj.value("dateUpdated", "");
         packagesArray.push_back(resultPackage);
     }
 
