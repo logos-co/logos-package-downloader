@@ -7,95 +7,83 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-TEST(DownloaderTest, ResolveDependenciesReturnsInputOnEmptyPackageList) {
-    // When the catalog can't be fetched, resolveDependencies should
-    // return the requested names as-is.
-    PackageDownloaderLib dl;
+// ─── Semver matcher ───────────────────────────────────────────────────────────
+// These are pure tests — no network involved.
 
-    std::vector<std::string> names = {"pkg_a", "pkg_b"};
-    std::string result = dl.resolveDependencies("__nonexistent_release_tag__", names);
-    json resolved = json::parse(result);
-
-    ASSERT_TRUE(resolved.is_array());
-    EXPECT_EQ(resolved.size(), 2);
-    EXPECT_EQ(resolved[0], "pkg_a");
-    EXPECT_EQ(resolved[1], "pkg_b");
+TEST(Semver, ExactAndComparator) {
+    using lgpd::PackageDownloaderLib;
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("1.2.3",     "1.2.3"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches("1.2.3",     "1.2.4"));
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches(">=1.0.0",   "1.2.3"));
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches(">=1.0.0",   "9.0.0"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches(">=2.0.0",   "1.99.0"));
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("<2.0.0",    "1.99.0"));
 }
 
-TEST(DownloaderTest, DownloadPackageReturnsEmptyForNonExistent) {
-    PackageDownloaderLib dl;
-
-    std::string result = dl.downloadPackage("__nonexistent_release_tag__", "nonexistent_package_xyz");
-    EXPECT_TRUE(result.empty());
+TEST(Semver, CaretAndTilde) {
+    using lgpd::PackageDownloaderLib;
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("^1.2.3",    "1.9.9"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches("^1.2.3",    "2.0.0"));
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("^0.2.3",    "0.2.9"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches("^0.2.3",    "0.3.0"));
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("~1.2.3",    "1.2.9"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches("~1.2.3",    "1.3.0"));
 }
 
-TEST(DownloaderTest, DownloadFileFailsForInvalidUrl) {
-    PackageDownloaderLib dl;
-
-    fs::path tempDir = fs::temp_directory_path() / ("lgpd_test_" + std::to_string(std::rand()));
-    fs::create_directories(tempDir);
-    fs::path dest = tempDir / "test_file.lgx";
-
-    bool ok = dl.downloadFile("http://127.0.0.1:1/nonexistent", dest.string());
-    EXPECT_FALSE(ok);
-
-    std::error_code ec;
-    fs::remove_all(tempDir, ec);
+TEST(Semver, WildcardAndConjunction) {
+    using lgpd::PackageDownloaderLib;
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("*",          "9.9.9"));
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("1.x",        "1.5.0"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches("1.x",        "2.0.0"));
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches(">=1.0 <2.0", "1.5.0"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches(">=1.0 <2.0", "2.0.1"));
+    // Alternation
+    EXPECT_TRUE (PackageDownloaderLib::semverMatches("1.x || 2.x", "2.3.4"));
+    EXPECT_FALSE(PackageDownloaderLib::semverMatches("1.x || 2.x", "3.0.0"));
 }
 
-TEST(DownloaderTest, GetPackagesReturnsJsonArray) {
-    PackageDownloaderLib dl;
-    // Even if fetch fails, should return valid JSON array
-    std::string result = dl.getPackages("__nonexistent_release_tag__");
-    json packages = json::parse(result);
-    EXPECT_TRUE(packages.is_array());
+// ─── Repository registry (in-memory) ─────────────────────────────────────────
+
+TEST(Registry, DefaultIsAlwaysPresent) {
+    lgpd::PackageDownloaderLib lib;
+    auto repos = lib.registry().list();
+    ASSERT_FALSE(repos.empty());
+    EXPECT_TRUE(repos.front().isDefault);
 }
 
-TEST(DownloaderTest, GetCategoriesReturnsJsonArray) {
-    PackageDownloaderLib dl;
-
-    std::string result = dl.getCategories("__nonexistent_release_tag__");
-    json cats = json::parse(result);
-    EXPECT_TRUE(cats.is_array());
-    // Should at least contain "All"
-    ASSERT_FALSE(cats.empty());
-    EXPECT_EQ(cats[0], "All");
+TEST(Registry, MutationsRequireConfig) {
+    lgpd::PackageDownloaderLib lib;
+    auto err = lib.registry().addRepository("https://example.com/logos-repo.json");
+    EXPECT_FALSE(err.empty());
 }
 
-TEST(DownloaderTest, GetPackagesByCategoryReturnsJsonArray) {
-    PackageDownloaderLib dl;
-
-    std::string result = dl.getPackages("__nonexistent_release_tag__", "networking");
-    json packages = json::parse(result);
-    EXPECT_TRUE(packages.is_array());
-}
-
-TEST(DownloaderTest, EmptyReleaseTagResolvesToLatest) {
-    PackageDownloaderLib dl;
-    // Passing empty string should behave identically to "latest"
-    // Both should return valid JSON arrays (we just verify no crash / valid structure)
-    std::string result1 = dl.getPackages("");
-    std::string result2 = dl.getPackages("latest");
-    json p1 = json::parse(result1);
-    json p2 = json::parse(result2);
-    EXPECT_TRUE(p1.is_array());
-    EXPECT_TRUE(p2.is_array());
-    EXPECT_EQ(p1.size(), p2.size());
-}
-
-TEST(DownloaderTest, GetReleasesReturnsJsonArray) {
-    PackageDownloaderLib dl;
-
-    // Hits the GitHub API; if offline / rate-limited the lib falls back to
-    // an empty array, so we only assert structure: must always be valid
-    // JSON, must always be an array, must never throw.
-    std::string result = dl.getReleases();
-    json releases;
-    ASSERT_NO_THROW(releases = json::parse(result));
-    EXPECT_TRUE(releases.is_array());
-
-    // If we got any entries, each must have a tag_name field.
-    for (const auto& rel : releases) {
-        EXPECT_TRUE(rel.contains("tag_name"));
+TEST(Registry, RoundTripsConfigFile) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_test_cfg_" + std::to_string(std::rand()) + ".json");
+    {
+        lgpd::PackageDownloaderLib lib(cfg.string());
+        // Adding a bogus URL fails fast (no fetcher will reach it). Just
+        // exercise the persistence layer by toggling the default's enabled
+        // flag, which doesn't require a successful fetch.
+        auto err = lib.registry().setEnabled(lgpd::kDefaultRepositoryUrl, false);
+        EXPECT_TRUE(err.empty()) << err;
     }
+    ASSERT_TRUE(fs::exists(cfg));
+    {
+        lgpd::PackageDownloaderLib lib2(cfg.string());
+        // The default appears as disabled after reload.
+        auto repos = lib2.registry().list();
+        ASSERT_FALSE(repos.empty());
+        EXPECT_TRUE(repos.front().isDefault);
+        EXPECT_FALSE(repos.front().enabled);
+    }
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(Catalog, ReturnsJsonArrayWhenNoNetwork) {
+    // No real network is required because the lib lazy-fetches per repo
+    // and degrades to empty results on failure.
+    lgpd::PackageDownloaderLib lib;
+    json catalog;
+    ASSERT_NO_THROW(catalog = json::parse(lib.getCatalogJson()));
+    EXPECT_TRUE(catalog.is_array());
 }
