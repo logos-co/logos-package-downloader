@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Logos Package Downloader
+Exec=lgpd
+Icon=lgpd
+Terminal=true
+Categories=Utility;
