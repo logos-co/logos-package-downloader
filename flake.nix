@@ -14,7 +14,7 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f {
         inherit system;
         pkgs = import nixpkgs { inherit system; };
-        dirBundler = nix-bundle-dir.bundlers.${system}.default;
+        dirBundler = nix-bundle-dir.bundlers.${system}.permissive;
       });
     in
     {
