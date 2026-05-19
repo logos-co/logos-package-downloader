@@ -16,7 +16,9 @@
 #include "package_downloader_lib.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -268,6 +270,31 @@ size_t curlWriteFile(void* contents, size_t size, size_t nmemb, void* userp) {
     return file->good() ? size * nmemb : 0;
 }
 
+// Append a unique cache-busting query param.
+//
+// The metadata we GET (logos-repo.json from raw.githubusercontent.com,
+// index.json from a GitHub release asset) is mutable but sits behind
+// Fastly. After a catalog rebuild the edge can keep serving the OLD
+// body for a window even with `Cache-Control: no-cache` (that means
+// "revalidate", and the release-download 302 itself is edge-cached).
+// A unique query string changes the cache key → guaranteed origin
+// fetch → the client never shows a removed/renamed module just
+// because it reloaded too soon after an upstream change. Unbounded
+// freshness matters more than CDN offload for these tiny JSON files;
+// the actual `.lgx` blobs (getToFile) are immutable per version and
+// are intentionally left cacheable.
+std::string cacheBustedUrl(const std::string& url) {
+    static std::atomic<unsigned long long> seq{0};
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    const unsigned long long n = seq.fetch_add(1, std::memory_order_relaxed);
+    const char sep = (url.find('?') == std::string::npos) ? '?' : '&';
+    return url + sep + "_lgpd_cb=" +
+           std::to_string(static_cast<unsigned long long>(ns)) + "-" +
+           std::to_string(n);
+}
+
 class HttpsFetcher : public Fetcher {
 public:
     bool get(const std::string& url, std::string& out) override {
@@ -275,7 +302,14 @@ public:
         CURL* c = curl_easy_init();
         if (!c) return false;
         out.clear();
-        curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+        // Cache-buster + no-cache headers so a reload right after an
+        // upstream catalog change never re-serves a stale edge copy.
+        const std::string busted = cacheBustedUrl(url);
+        struct curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, "Cache-Control: no-cache, no-store, max-age=0");
+        hdrs = curl_slist_append(hdrs, "Pragma: no-cache");
+        curl_easy_setopt(c, CURLOPT_URL, busted.c_str());
+        curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteMem);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
@@ -284,6 +318,7 @@ public:
         CURLcode res = curl_easy_perform(c);
         long code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+        curl_slist_free_all(hdrs);
         curl_easy_cleanup(c);
         return res == CURLE_OK && code >= 200 && code < 300;
     }
