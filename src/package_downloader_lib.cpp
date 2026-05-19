@@ -826,16 +826,34 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
 
     // Lookup helper: find best candidate across repos.
     auto findBest = [&](const ParsedDep& dep, json& chosen, std::string& chosenRepo, std::string& errMsg) -> bool {
-        const json* bestVer = nullptr;
+        // Hold the best candidate as an owned value, NOT a pointer.
+        //
+        // The previous `const json* bestVer = &v` aliased an element of
+        // the per-package `versions` sequence. With the ternary below,
+        // `versions` is a *temporary copy* whose lifetime ends with the
+        // enclosing `for (pkg : cat)` iteration. When the same package
+        // name appears in more than one repository (e.g. the official
+        // repo plus a user fork both publishing `wallet_module`), the
+        // best candidate is found in repo A, the loop advances to
+        // repo B's same-named package, repo A's `versions` copy is
+        // destroyed, and `*bestVer` afterwards dereferences freed
+        // memory. The corrupted read surfaced downstream as
+        // `json type_error.306 (value() with null)` on the next
+        // `chosen.value(...)`. Copying the chosen version out on the
+        // spot removes the alias entirely.
+        bool haveBest = false;
+        json bestVer;
         std::string bestRepo;
         std::string bestDate;
+        // Stable empty array so the ternary binds a real lvalue ref
+        // (no materialised temporary) when `versions` is absent/null.
+        const json emptyArr = json::array();
         for (const auto& pkg : cat) {
             if (!pkg.is_object() || pkg.value("name", "") != dep.name) continue;
-            // Same null-guard reasoning as objOrEmpty: `versions` may legally
-            // be an array, missing, or (defensively) null — value() with a
-            // default array only saves us from the missing case.
+            // `versions` may legally be an array, missing, or
+            // (defensively) null — only the array case is iterable.
             const json& versions = (pkg.contains("versions") && pkg["versions"].is_array())
-                                   ? pkg["versions"] : json::array();
+                                   ? pkg["versions"] : emptyArr;
             for (const auto& v : versions) {
                 if (!v.is_object()) continue;
                 std::string ver = objOrEmpty(v, "manifest").value("version", "");
@@ -847,14 +865,15 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                     if (sigDid != *dep.signer) continue;
                 }
                 std::string date = v.value("releasedAt", "");
-                if (!bestVer || date > bestDate) {
-                    bestVer = &v;
+                if (!haveBest || date > bestDate) {
+                    haveBest = true;
+                    bestVer = v;            // copy — outlives this iteration
                     bestRepo = pkg.value("repositoryUrl", "");
                     bestDate = date;
                 }
             }
         }
-        if (!bestVer) {
+        if (!haveBest) {
             std::ostringstream oss;
             oss << "no candidate matches '" << dep.name << "'";
             if (dep.versionRange) oss << " @ " << *dep.versionRange;
@@ -862,7 +881,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
             errMsg = oss.str();
             return false;
         }
-        chosen = *bestVer;
+        chosen = std::move(bestVer);
         chosenRepo = bestRepo;
         return true;
     };
