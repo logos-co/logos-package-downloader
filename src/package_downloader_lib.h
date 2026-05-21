@@ -162,13 +162,28 @@ public:
     /// Given a starting package's dependency list (one element per
     /// dependency, in the Dependency JSON form described by the manifest
     /// schema), returns a JSON array of resolved versions:
-    ///   `[{ repositoryUrl, name, version, rootHash, url }, ...]`
+    ///   `[{ repositoryUrl, name, version, rootHash, url, topLevel }, ...]`
     /// in install order (deps before dependents, no duplicates).
+    /// `topLevel: true` marks entries that came from the input array (the
+    /// packages the caller explicitly requested); other entries are
+    /// transitive deps the resolver pulled in.
+    ///
+    /// `installedPackagesJson` is an optional `[{ name, version, rootHash }, ...]`
+    /// describing what's currently on disk. When supplied, the resolver
+    /// uses it to short-circuit TRANSITIVE deps that are already
+    /// satisfied: if an installed copy's version meets the dep's
+    /// range, that dep is omitted from the output entirely (no install
+    /// or change needed). Top-level entries (from the input array) are
+    /// always resolved against the catalog — the caller picked them
+    /// explicitly. Empty/missing installedPackagesJson disables the
+    /// short-circuit and reproduces the pre-installed-aware behaviour
+    /// (every transitive dep resolves to a catalog pick).
     ///
     /// When a constraint cannot be satisfied, an entry of the form
     /// `{ error: "...", name: "..." }` is included at the unsatisfied
     /// position and resolution stops; callers should check for `error`.
-    std::string resolveDependenciesJson(const std::string& dependenciesJson);
+    std::string resolveDependenciesJson(const std::string& dependenciesJson,
+                                        const std::string& installedPackagesJson = "");
 
     /// True if the given semver range matches the given concrete version.
     /// Exposed for tests and for callers that want to filter without going

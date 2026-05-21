@@ -852,7 +852,8 @@ bool parseDep(const json& j, ParsedDep& out, std::string& err) {
 
 } // namespace
 
-std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dependenciesJson) {
+std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dependenciesJson,
+                                                          const std::string& installedPackagesJson) {
     impl_->ensureMetadata();
     json input;
     try { input = json::parse(dependenciesJson); }
@@ -864,6 +865,26 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
     std::string catBody = getCatalogJson();
     json cat;
     try { cat = json::parse(catBody); } catch (...) { cat = json::array(); }
+
+    // Installed-packages index, name → version. Used to short-circuit
+    // transitive deps whose range is already satisfied by what's on
+    // disk. Empty / unparseable installedPackagesJson disables the
+    // optimisation — the resolver then picks every transitive from the
+    // catalog (pre-installed-aware behaviour).
+    std::unordered_map<std::string, std::string> installedByName;
+    if (!installedPackagesJson.empty()) {
+        try {
+            json inst = json::parse(installedPackagesJson);
+            if (inst.is_array()) {
+                for (const auto& e : inst) {
+                    if (!e.is_object()) continue;
+                    const std::string n = e.value("name", "");
+                    const std::string v = e.value("version", "");
+                    if (!n.empty() && !v.empty()) installedByName[n] = v;
+                }
+            }
+        } catch (...) { /* silent — best effort */ }
+    }
 
     json out = json::array();
     std::unordered_map<std::string, bool> seen; // name|version|hash
@@ -940,20 +961,45 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         return true;
     };
 
-    // BFS so deps-of-deps are added before their consumers.
-    std::vector<ParsedDep> queue;
+    // BFS so deps-of-deps are added before their consumers. Each queue
+    // entry carries an isTopLevel flag — true for the caller's input
+    // array, false for deps the resolver pulled in. Top-level entries
+    // are NEVER short-circuited by the installed-state check (the user
+    // explicitly picked them), and they get `topLevel: true` in the
+    // output so consumers can split the resolved list into "the action
+    // I asked for" vs "the transitive deps that come along".
+    struct QueueEntry { ParsedDep dep; bool isTopLevel; };
+    std::vector<QueueEntry> queue;
     for (const auto& el : input) {
         ParsedDep d; std::string err;
         if (!parseDep(el, d, err)) {
             json e; e["error"] = err; out.push_back(std::move(e));
             return out.dump();
         }
-        queue.push_back(std::move(d));
+        queue.push_back({std::move(d), /*isTopLevel=*/true});
     }
 
     while (!queue.empty()) {
-        ParsedDep dep = std::move(queue.front());
+        QueueEntry qe = std::move(queue.front());
         queue.erase(queue.begin());
+        const ParsedDep& dep = qe.dep;
+
+        // Installed-state short-circuit (transitive only). If an
+        // installed copy's version meets the dep's range, the dep is
+        // satisfied as-is; skip emitting an entry and skip recursing
+        // into the chosen manifest (we don't have one — by definition
+        // we didn't pick from the catalog). Top-level inputs bypass
+        // this: the caller asked for them explicitly, so they must
+        // always resolve to a catalog pick.
+        if (!qe.isTopLevel) {
+            auto it = installedByName.find(dep.name);
+            if (it != installedByName.end()) {
+                const bool inRange = !dep.versionRange
+                                  || semverRangeMatches(*dep.versionRange, it->second);
+                if (inRange) continue;
+            }
+        }
+
         json chosen; std::string chosenRepo; std::string err;
         if (!findBest(dep, chosen, chosenRepo, err)) {
             json e; e["error"] = err; e["name"] = dep.name; out.push_back(std::move(e));
@@ -971,12 +1017,14 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         entry["rootHash"] = hash;
         entry["repositoryUrl"] = chosenRepo;
         entry["url"] = chosen.value("url", "");
+        entry["topLevel"] = qe.isTopLevel;
         out.push_back(std::move(entry));
         // Enqueue transitive deps from the chosen version's manifest.
         if (chosenManifest.contains("dependencies") && chosenManifest["dependencies"].is_array()) {
             for (const auto& sub : chosenManifest["dependencies"]) {
                 ParsedDep d; std::string serr;
-                if (parseDep(sub, d, serr)) queue.push_back(std::move(d));
+                if (parseDep(sub, d, serr))
+                    queue.push_back({std::move(d), /*isTopLevel=*/false});
             }
         }
     }
