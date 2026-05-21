@@ -825,6 +825,13 @@ struct ParsedDep {
     std::string name;
     std::optional<std::string> versionRange;
     std::optional<std::string> signer;
+    // Optional source-repo scope. When set, findBest only considers
+    // packages from this repository URL — so callers that already know
+    // exactly which repo entry they want (the package_manager_ui's
+    // per-row install / upgrade path, scoped to the row the user
+    // clicked) can pin it. Manifest-declared transitive deps don't set
+    // this; they fall through to the cross-repo "best" pick.
+    std::optional<std::string> repositoryUrl;
 };
 
 bool parseDep(const json& j, ParsedDep& out, std::string& err) {
@@ -838,6 +845,8 @@ bool parseDep(const json& j, ParsedDep& out, std::string& err) {
         out.versionRange = j["version"].get<std::string>();
     if (j.contains("signer") && j["signer"].is_string())
         out.signer = j["signer"].get<std::string>();
+    if (j.contains("repositoryUrl") && j["repositoryUrl"].is_string())
+        out.repositoryUrl = j["repositoryUrl"].get<std::string>();
     return true;
 }
 
@@ -885,6 +894,15 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         const json emptyArr = json::array();
         for (const auto& pkg : cat) {
             if (!pkg.is_object() || pkg.value("name", "") != dep.name) continue;
+            // Repo scope. When the caller pinned a repositoryUrl (the
+            // per-row install path in package_manager_ui does this with
+            // the row's source repo), skip packages from other repos
+            // — otherwise two repos publishing the same `name` would
+            // tiebreak by releasedAt and the resolver could pick the
+            // wrong one. Empty pin = no scope = pre-fix cross-repo
+            // behaviour, matching manifest-declared transitive deps.
+            if (dep.repositoryUrl && pkg.value("repositoryUrl", "") != *dep.repositoryUrl)
+                continue;
             // `versions` may legally be an array, missing, or
             // (defensively) null — only the array case is iterable.
             const json& versions = (pkg.contains("versions") && pkg["versions"].is_array())
@@ -913,6 +931,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
             oss << "no candidate matches '" << dep.name << "'";
             if (dep.versionRange) oss << " @ " << *dep.versionRange;
             if (dep.signer) oss << " (signer=" << *dep.signer << ")";
+            if (dep.repositoryUrl) oss << " (repo=" << *dep.repositoryUrl << ")";
             errMsg = oss.str();
             return false;
         }
