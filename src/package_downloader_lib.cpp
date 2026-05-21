@@ -38,7 +38,7 @@ using json = nlohmann::json;
 namespace lgpd {
 
 const char* kDefaultRepositoryUrl =
-    "https://raw.githubusercontent.com/logos-co/logos-modules-v2/HEAD/logos-repo.json";
+    "https://raw.githubusercontent.com/logos-co/logos-modules-release/refs/heads/main/logos-repo.json";
 
 namespace {
 
