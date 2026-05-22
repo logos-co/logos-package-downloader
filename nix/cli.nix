@@ -1,8 +1,8 @@
 # Builds the logos-package-downloader CLI (lgpd)
-{ pkgs, common, src }:
+{ pkgs, common, src, logosPackageLib }:
 
 let
-  lib = import ./lib.nix { inherit pkgs common src; };
+  lib = import ./lib.nix { inherit pkgs common src logosPackageLib; };
 in
 pkgs.stdenv.mkDerivation {
   pname = "${common.pname}-cli";

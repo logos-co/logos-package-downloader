@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -31,6 +32,7 @@
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#include <lgx.h>   // lgx_load / lgx_get_manifest_json / lgx_verify_signature
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -767,6 +769,103 @@ const json* pickVersion(const json& pkg,
 
 } // namespace
 
+namespace {
+
+// Verify that a freshly-downloaded `.lgx` is the artifact the catalog
+// advertised. This is intentionally a SHALLOW check — "what we
+// downloaded == what the index said" — NOT a deep integrity check.
+// The .lgx's own internal consistency (its manifest's recorded
+// content hashes vs its actual files) and the Ed25519 signature
+// validity are package_manager's job at install time
+// (verifyPackageSignature). Here we only close the index→file binding
+// gap: the index.json comes from one host, the .lgx `url` from
+// another, and nothing otherwise stops a swapped file (a downgrade
+// attack, or a different-but-also-signed sibling package).
+//
+// `indexEntry` is the catalog version entry — `{ manifest, signature,
+// rootHash, url, ... }`.
+//
+// Returns true (accept) when the download matches, or when the index
+// carried nothing to compare against (legacy `manifest: null` rows —
+// we can't verify what wasn't advertised, and package_manager's
+// install-time check still runs). Returns false (reject) on a real
+// mismatch, with `errMsg` set.
+bool verifyDownloadAgainstIndex(const std::string& lgxPath,
+                                const json& indexEntry,
+                                std::string& errMsg) {
+    const json& advertised = objOrEmpty(indexEntry, "manifest");
+
+    // Manifest comparison. Skipped entirely when the index row has no
+    // manifest (the `manifest: null` rows objOrEmpty was written for).
+    if (!advertised.empty()) {
+        lgx_package_t pkg = lgx_load(lgxPath.c_str());
+        if (!pkg) {
+            errMsg = "downloaded file is not a readable .lgx package";
+            return false;
+        }
+        const char* mraw = lgx_get_manifest_json(pkg);
+        std::string fileManifestStr = mraw ? mraw : "";
+        lgx_free_package(pkg);
+
+        json fileManifest;
+        try { fileManifest = json::parse(fileManifestStr); }
+        catch (...) {
+            errMsg = "downloaded package has an unparseable manifest";
+            return false;
+        }
+
+        // Compare the security-relevant fields rather than requiring
+        // whole-manifest byte-equality: the index builder may
+        // normalise the manifest copy it embeds (key order, an added
+        // display-only field), and a benign cosmetic difference
+        // shouldn't block an install. These four are the fields an
+        // index→file swap would have to alter to be an actual attack:
+        //   name / version — identity
+        //   main           — variant→entrypoint map (the code that loads)
+        //   dependencies   — the transitive surface
+        // `type` is included too — cheap, and a ui_qml/core swap is
+        // load-path-relevant.
+        static const char* kFields[] = {
+            "name", "version", "main", "dependencies", "type"};
+        for (const char* f : kFields) {
+            const json a = advertised.contains(f)   ? advertised.at(f)   : json();
+            const json b = fileManifest.contains(f) ? fileManifest.at(f) : json();
+            if (a != b) {
+                errMsg = std::string("downloaded package field '") + f
+                       + "' does not match the catalog entry";
+                return false;
+            }
+        }
+    }
+
+    // Signature binding. When the index advertised a signer DID, the
+    // file must be signed by the SAME DID. We don't re-verify the
+    // Ed25519 here (package_manager does, against the trust keyring) —
+    // we only bind index→file so a swap to a differently-signed (or
+    // unsigned) package is caught even under the WARN signature policy.
+    const json& advSig = objOrEmpty(indexEntry, "signature");
+    if (!advSig.empty()) {
+        const std::string advDid = advSig.value("did", "");
+        if (!advDid.empty()) {
+            lgx_signature_info_t info =
+                lgx_verify_signature(lgxPath.c_str(), nullptr);
+            const bool fileSigned = info.is_signed;
+            const std::string fileDid =
+                info.signer_did ? info.signer_did : "";
+            lgx_free_signature_info(info);
+            if (!fileSigned || fileDid != advDid) {
+                errMsg = "downloaded package signer does not match the "
+                         "catalog (expected " + advDid + ")";
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+} // namespace
+
 std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrName,
                                                   const std::string& packageName,
                                                   const std::string& version,
@@ -810,8 +909,24 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             if (filename.empty()) filename = packageName + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
             if (!impl_->fetcher->getToFile(url, dest)) return {};
-            // sha256 / rootHash verification is the caller's responsibility
-            // (lgx verify) — we just return the file path here.
+            // Bind the downloaded artifact to what the index advertised
+            // — manifest fields + signer DID. The .lgx `url` and the
+            // `index.json` come from independent hosts; without this a
+            // swapped file (downgrade attack, sibling package) would
+            // sail through to install. Deep integrity + Ed25519 trust
+            // stay package_manager's job at install time; this is only
+            // the index→file binding. On mismatch we delete the bad
+            // artifact and fail the download.
+            {
+                std::string verr;
+                if (!verifyDownloadAgainstIndex(dest, *v, verr)) {
+                    std::error_code rmEc;
+                    fs::remove(dest, rmEc);
+                    std::cerr << "package_downloader: rejected " << packageName
+                              << " from " << url << " — " << verr << "\n";
+                    return {};
+                }
+            }
             return dest;
         }
     }

@@ -1,5 +1,5 @@
 # Builds and runs logos-package-downloader tests
-{ pkgs, common, src }:
+{ pkgs, common, src, logosPackageLib }:
 
 pkgs.stdenv.mkDerivation {
   pname = "${common.pname}-tests";

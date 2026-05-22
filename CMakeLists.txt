@@ -19,6 +19,16 @@ endif()
 # Find libcurl
 find_package(CURL REQUIRED)
 
+# Find lgx library (logos-package). Used post-download to verify a
+# fetched .lgx against the catalog entry — see verifyDownloadAgainstIndex
+# in package_downloader_lib.cpp.
+if(NOT DEFINED LGX_ROOT)
+    message(FATAL_ERROR "LGX_ROOT must be set to the logos-package library path")
+endif()
+message(STATUS "Using lgx library at: ${LGX_ROOT}")
+find_library(LGX_LIB lgx PATHS ${LGX_ROOT}/lib NO_DEFAULT_PATH REQUIRED)
+message(STATUS "Found lgx library: ${LGX_LIB}")
+
 # Library sources
 set(LIB_SOURCES
     src/package_downloader_lib.cpp
@@ -41,11 +51,15 @@ set_target_properties(package_downloader_lib PROPERTIES
 target_include_directories(package_downloader_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+target_include_directories(package_downloader_lib PRIVATE
+    ${LGX_ROOT}/include
+)
 
 # Link dependencies
 target_link_libraries(package_downloader_lib PRIVATE
     nlohmann_json::nlohmann_json
     CURL::libcurl
+    ${LGX_LIB}
 )
 
 # RPATH settings
@@ -56,17 +70,20 @@ set_target_properties(package_downloader_lib PROPERTIES
 
 if(APPLE)
     set_target_properties(package_downloader_lib PROPERTIES
-        INSTALL_RPATH "@loader_path"
+        INSTALL_RPATH "@loader_path;${LGX_ROOT}/lib"
         INSTALL_NAME_DIR "@rpath"
         BUILD_WITH_INSTALL_NAME_DIR TRUE
     )
     add_custom_command(TARGET package_downloader_lib POST_BUILD
         COMMAND install_name_tool -id "@rpath/libpackage_downloader_lib.dylib" $<TARGET_FILE:package_downloader_lib>
+        # Rewrite the absolute nix-store lgx path to @rpath so the
+        # liblgx.dylib bundled next to us (see nix/lib.nix) resolves.
+        COMMAND install_name_tool -change "${LGX_LIB}" "@rpath/liblgx.dylib" $<TARGET_FILE:package_downloader_lib>
         COMMENT "Updating library paths for macOS"
     )
 else()
     set_target_properties(package_downloader_lib PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN:${LGX_ROOT}/lib"
         INSTALL_RPATH_USE_LINK_PATH FALSE
     )
 endif()
