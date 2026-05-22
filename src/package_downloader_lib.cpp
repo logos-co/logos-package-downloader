@@ -771,46 +771,95 @@ const json* pickVersion(const json& pkg,
 
 namespace {
 
-// Verify that a freshly-downloaded `.lgx` is the artifact the catalog
-// advertised. This is intentionally a SHALLOW check — "what we
-// downloaded == what the index said" — NOT a deep integrity check.
-// The .lgx's own internal consistency (its manifest's recorded
-// content hashes vs its actual files) and the Ed25519 signature
-// validity are package_manager's job at install time
-// (verifyPackageSignature). Here we only close the index→file binding
-// gap: the index.json comes from one host, the .lgx `url` from
-// another, and nothing otherwise stops a swapped file (a downgrade
-// attack, or a different-but-also-signed sibling package).
+// Verify that a freshly-downloaded `.lgx` is structurally sound AND is
+// the artifact the catalog advertised.
+//
+// Two layers:
+//  1. Structural — lgx_verify confirms the file is a well-formed .lgx
+//     whose internal content hashes are self-consistent. Catches a
+//     truncated / corrupt download (or a non-.lgx file served at the
+//     URL) before it ever reaches the installer. Runs unconditionally.
+//  2. Index→file binding — the index.json comes from one host, the
+//     .lgx `url` from another; nothing otherwise stops a swapped file
+//     (a downgrade attack, or a different-but-also-signed sibling
+//     package). We bind them three ways:
+//       * rootHash  — the package's content Merkle root must equal the
+//                     hash the catalog pinned. This is the strongest
+//                     check: it covers a content swap that kept the
+//                     manifest byte-identical (manifest.json carries
+//                     no content hashes).
+//       * manifest  — name / version / main / dependencies / type must
+//                     match the manifest the catalog embedded.
+//       * signer    — if the catalog advertised a signer DID, the file
+//                     must be signed by the SAME DID.
+//
+// Ed25519 trust (is the signer in our keyring) stays package_manager's
+// job at install time — here we only confirm the file is what the
+// index said it would be.
 //
 // `indexEntry` is the catalog version entry — `{ manifest, signature,
 // rootHash, url, ... }`.
 //
-// Returns true (accept) when the download matches, or when the index
-// carried nothing to compare against (legacy `manifest: null` rows —
-// we can't verify what wasn't advertised, and package_manager's
-// install-time check still runs). Returns false (reject) on a real
-// mismatch, with `errMsg` set.
+// Returns true (accept) on a match, or when the index carried nothing
+// to compare a given facet against (legacy rows with `manifest: null`
+// / no `rootHash` — we can't verify what wasn't advertised). Returns
+// false (reject) on a real mismatch, with `errMsg` set.
 bool verifyDownloadAgainstIndex(const std::string& lgxPath,
                                 const json& indexEntry,
                                 std::string& errMsg) {
-    const json& advertised = objOrEmpty(indexEntry, "manifest");
-
-    // Manifest comparison. Skipped entirely when the index row has no
-    // manifest (the `manifest: null` rows objOrEmpty was written for).
-    if (!advertised.empty()) {
-        lgx_package_t pkg = lgx_load(lgxPath.c_str());
-        if (!pkg) {
-            errMsg = "downloaded file is not a readable .lgx package";
+    // ── 1. Structural soundness ──────────────────────────────────────
+    {
+        lgx_verify_result_t vr = lgx_verify(lgxPath.c_str());
+        const bool ok = vr.valid;
+        std::string firstErr;
+        if (!ok && vr.errors && vr.errors[0])
+            firstErr = vr.errors[0];
+        lgx_free_verify_result(vr);
+        if (!ok) {
+            errMsg = "downloaded file failed .lgx structure verification"
+                   + (firstErr.empty() ? std::string()
+                                       : (": " + firstErr));
             return false;
         }
+    }
+
+    // Load once for the manifest + root-hash reads below.
+    lgx_package_t pkg = lgx_load(lgxPath.c_str());
+    if (!pkg) {
+        errMsg = "downloaded file is not a readable .lgx package";
+        return false;
+    }
+
+    // ── 2a. rootHash binding ─────────────────────────────────────────
+    // Strongest of the three: a content fingerprint. An attacker who
+    // rebuilds a clean (lgx_verify-passing) .lgx with a malicious
+    // payload but an unchanged manifest is caught only here.
+    const std::string advRootHash = indexEntry.value("rootHash", "");
+    if (!advRootHash.empty()) {
+        const char* rhRaw = lgx_get_root_hash(pkg);
+        const std::string fileRootHash = rhRaw ? rhRaw : "";
+        if (fileRootHash != advRootHash) {
+            errMsg = "downloaded package content hash does not match the "
+                     "catalog (expected " + advRootHash + ", got "
+                   + (fileRootHash.empty() ? "none" : fileRootHash) + ")";
+            lgx_free_package(pkg);
+            return false;
+        }
+    }
+
+    // ── 2b. Manifest binding ─────────────────────────────────────────
+    // Skipped when the index row has no manifest (the `manifest: null`
+    // rows objOrEmpty was written for).
+    const json& advertised = objOrEmpty(indexEntry, "manifest");
+    if (!advertised.empty()) {
         const char* mraw = lgx_get_manifest_json(pkg);
         std::string fileManifestStr = mraw ? mraw : "";
-        lgx_free_package(pkg);
 
         json fileManifest;
         try { fileManifest = json::parse(fileManifestStr); }
         catch (...) {
             errMsg = "downloaded package has an unparseable manifest";
+            lgx_free_package(pkg);
             return false;
         }
 
@@ -818,7 +867,7 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
         // whole-manifest byte-equality: the index builder may
         // normalise the manifest copy it embeds (key order, an added
         // display-only field), and a benign cosmetic difference
-        // shouldn't block an install. These four are the fields an
+        // shouldn't block an install. These are the fields an
         // index→file swap would have to alter to be an actual attack:
         //   name / version — identity
         //   main           — variant→entrypoint map (the code that loads)
@@ -833,16 +882,20 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
             if (a != b) {
                 errMsg = std::string("downloaded package field '") + f
                        + "' does not match the catalog entry";
+                lgx_free_package(pkg);
                 return false;
             }
         }
     }
 
-    // Signature binding. When the index advertised a signer DID, the
-    // file must be signed by the SAME DID. We don't re-verify the
-    // Ed25519 here (package_manager does, against the trust keyring) —
-    // we only bind index→file so a swap to a differently-signed (or
-    // unsigned) package is caught even under the WARN signature policy.
+    lgx_free_package(pkg);
+
+    // ── 2c. Signer binding ───────────────────────────────────────────
+    // When the index advertised a signer DID, the file must be signed
+    // by the SAME DID. We don't re-verify the Ed25519 here
+    // (package_manager does, against the trust keyring) — we only bind
+    // index→file so a swap to a differently-signed (or unsigned)
+    // package is caught even under the WARN signature policy.
     const json& advSig = objOrEmpty(indexEntry, "signature");
     if (!advSig.empty()) {
         const std::string advDid = advSig.value("did", "");
