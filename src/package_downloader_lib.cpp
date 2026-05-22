@@ -783,11 +783,13 @@ namespace {
 //     .lgx `url` from another; nothing otherwise stops a swapped file
 //     (a downgrade attack, or a different-but-also-signed sibling
 //     package). We bind them three ways:
-//       * rootHash  — the package's content Merkle root must equal the
-//                     hash the catalog pinned. This is the strongest
-//                     check: it covers a content swap that kept the
-//                     manifest byte-identical (manifest.json carries
-//                     no content hashes).
+//       * rootHash  — the catalog pins a version's `rootHash`; the
+//                     .lgx's own manifest carries the same value under
+//                     `hashes.root` (lgx recomputes the Merkle tree on
+//                     every content change and records it in the
+//                     manifest). A plain string compare of the two
+//                     binds the download to the advertised content —
+//                     no recomputation here.
 //       * manifest  — name / version / main / dependencies / type must
 //                     match the manifest the catalog embedded.
 //       * signer    — if the catalog advertised a signer DID, the file
@@ -823,26 +825,40 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
         }
     }
 
-    // Load once for the manifest + root-hash reads below.
+    // Load the package + read its manifest once — both binding checks
+    // below come straight out of it.
     lgx_package_t pkg = lgx_load(lgxPath.c_str());
     if (!pkg) {
         errMsg = "downloaded file is not a readable .lgx package";
         return false;
     }
+    const char* mraw = lgx_get_manifest_json(pkg);
+    std::string fileManifestStr = mraw ? mraw : "";
+    lgx_free_package(pkg);
+
+    json fileManifest;
+    try { fileManifest = json::parse(fileManifestStr); }
+    catch (...) {
+        errMsg = "downloaded package has an unparseable manifest";
+        return false;
+    }
 
     // ── 2a. rootHash binding ─────────────────────────────────────────
-    // Strongest of the three: a content fingerprint. An attacker who
-    // rebuilds a clean (lgx_verify-passing) .lgx with a malicious
-    // payload but an unchanged manifest is caught only here.
+    // The catalog pins a version's `rootHash`; the .lgx's manifest
+    // records the same Merkle tree under `hashes`, with `hashes.root`
+    // the content root. A plain string compare binds the download to
+    // the advertised content — no recomputation. (lgx_verify above
+    // already confirmed the manifest's recorded hashes are consistent
+    // with the actual archive content, so a manifest-stated root we
+    // can trust as the file's real root.)
     const std::string advRootHash = indexEntry.value("rootHash", "");
     if (!advRootHash.empty()) {
-        const char* rhRaw = lgx_get_root_hash(pkg);
-        const std::string fileRootHash = rhRaw ? rhRaw : "";
+        const std::string fileRootHash =
+            objOrEmpty(fileManifest, "hashes").value("root", "");
         if (fileRootHash != advRootHash) {
             errMsg = "downloaded package content hash does not match the "
                      "catalog (expected " + advRootHash + ", got "
                    + (fileRootHash.empty() ? "none" : fileRootHash) + ")";
-            lgx_free_package(pkg);
             return false;
         }
     }
@@ -852,17 +868,6 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
     // rows objOrEmpty was written for).
     const json& advertised = objOrEmpty(indexEntry, "manifest");
     if (!advertised.empty()) {
-        const char* mraw = lgx_get_manifest_json(pkg);
-        std::string fileManifestStr = mraw ? mraw : "";
-
-        json fileManifest;
-        try { fileManifest = json::parse(fileManifestStr); }
-        catch (...) {
-            errMsg = "downloaded package has an unparseable manifest";
-            lgx_free_package(pkg);
-            return false;
-        }
-
         // Compare the security-relevant fields rather than requiring
         // whole-manifest byte-equality: the index builder may
         // normalise the manifest copy it embeds (key order, an added
@@ -882,13 +887,10 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
             if (a != b) {
                 errMsg = std::string("downloaded package field '") + f
                        + "' does not match the catalog entry";
-                lgx_free_package(pkg);
                 return false;
             }
         }
     }
-
-    lgx_free_package(pkg);
 
     // ── 2c. Signer binding ───────────────────────────────────────────
     // When the index advertised a signer DID, the file must be signed
