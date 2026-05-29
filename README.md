@@ -81,12 +81,56 @@ lgpd info waku_module --json
 lgpd download waku_module -o ./packages/
 ```
 
-## Building
+## How to Build
+
+### Using Nix (Recommended)
+
+The downloader ships as a C++ library plus the `lgpd` CLI. `nix build` (no target) produces the combined library + CLI.
+
+#### Local Build
+
+A standard Nix derivation whose dependencies live in `/nix/store`. It is the fastest way to iterate during development but is **not portable** — it only runs on the machine that built it.
 
 ```bash
-nix build                        # library + CLI
-nix build .#lib                  # library only
-nix build .#cli                  # CLI only
+nix build                        # library + CLI (combined)
+nix build '.#lib'                # library only
+nix build '.#cli'                # CLI only
+./result/bin/lgpd --help
+```
+
+#### Portable Builds
+
+Portable builds are **fully self-contained** — no `/nix/store` references at runtime — for distribution. Unlike [logos-package-manager](https://github.com/logos-co/logos-package-manager), `lgpd` only fetches files over the network and has no dev variant/portable *variant* distinction; downloaded packages are always portable.
+
+| Output | Platform | Format |
+|---|---|---|
+| `cli-bundle-dir` | Linux, macOS | Self-contained flat directory with `bin/` and `lib/` |
+| `cli-appimage` | Linux | Single-file `.AppImage` executable |
+
+##### Self-contained directory bundle (all platforms)
+```bash
+nix build '.#cli-bundle-dir'
+./result/bin/lgpd --help
+```
+
+##### Linux AppImage (Linux only)
+```bash
+nix build '.#cli-appimage'
+./result/lgpd.AppImage --help
+```
+
+#### Development Shell
+
+```bash
+nix develop
+```
+
+**Note:** In zsh, quote targets containing `#` to prevent glob expansion (e.g., `'.#cli'`).
+
+If you don't have flakes enabled globally:
+
+```bash
+nix build --extra-experimental-features 'nix-command flakes'
 ```
 
 ## Testing
