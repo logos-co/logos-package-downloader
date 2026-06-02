@@ -1,84 +1,146 @@
 # logos-package-downloader
 
-C++ library and CLI for fetching the online Logos package catalog and downloading `.lgx` packages from GitHub releases.
+C++ library and CLI (`lgpd`) for fetching **Logos module catalogs** and
+downloading `.lgx` packages — across **multiple repositories**.
 
-This repo handles **network/download** operations only. It does not install packages — that is the responsibility of [logos-package-manager](https://github.com/logos-co/logos-package-manager).
+This repo handles **network / download** operations only. It does not
+install packages — that is the responsibility of
+[logos-package-manager](https://github.com/logos-co/logos-package-manager).
+
+## Model
+
+A *repository* is identified by the URL of its `logos-repo.json` (its
+identity card: name, `indexUrl`, trusted signers). The downloader keeps a
+registry of repositories — a built-in default plus any the user adds —
+fetches each one's `index.json`, and **merges them into a single
+catalog**. Packages are downloaded by their per-version `url` and
+**verified against the catalog entry** before they're handed off for
+install (content `rootHash` + manifest fields + signer DID).
+
+> 📖 The `logos-repo.json` and `index.json` formats this library consumes
+> are fully specified in
+> [logos-modules-release-tool/docs/catalog-format.md](https://github.com/logos-co/logos-modules-release-tool/blob/main/docs/catalog-format.md).
+> To build/host your own catalog, see
+> [logos-modules-release-base](https://github.com/logos-co/logos-modules-release-base).
 
 ## Library API
+
+The public API speaks JSON strings so it's trivially callable from a C
+wrapper, the package-downloader Logos module, and tests.
 
 ```cpp
 #include <package_downloader_lib.h>
 
-PackageDownloaderLib dl;
+// In-memory only, or backed by a config file that persists user repos.
+PackageDownloaderLib dl;                          // built-in default repo only
+PackageDownloaderLib dl{"/path/repositories.json"}; // + persisted user repos
 
-// Configure release tag (default: "latest")
-dl.setRelease("v1.0.0");
+// ── Repositories ────────────────────────────────────────────────
+// The default repo is always present; user repos are added by the URL
+// of their logos-repo.json and persisted (when constructed with a path).
+dl.registry().addRepository("https://example.com/my/logos-repo.json");
+dl.registry().setEnabled("https://example.com/my/logos-repo.json", false);
+dl.registry().removeRepository("https://example.com/my/logos-repo.json");
+std::string repos = dl.listRepositoriesJson();    // [{url,enabled,isDefault,name,…,resolveError}]
 
-// Fetch package catalog (returns JSON strings)
-std::string packages = dl.getPackages();
-std::string filtered = dl.getPackages("networking");
-std::string categories = dl.getCategories();
+// ── Catalog ─────────────────────────────────────────────────────
+std::string all   = dl.getCatalogJson();          // merged across enabled repos
+std::string oneEl = dl.getCatalogForRepoJson("my-catalog"); // one repo (url or name)
+dl.refreshCatalogs();                              // force re-fetch of repo metadata + indexes
 
-// Dependency resolution (returns JSON array string of resolved names)
-std::string resolved = dl.resolveDependencies({"chat_module"});
+// ── Dependency resolution (no download) ─────────────────────────
+// Input: a manifest-style dependency list. Output: resolved versions in
+// install order, each tagged `topLevel`. The optional installed-packages
+// snapshot lets the resolver omit transitive deps already satisfied
+// on-disk.
+std::string plan = dl.resolveDependenciesJson(R"([{"name":"chat_module"}])");
+std::string plan2 = dl.resolveDependenciesJson(depsJson, installedJson);
 
-// Synchronous download (returns local file path, or empty on error)
-std::string path = dl.downloadPackage("waku_module");
-std::string path = dl.downloadPackage("waku_module", "/output/dir");
-
-// Low-level file download
-dl.downloadFile("https://example.com/file.lgx", "/local/path.lgx");
+// ── Download (pinned + verified) ────────────────────────────────
+// repoUrlOrName empty → any enabled repo (registry order); version empty
+// → newest matching; rootHash disambiguates two builds sharing a version.
+// Returns the local .lgx path, or empty on error.
+std::string path = dl.downloadPackage(/*repo*/"", "wallet_module",
+                                      /*version*/"1.0.0", /*rootHash*/"",
+                                      /*outputDir*/"/tmp/pkgs");
 ```
 
 ### C API
 
-A C-compatible API is available via `lgpd.h` for use from non-C++ consumers:
+A C-compatible API is available via `lgpd.h` for non-C++ consumers. All
+returned `char*` are owned by the caller — free with `lgpd_free_string`;
+errors via `lgpd_get_last_error()`.
 
 ```c
 #include <lgpd.h>
 
-lgpd_context_t ctx = lgpd_create();
-lgpd_set_release(ctx, "v1.0.0");
-char* packages = lgpd_get_packages(ctx);
-lgpd_free_string(packages);
+lgpd_context_t ctx = lgpd_create();                    // or lgpd_create_with_config(path)
+lgpd_repo_add(ctx, "https://example.com/my/logos-repo.json");
+
+char* catalog = lgpd_get_catalog(ctx);                 // merged catalog JSON
+lgpd_free_string(catalog);
+
+char* plan = lgpd_resolve_dependencies(ctx, "[{\"name\":\"chat_module\"}]");
+lgpd_free_string(plan);
+
+char* path = lgpd_download_package(ctx, /*repo*/"", "wallet_module",
+                                   /*version*/"1.0.0", /*root_hash*/"",
+                                   /*output_dir*/"");
+lgpd_free_string(path);
 lgpd_free(ctx);
 ```
 
 ## CLI (`lgpd`)
 
 ```
-lgpd [options] <command> [arguments]
+lgpd [global options] <command> [arguments]
 
-Commands:
-  search <query>              Search packages by name/description
-  list [--category <cat>]     List available packages
-  categories                  List package categories
-  info <package>              Show package details from catalog
-  download <package>          Download .lgx package
+Catalog commands:
+  list                          List all available packages
+  search <query>                Search packages by name or description
+  info <package>                Show package details (all versions, by date)
+  download <package>            Download a .lgx package
 
-Options:
-  --release <tag>             GitHub release tag (default: latest)
-  --category <cat>            Filter by category (for list command)
-  -o, --output <path>         Output file or directory (for download command)
-  --json                      Output in JSON format
-  -h, --help                  Show help
-  -v, --version               Show version
+Repository management (require --config <path>):
+  repo list                     Show configured repositories
+  repo add <url>                Add a user repository (url -> logos-repo.json)
+  repo remove <url>             Remove a user repository
+  repo enable <url>             Enable a repository
+  repo disable <url>            Disable a repository
+  repo refresh                  Re-fetch every repo's logos-repo.json + index.json
+
+Config:
+  config init <path>            Create an empty repository config file
+  config show                   Print the resolved config JSON
+  config path                   Print the current --config path
+
+Global options:
+  --config <path>               Path to repositories.json (required for repo mutations)
+  --repo <url-or-name>          Restrict a catalog/download command to one repo
+  --version <ver>               Pin a specific package version (download/info)
+  --root-hash <hex>             Disambiguate two releases sharing a version
+  --category <cat>              Filter by category (list)
+  -o, --output <dir>            Output directory (download)
+  --json                        Emit structured JSON
+  -h, --help                    Show help
+  -V, --version                 Print version
 ```
 
 ### Examples
 
 ```bash
-# Search the online catalog
+# Browse the merged catalog
+lgpd list
 lgpd search waku
+lgpd info wallet_module --json
 
-# List packages in a category
-lgpd list --category networking
+# Add and manage your own repository (persisted to the config file)
+lgpd --config ~/.config/logos/repositories.json repo add https://example.com/my/logos-repo.json
+lgpd --config ~/.config/logos/repositories.json repo list
+lgpd --config ~/.config/logos/repositories.json repo refresh
 
-# Show package details
-lgpd info waku_module --json
-
-# Download a package to a specific directory
-lgpd download waku_module -o ./packages/
+# Download — pin a version, scope to one repo, choose an output dir
+lgpd download wallet_module --version 1.0.0 --repo my-catalog -o ./packages/
 ```
 
 ## How to Build
