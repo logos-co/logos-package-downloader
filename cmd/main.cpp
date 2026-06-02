@@ -132,7 +132,11 @@ int cmdList(const CliOpts& o) {
 int cmdSearch(const CliOpts& o, const std::string& query) {
     auto lib = makeLib(o);
     json packages;
-    try { packages = json::parse(lib->getCatalogJson()); } catch (...) {
+    // Honour --repo, same as cmdInfo: scope the search to one repo when
+    // the user named one, otherwise search the merged catalog.
+    try { packages = json::parse(
+        o.repo.empty() ? lib->getCatalogJson() : lib->getCatalogForRepoJson(o.repo));
+    } catch (...) {
         std::cerr << "Error: catalog parse failed\n"; return 1;
     }
     std::string q = query;
@@ -177,7 +181,14 @@ int cmdInfo(const CliOpts& o, const std::string& name) {
         return 0;
     }
     for (const auto& v : found["versions"]) {
-        std::string ver = v.value("manifest", json::object()).value("version", "");
+        // Null-safe: a version row can legitimately carry `manifest: null`
+        // (early catalog rows). `v.value("manifest", json::object())`
+        // returns the null when the key exists-but-null, and a chained
+        // .value() on null throws — so guard for an actual object.
+        const json manifest = (v.is_object() && v.contains("manifest")
+                               && v["manifest"].is_object())
+                              ? v["manifest"] : json::object();
+        std::string ver = manifest.value("version", "");
         std::string date = v.value("releasedAt", "");
         std::string hash = v.value("rootHash", "");
         std::string shortHash = hash.size() > 12 ? (hash.substr(0, 8) + "..." + hash.substr(hash.size() - 4)) : hash;

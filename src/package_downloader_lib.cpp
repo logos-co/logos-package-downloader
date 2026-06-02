@@ -8,10 +8,11 @@
 //     `index.json` into one catalog, downloads `.lgx` files by their URL,
 //     and performs semver-aware cross-repo dependency resolution.
 //
-// All persisted JSON shapes are documented in the plan at
-// /Users/dlipicar/.claude/plans/i-want-to-make-virtual-journal.md
-// (sections "Client-side repository config", "`logos-repo.json` schema",
-// and "`index.json` schema").
+// The `logos-repo.json` and `index.json` shapes consumed here are
+// specified in logos-modules-release-tool's docs/catalog-format.md:
+// https://github.com/logos-co/logos-modules-release-tool/blob/main/docs/catalog-format.md
+// The client-side repository config (`{ defaultDisabled, repositories:
+// [{ url, enabled }] }`) is described in RepositoryRegistry::Impl below.
 
 #include "package_downloader_lib.h"
 
@@ -331,8 +332,21 @@ public:
         fs::create_directories(fs::path(path).parent_path(), ec);
         std::ofstream f(path, std::ios::binary);
         if (!f.is_open()) return false;
+
+        // Remove the destination on any failure so a half-written or
+        // empty file is never left behind for a later step (or the
+        // user) to mistake for a good download. The body may already
+        // have been partially streamed to disk by curlWriteFile before
+        // a non-2xx status or transfer error is known.
+        auto fail = [&]() -> bool {
+            f.close();
+            std::error_code rmEc;
+            fs::remove(path, rmEc);
+            return false;
+        };
+
         CURL* c = curl_easy_init();
-        if (!c) return false;
+        if (!c) return fail();
         curl_easy_setopt(c, CURLOPT_URL, url.c_str());
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteFile);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &f);
@@ -344,7 +358,12 @@ public:
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(c);
         f.close();
-        return res == CURLE_OK && code >= 200 && code < 300;
+        if (res != CURLE_OK || code < 200 || code >= 300) {
+            std::error_code rmEc;
+            fs::remove(path, rmEc);
+            return false;
+        }
+        return true;
     }
 };
 
@@ -605,17 +624,26 @@ struct PackageDownloaderLib::Impl {
 
     // Caches: url -> body
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
+    // True once registry.refresh() has resolved every repo's
+    // logos-repo.json this process. Guards ensureMetadata so a catalog
+    // browse doesn't re-fetch all repo metadata on every call. Reset by
+    // setFetcher (new fetcher → must re-resolve) and forced by
+    // refreshCatalogs (explicit reload).
+    bool metadataResolved = false;
     mutable std::mutex mu;
 
     Impl() {}
     explicit Impl(std::string configPath) : registry(std::move(configPath)) {}
 
     bool ensureMetadata() {
-        // Lazy refresh — only do it once per process unless explicitly
-        // re-requested. Best-effort: errors are tolerated, since some repos
-        // may be unreachable while others work.
-        // (refresh() is idempotent and re-fetches every time it is called.)
+        // Lazy: resolve repo metadata once per process. The first
+        // catalog/list/resolve call pays the network cost; later calls
+        // reuse it. Best-effort — refresh() records per-repo errors and
+        // never throws, so a partial failure still leaves the working
+        // repos usable. Use refreshCatalogs() to force a re-fetch.
+        if (metadataResolved) return true;
         registry.refresh();
+        metadataResolved = true;
         return true;
     }
 
@@ -637,6 +665,47 @@ struct PackageDownloaderLib::Impl {
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl.clear();
     }
+
+    // Synthesise the catalog entries for one repo from its index.json
+    // body and append them to `out`. Single source of truth for the
+    // entry shape so getCatalogJson (all repos) and getCatalogForRepoJson
+    // (one repo) can't diverge — the latter previously returned the raw
+    // index `packages[]`, missing the synthesised repositoryUrl /
+    // repository{Name,DisplayName} / package-level type/category/etc.
+    // and the date-sorted versions that callers (CLI/UI/C API) expect.
+    void appendCatalogEntries(const Repository& r, const std::string& body, json& out) {
+        if (body.empty()) return;
+        try {
+            auto idx = json::parse(body);
+            if (!idx.is_object() || !idx.contains("packages")
+                || !idx["packages"].is_array()) return;
+            for (auto& pkg : idx["packages"]) {
+                if (!pkg.is_object() || !pkg.contains("name")) continue;
+                json entry;
+                entry["repositoryUrl"]  = r.url;
+                entry["repositoryName"] = r.name.empty() ? r.url : r.name;
+                entry["repositoryDisplayName"] = r.displayName;
+                entry["name"] = pkg["name"];
+                // Package "header" fields lifted from the first version's
+                // embedded manifest (constant across a package's versions).
+                if (pkg.contains("versions") && pkg["versions"].is_array()
+                    && !pkg["versions"].empty()) {
+                    const json& firstManifest = objOrEmpty(pkg["versions"][0], "manifest");
+                    entry["description"] = firstManifest.value("description", "");
+                    entry["type"]        = firstManifest.value("type", "");
+                    entry["category"]    = firstManifest.value("category", "");
+                    entry["author"]      = firstManifest.value("author", "");
+                    entry["icon"]        = firstManifest.value("icon", "");
+                }
+                auto versions = pkg.value("versions", json::array());
+                std::stable_sort(versions.begin(), versions.end(), VersionDateDesc{});
+                entry["versions"] = std::move(versions);
+                out.push_back(std::move(entry));
+            }
+        } catch (...) {
+            // Unparseable index; surfaced via resolveError in listRepositoriesJson.
+        }
+    }
 };
 
 PackageDownloaderLib::PackageDownloaderLib()
@@ -651,6 +720,9 @@ void PackageDownloaderLib::setFetcher(std::shared_ptr<Fetcher> fetcher) {
     impl_->fetcher = fetcher;
     impl_->registry.setFetcher(fetcher);
     impl_->clearCaches();
+    // New fetcher → the once-per-process metadata resolution must run
+    // again (against the new fetcher) on the next ensureMetadata.
+    impl_->metadataResolved = false;
 }
 
 RepositoryRegistry& PackageDownloaderLib::registry() { return impl_->registry; }
@@ -682,43 +754,7 @@ std::string PackageDownloaderLib::getCatalogJson() {
     for (const auto& r : impl_->registry.list()) {
         if (!r.enabled) continue;
         if (!r.resolveError.empty()) continue;
-        std::string body = impl_->fetchIndex(r);
-        if (body.empty()) continue;
-        try {
-            auto idx = json::parse(body);
-            if (!idx.is_object() || !idx.contains("packages")
-                || !idx["packages"].is_array()) continue;
-            for (auto& pkg : idx["packages"]) {
-                if (!pkg.is_object() || !pkg.contains("name")) continue;
-                json entry;
-                entry["repositoryUrl"]  = r.url;
-                entry["repositoryName"] = r.name.empty() ? r.url : r.name;
-                entry["repositoryDisplayName"] = r.displayName;
-                entry["name"] = pkg["name"];
-                // Pull the rest of the manifest "header" fields from the
-                // first version's embedded manifest (these don't change
-                // across versions of the same package).
-                if (pkg.contains("versions") && pkg["versions"].is_array() && !pkg["versions"].empty()) {
-                    // Null-safe: an index.json entry with `manifest: null`
-                    // (early action runs produced these) would otherwise
-                    // crash on the chained value() call below.
-                    const json& firstManifest = objOrEmpty(pkg["versions"][0], "manifest");
-                    entry["description"] = firstManifest.value("description", "");
-                    entry["type"]        = firstManifest.value("type", "");
-                    entry["category"]    = firstManifest.value("category", "");
-                    entry["author"]      = firstManifest.value("author", "");
-                    entry["icon"]        = firstManifest.value("icon", "");
-                }
-                // Versions sorted by releasedAt desc.
-                auto versions = pkg.value("versions", json::array());
-                std::stable_sort(versions.begin(), versions.end(), VersionDateDesc{});
-                entry["versions"] = std::move(versions);
-                out.push_back(std::move(entry));
-            }
-        } catch (...) {
-            // Skip unparseable indexes; they show up in resolveError if you
-            // call listRepositoriesJson().
-        }
+        impl_->appendCatalogEntries(r, impl_->fetchIndex(r), out);
     }
     return out.dump();
 }
@@ -727,17 +763,20 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
     auto repo = impl_->registry.findByUrlOrName(urlOrName);
     if (!repo) return "[]";
     impl_->ensureMetadata();
-    std::string body = impl_->fetchIndex(*repo);
-    if (body.empty()) return "[]";
-    try {
-        auto idx = json::parse(body);
-        if (!idx.is_object() || !idx.contains("packages")) return "[]";
-        return idx["packages"].dump();
-    } catch (...) { return "[]"; }
+    // Same synthesised shape as getCatalogJson, scoped to one repo —
+    // callers (CLI `--repo`, the UI, the C API) get repositoryUrl,
+    // date-sorted versions, and the package-level header fields, not the
+    // raw index `packages[]`.
+    json out = json::array();
+    impl_->appendCatalogEntries(*repo, impl_->fetchIndex(*repo), out);
+    return out.dump();
 }
 
 std::string PackageDownloaderLib::refreshCatalogs() {
     impl_->clearCaches();
+    // Explicit reload: force the metadata refresh now and mark it done
+    // so the next ensureMetadata() doesn't redundantly refresh again.
+    impl_->metadataResolved = true;
     return impl_->registry.refresh();
 }
 
@@ -1149,9 +1188,13 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         queue.push_back({std::move(d), /*isTopLevel=*/true});
     }
 
-    while (!queue.empty()) {
-        QueueEntry qe = std::move(queue.front());
-        queue.erase(queue.begin());
+    // Index-based FIFO consumption rather than erase(begin()): the
+    // queue only grows (transitive deps are appended), so a head index
+    // walks it in O(1) per step. erase(begin()) was O(n) per pop —
+    // quadratic on a deep/wide dependency graph. Entries are moved out
+    // and never revisited, so the moved-from slots are harmless.
+    for (size_t head = 0; head < queue.size(); ++head) {
+        QueueEntry qe = std::move(queue[head]);
         const ParsedDep& dep = qe.dep;
 
         // Installed-state short-circuit (transitive only). If an
