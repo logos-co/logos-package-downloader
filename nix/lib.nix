@@ -1,5 +1,5 @@
 # Builds the logos-package-downloader library
-{ pkgs, common, src }:
+{ pkgs, common, src, logosPackageLib }:
 
 pkgs.stdenv.mkDerivation {
   pname = "${common.pname}-lib";
@@ -20,6 +20,17 @@ pkgs.stdenv.mkDerivation {
     else
       echo "Error: No library file found"
       exit 1
+    fi
+
+    # Bundle liblgx alongside so the downloader lib can resolve it at
+    # runtime via @loader_path / $ORIGIN (the verify-against-index step
+    # links lgx). Mirrors what logos-package-manager's lib.nix does.
+    if [ -f ${logosPackageLib}/lib/liblgx.dylib ]; then
+      cp ${logosPackageLib}/lib/liblgx.dylib $out/lib/
+    elif [ -f ${logosPackageLib}/lib/liblgx.so ]; then
+      cp ${logosPackageLib}/lib/liblgx.so $out/lib/
+    else
+      echo "Warning: liblgx library not found in ${logosPackageLib}/lib/"
     fi
 
     cp ${src}/src/package_downloader_lib.h $out/include/

@@ -72,9 +72,50 @@
         "type": "github"
       }
     },
-    "nix-bundle-appimage": {
+    "logos-nix_5": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_5"
+      },
+      "locked": {
+        "lastModified": 1773955630,
+        "narHash": "sha256-KqzMoWYIVp2xMgphs7v02T/BE54RKMFxpdC2duhJKG0=",
+        "owner": "logos-co",
+        "repo": "logos-nix",
+        "rev": "0e9e6d66ab8eb34f59e45ed448f7dc29130feb88",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-nix",
+        "type": "github"
+      }
+    },
+    "logos-package": {
       "inputs": {
         "logos-nix": "logos-nix_2",
+        "nixpkgs": [
+          "logos-package",
+          "logos-nix",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1778543214,
+        "narHash": "sha256-2WP1fa4HvnMpQ7T3pieOaG08L9lb66SmQROB6RNVWdQ=",
+        "owner": "logos-co",
+        "repo": "logos-package",
+        "rev": "18b00759e002068b4cebffc6bc855504253d5c79",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-package",
+        "type": "github"
+      }
+    },
+    "nix-bundle-appimage": {
+      "inputs": {
+        "logos-nix": "logos-nix_3",
         "nix-bundle-dir": "nix-bundle-dir",
         "nixpkgs": [
           "nix-bundle-appimage",
@@ -98,7 +139,7 @@
     },
     "nix-bundle-dir": {
       "inputs": {
-        "logos-nix": "logos-nix_3",
+        "logos-nix": "logos-nix_4",
         "nixpkgs": [
           "nix-bundle-appimage",
           "nixpkgs"
@@ -120,7 +161,7 @@
     },
     "nix-bundle-dir_2": {
       "inputs": {
-        "logos-nix": "logos-nix_4",
+        "logos-nix": "logos-nix_5",
         "nixpkgs": [
           "nix-bundle-dir",
           "logos-nix",
@@ -205,9 +246,26 @@
         "type": "github"
       }
     },
+    "nixpkgs_5": {
+      "locked": {
+        "lastModified": 1759036355,
+        "narHash": "sha256-0m27AKv6ka+q270dw48KflE0LwQYrO7Fm4/2//KCVWg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e9f00bd893984bc8ce46c895c3bf7cac95331127",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "logos-nix": "logos-nix",
+        "logos-package": "logos-package",
         "nix-bundle-appimage": "nix-bundle-appimage",
         "nix-bundle-dir": "nix-bundle-dir_2",
         "nixpkgs": [

@@ -1,8 +1,8 @@
 #ifndef LGPD_H
 #define LGPD_H
 
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,50 +34,80 @@ extern "C" {
 /* Opaque handle */
 typedef struct lgpd_context_opaque* lgpd_context_t;
 
-/* Result type */
+/* Generic success/error result */
 typedef struct {
     bool success;
-    const char* error;
+    const char* error;     /* thread-local; only valid until the next call */
 } lgpd_result_t;
 
-/* Context lifecycle */
+/*
+ * Context lifecycle
+ * ─────────────────
+ * `lgpd_create` constructs an in-memory client with no persisted
+ * configuration. `lgpd_create_with_config` reads/writes user repositories
+ * from `config_path` (`{ repositories[], defaultDisabled }` JSON).
+ *
+ * The hardcoded default repository is always present, regardless of the
+ * config-file state.
+ */
 LGPD_EXPORT lgpd_context_t lgpd_create(void);
+LGPD_EXPORT lgpd_context_t lgpd_create_with_config(const char* config_path);
 LGPD_EXPORT void lgpd_free(lgpd_context_t ctx);
 
-/**
- * Get package catalog (returns JSON array string, caller frees with lgpd_free_string).
- * release_tag: GitHub release tag; NULL or empty string resolves to "latest".
+/*
+ * Repository management
+ * ─────────────────────
+ * All `repo_*` mutating calls require the context to have been created
+ * with a config file path; otherwise the call fails with a clear error.
  */
-LGPD_EXPORT char* lgpd_get_packages(lgpd_context_t ctx, const char* release_tag);
-LGPD_EXPORT char* lgpd_get_packages_by_category(lgpd_context_t ctx, const char* release_tag, const char* category);
-LGPD_EXPORT char* lgpd_get_categories(lgpd_context_t ctx, const char* release_tag);
+LGPD_EXPORT lgpd_result_t lgpd_repo_add(lgpd_context_t ctx, const char* url);
+LGPD_EXPORT lgpd_result_t lgpd_repo_remove(lgpd_context_t ctx, const char* url);
+LGPD_EXPORT lgpd_result_t lgpd_repo_set_enabled(lgpd_context_t ctx, const char* url, bool enabled);
+LGPD_EXPORT lgpd_result_t lgpd_repo_refresh(lgpd_context_t ctx);
 
-/**
- * Get list of GitHub releases (returns JSON array string, caller frees with lgpd_free_string).
+/*
+ * Returns a JSON array string describing every configured repository.
+ * Caller frees the returned string with `lgpd_free_string`.
  */
-LGPD_EXPORT char* lgpd_get_releases(lgpd_context_t ctx);
+LGPD_EXPORT char* lgpd_repo_list(lgpd_context_t ctx);
 
-/**
- * Resolve dependencies for the given package names.
- * Returns JSON array string of resolved names (caller frees with lgpd_free_string).
+/*
+ * Catalog
+ * ───────
+ * `lgpd_get_catalog` returns the merged catalog across all enabled repos
+ * as a JSON array (see `index.json` schema in the plan).
+ * `lgpd_get_catalog_for_repo` is the single-repo view (URL or canonical
+ * name).
  */
-LGPD_EXPORT char* lgpd_resolve_dependencies(lgpd_context_t ctx, const char* release_tag, const char** names, size_t count);
+LGPD_EXPORT char* lgpd_get_catalog(lgpd_context_t ctx);
+LGPD_EXPORT char* lgpd_get_catalog_for_repo(lgpd_context_t ctx, const char* repo_url_or_name);
 
-/**
- * Download a package by name. Returns path to downloaded file (caller frees with lgpd_free_string),
- * or NULL on error.
+/*
+ * Resolve a JSON-encoded list of dependencies (mirror of manifest format).
+ * Returns a JSON array of resolved `{ name, version, rootHash, url,
+ * repositoryUrl }` entries in install order, or an entry with `error` when
+ * a constraint is unsatisfiable.
  */
-LGPD_EXPORT char* lgpd_download_package(lgpd_context_t ctx, const char* release_tag, const char* name);
+LGPD_EXPORT char* lgpd_resolve_dependencies(lgpd_context_t ctx, const char* dependencies_json);
 
-/**
- * Download a file from URL to destination path.
+/*
+ * Download a package. `version` may be empty (= newest). `root_hash` may be
+ * empty (= newest matching version). `repo_url_or_name` may be empty (=
+ * search every enabled repo in registry order). `output_dir` may be empty
+ * (= system temp). Returns the local path to the downloaded `.lgx`, or
+ * NULL on error. Caller frees with `lgpd_free_string`.
  */
-LGPD_EXPORT lgpd_result_t lgpd_download_file(lgpd_context_t ctx, const char* url, const char* dest_path);
+LGPD_EXPORT char* lgpd_download_package(lgpd_context_t ctx,
+                                        const char* repo_url_or_name,
+                                        const char* package_name,
+                                        const char* version,
+                                        const char* root_hash,
+                                        const char* output_dir);
 
 /* Memory management */
 LGPD_EXPORT void lgpd_free_string(char* str);
 
-/* Error handling */
+/* Error handling (thread-local) */
 LGPD_EXPORT const char* lgpd_get_last_error(void);
 
 #ifdef __cplusplus
