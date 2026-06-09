@@ -70,7 +70,8 @@ Global options:
   -o, --output <dir>            Output directory (download).
   --json                        Emit structured JSON.
   -h, --help                    Show this help.
-  -V, --version                 Print version.
+  -V, --version                 Print version (a bare --version, with no value
+                                following, also prints the version).
 )HELP";
 }
 
@@ -302,10 +303,16 @@ int dispatch(int argc, char** argv) {
     for (size_t i = 0; i < args.size(); ++i) {
         const auto& a = args[i];
         if (a == "-h" || a == "--help") { printGlobalHelp(); return 0; }
-        if (a == "-V" || a == "--version") return printVersion();
+        if (a == "-V") return printVersion();
         if (a == "--config" && i + 1 < args.size()) { o.configPath = args[++i]; continue; }
         if (a == "--repo" && i + 1 < args.size())   { o.repo = args[++i]; continue; }
-        if (a == "--version" && i + 1 < args.size()){ o.version = args[++i]; continue; }
+        if (a == "--version") {
+            // `--version <ver>` pins a package version (download/info); a bare
+            // `--version` with no value following is treated like `-V` and prints
+            // the tool version.
+            if (i + 1 < args.size()) { o.version = args[++i]; continue; }
+            return printVersion();
+        }
         if (a == "--root-hash" && i + 1 < args.size()) { o.rootHash = args[++i]; continue; }
         if (a == "--category" && i + 1 < args.size()) { o.category = args[++i]; continue; }
         if ((a == "-o" || a == "--output") && i + 1 < args.size()) { o.outputDir = args[++i]; continue; }
