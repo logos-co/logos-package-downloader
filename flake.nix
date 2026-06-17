@@ -9,14 +9,9 @@
     logos-package.url = "github:logos-co/logos-package";
     nix-bundle-dir.url = "github:logos-co/nix-bundle-dir";
     nix-bundle-appimage.url = "github:logos-co/nix-bundle-appimage";
-    nix-bundle-macos-app = {
-      url = "github:logos-co/nix-bundle-macos-app";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.nix-bundle-dir.follows = "nix-bundle-dir";
-    };
   };
 
-  outputs = { self, nixpkgs, logos-nix, logos-package, nix-bundle-dir, nix-bundle-appimage, nix-bundle-macos-app }:
+  outputs = { self, nixpkgs, logos-nix, logos-package, nix-bundle-dir, nix-bundle-appimage }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f {
@@ -24,11 +19,10 @@
         pkgs = import nixpkgs { inherit system; };
         dirBundler = nix-bundle-dir.bundlers.${system}.permissive;
         logosPackageLib = logos-package.packages.${system}.lib;
-        macosAppBundler = nix-bundle-macos-app.lib.${system}.mkMacOSApp;
       });
     in
     {
-      packages = forAllSystems ({ pkgs, system, dirBundler, logosPackageLib, macosAppBundler }:
+      packages = forAllSystems ({ pkgs, system, dirBundler, logosPackageLib }:
         let
           common = import ./nix/default.nix { inherit pkgs logosPackageLib; };
           src = ./.;
@@ -55,17 +49,6 @@
             bundle = dirBundler cli;
             desktopFile = ./assets/lgpd.desktop;
             icon = ./assets/lgpd.png;
-          };
-        } // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
-          # macOS .app bundle (ad-hoc signed, notarization-ready structure).
-          # Released as a tar.gz; see .github/workflows/release.yml.
-          cli-macos-app = macosAppBundler {
-            drv = cli;
-            name = "lgpd";
-            bundle = dirBundler cli;
-            icon = ./assets/lgpd.png;
-            infoPlist = ./assets/macos/Info.plist.in;
-            entitlements = ./assets/macos/lgpd.entitlements;
           };
         } // {
           # Tests

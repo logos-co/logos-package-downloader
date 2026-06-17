@@ -4,10 +4,9 @@ name: Build & Release
 # them as a GitHub pre-release. Modeled on logos-basecamp's build.yml.
 #
 #   Linux (x86_64 + aarch64): build the AppImage, chmod +x, wrap in a tar.gz.
-#   macOS (aarch64):          build the .app via nix-bundle-macos-app, strip the
-#                             Gatekeeper quarantine flag + ad-hoc re-sign the way
-#                             Homebrew handles casks/bottled binaries, then wrap
-#                             in a tar.gz.
+#   macOS (aarch64):          build the portable cli-bundle-dir (bin/ + lib/),
+#                             strip the Gatekeeper quarantine flag the way
+#                             Homebrew handles casks, wrap in a tar.gz.
 
 on:
   push:
@@ -65,7 +64,7 @@ jobs:
           name: appimage-${{ matrix.arch }}
           path: lgpd-*-linux.tar.gz
 
-  build-macos-app:
+  build-macos-bundle:
     runs-on: macos-latest
 
     steps:
@@ -78,50 +77,37 @@ jobs:
           name: logos-co
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
-      - name: Build cli-macos-app
-        run: nix build .#cli-macos-app -L
-
-      - name: Strip quarantine + ad-hoc re-sign (Homebrew cask/bottle mechanism)
-        run: |
-          app=$(find result/ -maxdepth 2 -name '*.app' -print -quit)
-          # Copy out of the read-only Nix store into a writable working copy.
-          rm -rf dist && mkdir dist
-          cp -R "$app" "dist/$(basename "$app")"
-          appcopy="dist/$(basename "$app")"
-          chmod -R u+w "$appcopy"
-
-          # (cask) Strip the Gatekeeper quarantine attribute — the same call
-          # Homebrew's Cask::Quarantine.release! makes after staging a cask.
-          /usr/bin/xattr -r -d com.apple.quarantine "$appcopy" 2>/dev/null || true
-          /usr/bin/xattr -cr "$appcopy" 2>/dev/null || true
-
-          # (bottle) Ad-hoc re-sign the relocated binaries the way Homebrew
-          # re-signs poured bottles on Apple Silicon (Keg#codesign_patched_binary),
-          # preserving the entitlements baked in by nix-bundle-macos-app.
-          /usr/bin/codesign --sign - --force --deep \
-            --preserve-metadata=entitlements,requirements,flags,runtime "$appcopy" \
-            || /usr/bin/codesign --sign - --force --deep "$appcopy"
+      - name: Build cli-bundle-dir
+        run: nix build .#cli-bundle-dir -L
 
       - name: Smoke test (bundled binary runs)
         run: |
-          appcopy=$(find dist/ -maxdepth 1 -name '*.app' -print -quit)
-          out=$("$appcopy/Contents/MacOS/lgpd" --help 2>&1 || true)
+          out=$(./result/bin/lgpd --help 2>&1 || true)
           echo "$out"
           echo "$out" | grep -qi usage
 
-      - name: Package app bundle as tarball
+      - name: Package bundle as tarball
         run: |
-          appcopy=$(find dist/ -maxdepth 1 -name '*.app' -print -quit)
-          tar -czf lgpd-aarch64-macos.tar.gz -C dist "$(basename "$appcopy")"
+          dst="lgpd-aarch64-macos"
+          # Copy out of the read-only Nix store into a writable, archive-named dir.
+          rm -rf "$dst" && mkdir "$dst"
+          cp -RL result/. "$dst/"
+          chmod -R u+w "$dst"
+          # Strip the Gatekeeper quarantine attribute the way Homebrew's cask
+          # Quarantine.release! does. No-op on freshly built binaries (the Nix
+          # store carries none) but keeps the published artifact clean. The
+          # binaries are already validly ad-hoc signed by Nix — no re-signing.
+          /usr/bin/xattr -r -d com.apple.quarantine "$dst" 2>/dev/null || true
+          tar -czf "$dst.tar.gz" "$dst"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-app-aarch64-darwin
+          name: macos-aarch64-darwin
           path: lgpd-aarch64-macos.tar.gz
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')
-    needs: [build-appimage, build-macos-app]
+    needs: [build-appimage, build-macos-bundle]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -139,7 +125,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: macos-app-aarch64-darwin
+          name: macos-aarch64-darwin
           path: artifacts/
 
       - name: Generate tag
