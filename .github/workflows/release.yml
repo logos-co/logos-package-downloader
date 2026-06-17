@@ -1,0 +1,155 @@
+name: Build & Release
+
+# Builds distributable lgpd artifacts and, on release/** branches, publishes
+# them as a GitHub pre-release. Modeled on logos-basecamp's build.yml.
+#
+#   Linux (x86_64 + aarch64): build the AppImage, chmod +x, wrap in a tar.gz.
+#   macOS (aarch64):          build the .app via nix-bundle-macos-app, strip the
+#                             Gatekeeper quarantine flag + ad-hoc re-sign the way
+#                             Homebrew handles casks/bottled binaries, then wrap
+#                             in a tar.gz.
+
+on:
+  push:
+    branches:
+      - master
+      - 'release/**'
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-appimage:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64-linux
+            runner: ubuntu-latest
+          - arch: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: logos-co
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Build cli-appimage
+        run: nix build .#cli-appimage -L
+
+      - name: Smoke test (AppImage runs)
+        run: |
+          src=$(find result/ -name '*.AppImage' -print -quit)
+          out=$(APPIMAGE_EXTRACT_AND_RUN=1 "$src" --help 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -qi usage
+
+      - name: Package AppImage as tarball
+        run: |
+          arch="${{ matrix.arch }}"
+          arch_short="${arch%%-*}"
+          src=$(find result/ -name '*.AppImage' -print -quit)
+          cp "$src" "lgpd-${arch_short}.AppImage"
+          chmod +x "lgpd-${arch_short}.AppImage"
+          tar -czf "lgpd-${arch_short}-linux.tar.gz" "lgpd-${arch_short}.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ matrix.arch }}
+          path: lgpd-*-linux.tar.gz
+
+  build-macos-app:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: logos-co
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Build cli-macos-app
+        run: nix build .#cli-macos-app -L
+
+      - name: Strip quarantine + ad-hoc re-sign (Homebrew cask/bottle mechanism)
+        run: |
+          app=$(find result/ -maxdepth 2 -name '*.app' -print -quit)
+          # Copy out of the read-only Nix store into a writable working copy.
+          rm -rf dist && mkdir dist
+          cp -R "$app" "dist/$(basename "$app")"
+          appcopy="dist/$(basename "$app")"
+          chmod -R u+w "$appcopy"
+
+          # (cask) Strip the Gatekeeper quarantine attribute — the same call
+          # Homebrew's Cask::Quarantine.release! makes after staging a cask.
+          /usr/bin/xattr -r -d com.apple.quarantine "$appcopy" 2>/dev/null || true
+          /usr/bin/xattr -cr "$appcopy" 2>/dev/null || true
+
+          # (bottle) Ad-hoc re-sign the relocated binaries the way Homebrew
+          # re-signs poured bottles on Apple Silicon (Keg#codesign_patched_binary),
+          # preserving the entitlements baked in by nix-bundle-macos-app.
+          /usr/bin/codesign --sign - --force --deep \
+            --preserve-metadata=entitlements,requirements,flags,runtime "$appcopy" \
+            || /usr/bin/codesign --sign - --force --deep "$appcopy"
+
+      - name: Smoke test (bundled binary runs)
+        run: |
+          appcopy=$(find dist/ -maxdepth 1 -name '*.app' -print -quit)
+          out=$("$appcopy/Contents/MacOS/lgpd" --help 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -qi usage
+
+      - name: Package app bundle as tarball
+        run: |
+          appcopy=$(find dist/ -maxdepth 1 -name '*.app' -print -quit)
+          tar -czf lgpd-aarch64-macos.tar.gz -C dist "$(basename "$appcopy")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app-aarch64-darwin
+          path: lgpd-aarch64-macos.tar.gz
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')
+    needs: [build-appimage, build-macos-app]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: appimage-x86_64-linux
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: appimage-aarch64-linux
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-app-aarch64-darwin
+          path: artifacts/
+
+      - name: Generate tag
+        id: tag
+        run: echo "tag=pre-release-${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Pre-release ${{ steps.tag.outputs.tag }}
+          prerelease: true
+          files: |
+            artifacts/*.tar.gz
