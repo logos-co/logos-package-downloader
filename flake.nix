@@ -9,11 +9,8 @@
     logos-package.url = "github:logos-co/logos-package";
     nix-bundle-dir.url = "github:logos-co/nix-bundle-dir";
     nix-bundle-appimage.url = "github:logos-co/nix-bundle-appimage";
-    # Pinned to the non-Qt-bundle fix (logos-co/nix-bundle-macos-app#4) until
-    # it lands on the default branch — lgpd is a plain-C++ CLI, so its .app has
-    # no Resources/qt tree and trips the unguarded find in the published mkMacOSApp.
     nix-bundle-macos-app = {
-      url = "github:logos-co/nix-bundle-macos-app/463d7608c7539a18eb8d6a467609b85e88d781bb";
+      url = "github:logos-co/nix-bundle-macos-app";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.nix-bundle-dir.follows = "nix-bundle-dir";
     };

@@ -211,17 +211,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1781727922,
+        "lastModified": 1781728271,
         "narHash": "sha256-LHdzXrQPJCEVLC9cntURu8O9qSPPrePoVBzZd0UFGN0=",
         "owner": "logos-co",
         "repo": "nix-bundle-macos-app",
-        "rev": "463d7608c7539a18eb8d6a467609b85e88d781bb",
+        "rev": "d6b0cc518e599ab7a52258bf3e1f8123c8a01d31",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "nix-bundle-macos-app",
-        "rev": "463d7608c7539a18eb8d6a467609b85e88d781bb",
         "type": "github"
       }
     },
