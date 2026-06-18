@@ -137,5 +137,38 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Pre-release ${{ steps.tag.outputs.tag }}
           prerelease: true
+          body: |
+            ## Install
+
+            ### Linux
+
+            The artifact is an [AppImage](https://appimage.org/) — a single self-contained executable. Download it, extract, and drop it on your `PATH` as `lgpd` (swap `x86_64` for `aarch64` on ARM):
+
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/lgpd-x86_64-linux.tar.gz
+            tar -xvf lgpd-x86_64-linux.tar.gz
+            mkdir -p ~/.local/bin
+            install -m755 lgpd-x86_64.AppImage ~/.local/bin/lgpd
+            # make sure ~/.local/bin is on your PATH (add this to ~/.bashrc or ~/.zshrc):
+            export PATH="$HOME/.local/bin:$PATH"
+            ```
+
+            Now `lgpd` runs from anywhere. (If you hit a FUSE error, run it as `APPIMAGE_EXTRACT_AND_RUN=1 lgpd`.)
+
+            ### macOS (Apple Silicon)
+
+            > **Download from the terminal with `wget` or `curl` — _not_ a web browser.** Browsers tag downloads with `com.apple.quarantine`, which makes Gatekeeper block this unsigned binary. Fetching over the terminal and extracting with `tar` never sets that flag, so the binary runs as-is — no signing or notarization needed.
+
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/lgpd-aarch64-macos.tar.gz
+            tar -xvf lgpd-aarch64-macos.tar.gz
+            # move the whole folder somewhere permanent (keep its contents together —
+            # the binary finds its libraries via ../lib) and put its bin/ on your PATH:
+            mv lgpd-aarch64-macos ~/.local/lgpd
+            echo 'export PATH="$HOME/.local/lgpd/bin:$PATH"' >> ~/.zshrc
+            source ~/.zshrc
+            ```
+
+            Now `lgpd` runs from anywhere.
           files: |
             artifacts/*.tar.gz
