@@ -170,6 +170,7 @@ int cmdInfo(const CliOpts& o, const std::string& name) {
     if (found.is_null()) { std::cerr << "Error: package '" << name << "' not found\n"; return 1; }
     if (o.jsonOutput) { std::cout << found.dump(2) << "\n"; return 0; }
     std::cout << "Name:        " << found.value("name", "") << "\n";
+    std::cout << "Display:     " << found.value("displayName", "") << "\n";
     std::cout << "Type:        " << found.value("type", "") << "\n";
     std::cout << "Category:    " << found.value("category", "") << "\n";
     std::cout << "Author:      " << found.value("author", "") << "\n";
