@@ -691,6 +691,7 @@ struct PackageDownloaderLib::Impl {
                 if (pkg.contains("versions") && pkg["versions"].is_array()
                     && !pkg["versions"].empty()) {
                     const json& firstManifest = objOrEmpty(pkg["versions"][0], "manifest");
+                    entry["displayName"] = firstManifest.value("display_name", "");
                     entry["description"] = firstManifest.value("description", "");
                     entry["type"]        = firstManifest.value("type", "");
                     entry["category"]    = firstManifest.value("category", "");
