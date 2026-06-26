@@ -20,6 +20,7 @@
 #include <nlohmann/json.hpp>
 
 #include "package_downloader_lib.h"
+#include "version_info.h"
 
 using json = nlohmann::json;
 
@@ -76,7 +77,7 @@ Global options:
 }
 
 int printVersion() {
-    std::cout << "lgpd version 2.0.0\n";
+    std::cout << lgpd_version::versionString() << "\n";
     return 0;
 }
 

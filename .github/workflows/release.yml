@@ -3,6 +3,13 @@ name: Build & Release
 # Builds distributable lgpd artifacts and, on release/** branches, publishes
 # them as a GitHub pre-release. Modeled on logos-basecamp's build.yml.
 #
+# Version stamping: `lgpd --version` is baked at build time from a VERSION file
+# at the repo root (read by flake.nix). VERSION exists only on release/**
+# branches — add it (e.g. `echo 0.2.0 > VERSION`) on the release branch and this
+# job bakes that version in. master builds fall back to `pre-release-<sha7>`,
+# dirty local builds to `dev`; the commit hash (with a `-dirty` marker) is
+# always reported.
+#
 #   Linux (x86_64 + aarch64): build the AppImage, chmod +x, wrap in a tar.gz.
 #   macOS (aarch64):          build the portable cli-bundle-dir (bin/ + lib/),
 #                             strip the Gatekeeper quarantine flag the way
