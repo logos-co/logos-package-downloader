@@ -298,12 +298,79 @@ std::string cacheBustedUrl(const std::string& url) {
            std::to_string(n);
 }
 
+// Point libcurl at a CA-certificate bundle from the host system.
+//
+// nixpkgs builds curl against OpenSSL whose only built-in trust anchor is
+// a /nix store path (ultimately /nix/var/nix/profiles/default/etc/ssl/
+// certs/ca-bundle.crt) that exists ONLY when Nix is installed. A portable
+// build copied to a machine without Nix therefore has no trust store, and
+// every HTTPS fetch fails certificate verification (CURLE_SSL_CACERT) —
+// which is exactly why installing Nix "fixes" the download with no rebuild.
+// To stay self-contained we honor the standard env overrides first, then
+// probe the well-known per-distro/OS CA locations and pin them explicitly.
+// Resolved once and shared by every transfer (the lgpd CLI and the
+// in-process package_downloader module both reach here).
+void applyCaBundle(CURL* c) {
+    // { CAINFO file, CAPATH dir }. Both empty ⇒ nothing usable found, so
+    // leave curl on its compiled-in default rather than break a working host.
+    static const std::pair<std::string, std::string> ca = [] {
+        auto fileOk = [](const char* p) {
+            std::error_code ec; return p && *p && fs::is_regular_file(p, ec);
+        };
+        auto dirOk = [](const char* p) {
+            std::error_code ec; return p && *p && fs::is_directory(p, ec);
+        };
+        // 1) Explicit env overrides. libcurl/OpenSSL honor some of these
+        //    natively; setting them ourselves keeps behavior identical across
+        //    SSL backends. Guarded by existence so a stale path (e.g. an
+        //    inherited NIX_SSL_CERT_FILE pointing at a vanished store path)
+        //    doesn't shadow the system probe below.
+        for (const char* var : {"CURL_CA_BUNDLE", "SSL_CERT_FILE", "NIX_SSL_CERT_FILE"}) {
+            const char* v = std::getenv(var);
+            if (fileOk(v)) return std::make_pair(std::string(v), std::string());
+        }
+        if (const char* d = std::getenv("SSL_CERT_DIR"); dirOk(d))
+            return std::make_pair(std::string(), std::string(d));
+        // 2) Well-known system CA bundle files (first existing wins).
+        for (const char* p : {
+                 "/etc/ssl/certs/ca-certificates.crt",                 // Debian/Ubuntu/Arch/Gentoo, NixOS
+                 "/etc/pki/tls/certs/ca-bundle.crt",                   // Fedora/RHEL/CentOS
+                 "/etc/ssl/ca-bundle.pem",                             // openSUSE
+                 "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  // CentOS/RHEL 7+
+                 "/etc/ssl/cert.pem",                                  // macOS, Alpine, FreeBSD
+             }) {
+            if (fileOk(p)) return std::make_pair(std::string(p), std::string());
+        }
+        // 3) Well-known hashed-symlink CA directories.
+        for (const char* p : {"/etc/ssl/certs", "/etc/pki/tls/certs"}) {
+            if (dirOk(p)) return std::make_pair(std::string(), std::string(p));
+        }
+        return std::make_pair(std::string(), std::string());
+    }();
+
+    if (!ca.first.empty())  curl_easy_setopt(c, CURLOPT_CAINFO, ca.first.c_str());
+    if (!ca.second.empty()) curl_easy_setopt(c, CURLOPT_CAPATH, ca.second.c_str());
+}
+
+// Compact reason a libcurl transfer failed: the libcurl error string (with
+// its numeric code) when the request never completed, else the non-2xx HTTP
+// status. Surfaced via Fetcher::lastError so an opaque "fetch failed"
+// becomes diagnosable — e.g. a host with no usable CA bundle reports
+// "SSL peer certificate or SSH remote key was not OK" instead of nothing.
+std::string curlFailDetail(CURLcode res, long httpCode) {
+    if (res != CURLE_OK)
+        return std::string(curl_easy_strerror(res)) +
+               " (curl error " + std::to_string(static_cast<int>(res)) + ")";
+    return "HTTP status " + std::to_string(httpCode);
+}
+
 class HttpsFetcher : public Fetcher {
 public:
     bool get(const std::string& url, std::string& out) override {
         curlInit();
         CURL* c = curl_easy_init();
         if (!c) return false;
+        applyCaBundle(c);
         out.clear();
         // Cache-buster + no-cache headers so a reload right after an
         // upstream catalog change never re-serves a stale edge copy.
@@ -323,7 +390,9 @@ public:
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_slist_free_all(hdrs);
         curl_easy_cleanup(c);
-        return res == CURLE_OK && code >= 200 && code < 300;
+        const bool ok = (res == CURLE_OK && code >= 200 && code < 300);
+        m_lastError = ok ? std::string() : curlFailDetail(res, code);
+        return ok;
     }
 
     bool getToFile(const std::string& url, const std::string& path) override {
@@ -347,6 +416,7 @@ public:
 
         CURL* c = curl_easy_init();
         if (!c) return fail();
+        applyCaBundle(c);
         curl_easy_setopt(c, CURLOPT_URL, url.c_str());
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteFile);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &f);
@@ -359,12 +429,19 @@ public:
         curl_easy_cleanup(c);
         f.close();
         if (res != CURLE_OK || code < 200 || code >= 300) {
+            m_lastError = curlFailDetail(res, code);
             std::error_code rmEc;
             fs::remove(path, rmEc);
             return false;
         }
+        m_lastError.clear();
         return true;
     }
+
+    std::string lastError() const override { return m_lastError; }
+
+private:
+    std::string m_lastError;
 };
 
 // ─── logos-repo.json + index.json parsers ─────────────────────────────────────
@@ -487,7 +564,9 @@ struct RepositoryRegistry::Impl {
         }
         std::string body;
         if (!fetcher->get(r.url, body)) {
-            r.resolveError = "fetch failed: " + r.url;
+            const std::string detail = fetcher->lastError();
+            r.resolveError = "fetch failed: " + r.url +
+                             (detail.empty() ? "" : " — " + detail);
             return;
         }
         std::string err;
