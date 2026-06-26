@@ -1,0 +1,6 @@
+# Nix build artifacts
+result
+result-*
+
+# Generated build-info header (dropped into cmd/ by nix/cli.nix at build time)
+cmd/logos_build_info.h

@@ -259,7 +259,11 @@ A thin front-end over `PackageDownloaderLib`. The arg parser collects global
 flags into a `CliOpts` struct, then dispatches the first positional as the
 command. There are **no** `--release` or `categories` features (the workspace
 `CLAUDE.md` `lgpd` section documents an older interface — `cmd/main.cpp` and the
-README are authoritative). The version string is `lgpd version 2.0.0`.
+README are authoritative). The version is build-derived: `lgpd version <v>`
+followed by this repo's commit (with a `-dirty` marker) and the locked commits
+of the flake inputs, all baked in at build time by `nix/build-info.nix`. `<v>`
+is the `VERSION` file contents on a release branch, `pre-release-<sha7>` on a
+clean master build, or `dev` for a dirty local build.
 
 #### Catalog commands
 
@@ -301,7 +305,7 @@ README are authoritative). The version string is `lgpd version 2.0.0`.
 | `-o` / `--output <dir>` | download | Output directory. |
 | `--json` | all read commands | Emit structured JSON. |
 | `-h` / `--help` | — | Print usage (exit 0). |
-| `-V` | — | Print `lgpd version 2.0.0` (exit 0). |
+| `-V` | — | Print the build-derived version banner (`lgpd version <v>` + commit + dependency commits, exit 0). |
 | `--version` (bare) | — | With no value following, prints the version like `-V`. With a value, pins a package version (see above). |
 
 ## Verification model (`verifyDownloadAgainstIndex`)
@@ -496,7 +500,8 @@ lgpd_free(ctx);
 - **Stale platform docs.** The workspace `CLAUDE.md` `lgpd` section describes an
   older interface (a `--release` flag and a `categories` command) that does
   **not** match the current implementation. `README.md` and `cmd/main.cpp` are
-  authoritative: version reports `lgpd version 2.0.0`, repos are config-file
-  based, and there is no `categories` subcommand.
+  authoritative: version reports a build-derived `lgpd version <v>` banner (see
+  the CLI section), repos are config-file based, and there is no `categories`
+  subcommand.
 - **Not a Qt module / not a Python package.** There is no `metadata.json` or
   `pyproject.toml` — this is a plain C++ library + CLI.
