@@ -199,6 +199,17 @@ public:
     /// through the full resolver.
     static bool semverMatches(const std::string& range, const std::string& version);
 
+    /// The resolver's ranking rule: does the candidate outrank the incumbent?
+    ///
+    /// SemVer precedence decides; `releasedAt` only breaks ties between equal
+    /// versions. The resolver used to rank on `releasedAt` alone, so a 1.2.x
+    /// hotfix backported after 2.0.0 shipped — newer timestamp, older version —
+    /// would be chosen over 2.0.0.
+    ///
+    /// Exposed so the rule can be tested without standing up a live catalog.
+    static bool outranks(const std::string& candidateVersion, const std::string& candidateDate,
+                         const std::string& incumbentVersion, const std::string& incumbentDate);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
