@@ -730,6 +730,7 @@ const json* pickVersion(const json& pkg,
     if (!pkg.is_object() || !pkg.contains("versions") || !pkg["versions"].is_array())
         return nullptr;
     const json* best = nullptr;
+    std::string bestVer;
     std::string bestDate;
     for (const auto& v : pkg["versions"]) {
         // Skip null/array/scalar entries — value() on a non-object throws
@@ -741,7 +742,16 @@ const json* pickVersion(const json& pkg,
         std::string vDate = v.value("releasedAt", "");
         if (!version.empty() && vVer != version) continue;
         if (!rootHash.empty() && vHash != rootHash) continue;
-        if (!best || vDate > bestDate) { best = &v; bestDate = vDate; }
+        // "Newest" = highest SemVer precedence, with releasedAt only breaking
+        // ties (see PackageDownloaderLib::outranks). This path picks the version
+        // when the caller pins none (version=""), so it must use the same rule
+        // as findBest and the catalog sort — otherwise downloadPackage(...,"")
+        // would still prefer a later-published LOWER version.
+        if (!best || PackageDownloaderLib::outranks(vVer, vDate, bestVer, bestDate)) {
+            best = &v;
+            bestVer = vVer;
+            bestDate = vDate;
+        }
     }
     return best;
 }
