@@ -1047,6 +1047,12 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
 
     json out = json::array();
     std::unordered_map<std::string, bool> seen; // name|version|hash
+    // Names resolved from an explicit top-level input, and the version chosen
+    // for each. A top-level pin is authoritative: the same module must not then
+    // be re-resolved to a *different* (newest) version when it also turns up as
+    // a transitive dependency of another top-level input. See the transitive
+    // guard below.
+    std::unordered_map<std::string, std::string> topLevelChosen; // name -> version
 
     // Lookup helper: find best candidate across repos.
     auto findBest = [&](const ParsedDep& dep, json& chosen, std::string& chosenRepo, std::string& errMsg) -> bool {
@@ -1159,6 +1165,20 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         // this: the caller asked for them explicitly, so they must
         // always resolve to a catalog pick.
         if (!qe.isTopLevel) {
+            // Top-level pin wins. If this same name was explicitly requested at
+            // top level, that pick is authoritative — do NOT re-resolve it here
+            // to a newer catalog version. Otherwise a module that is both
+            // explicitly pinned AND a dependency of another pinned package gets
+            // emitted twice (once at the pin, once at newest), and consumers
+            // that key rows by name see the newest copy clobber the user's pick
+            // (the app-manager version dropdown snapping back to the newest
+            // release). The pinned version's own transitive deps were already
+            // enqueued when it was processed as a top-level input, so nothing is
+            // lost by skipping the duplicate. Whether the pin satisfies this
+            // dependent's range is a UI concern (surfaced as an "outdated"
+            // hint); we don't block a deliberate pin here.
+            if (topLevelChosen.count(dep.name)) continue;
+
             auto it = installedByName.find(dep.name);
             if (it != installedByName.end()) {
                 const bool inRange = !dep.versionRange
@@ -1186,6 +1206,9 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         entry["url"] = chosen.value("url", "");
         entry["topLevel"] = qe.isTopLevel;
         out.push_back(std::move(entry));
+        // Remember the version an explicit top-level input resolved to, so a
+        // later transitive encounter of the same name defers to it (above).
+        if (qe.isTopLevel) topLevelChosen[dep.name] = ver;
         // Enqueue transitive deps from the chosen version's manifest.
         if (chosenManifest.contains("dependencies") && chosenManifest["dependencies"].is_array()) {
             for (const auto& sub : chosenManifest["dependencies"]) {
