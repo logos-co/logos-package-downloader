@@ -3,7 +3,9 @@
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <vector>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -27,8 +29,10 @@ public:
 };
 
 json makeVersion(const char* ver, const char* hash, const json& deps) {
+    // These tests order versions by SemVer precedence, so releasedAt only
+    // tie-breaks equal versions (none here) — a single valid date suffices.
     return json{
-        {"releasedAt", std::string("2026-01-0") + (ver[4] ? ver[4] : '1') + "T00:00:00Z"},
+        {"releasedAt", "2026-01-01T00:00:00Z"},
         {"url", std::string("https://test.local/") + ver + ".lgx"},
         {"rootHash", hash},
         {"manifest", {
