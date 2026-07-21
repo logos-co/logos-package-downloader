@@ -464,9 +464,9 @@ void RepositoryRegistry::setFetcher(std::shared_ptr<Fetcher> fetcher) {
 std::vector<Repository> RepositoryRegistry::list() const {
     std::lock_guard<std::mutex> lock(impl_->mu);
     std::vector<Repository> out;
-    Repository def = impl_->defaultRepo;
-    def.enabled = !impl_->defaultDisabled;
-    out.push_back(def);
+    if (!impl_->defaultDisabled) {
+        out.push_back(impl_->defaultRepo);
+    }
     for (const auto& r : impl_->userRepos) out.push_back(r);
     return out;
 }
@@ -475,7 +475,13 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (!impl_->persistent) return "no config file (pass --config <path>)";
     if (url.empty()) return "url is empty";
-    if (url == impl_->defaultRepo.url) return "cannot add the default repository";
+    if (url == impl_->defaultRepo.url) {
+        // Re-adding the default URL restores it — clears the disabled flag.
+        if (!impl_->defaultDisabled) return "already registered: " + url;
+        impl_->defaultDisabled = false;
+        impl_->refreshOne(impl_->defaultRepo);
+        return impl_->save();
+    }
     if (!isHttpsUrl(url)) return "unsupported URL scheme (https required in v1)";
     for (const auto& r : impl_->userRepos) {
         if (r.url == url) return "already registered: " + url;
@@ -494,7 +500,12 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
 std::string RepositoryRegistry::removeRepository(const std::string& url) {
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (!impl_->persistent) return "no config file (pass --config <path>)";
-    if (url == impl_->defaultRepo.url) return "cannot remove the default repository";
+    if (url == impl_->defaultRepo.url) {
+        // Set the persisted flag; list() will omit the default repo entirely
+        // until the config is reset or the flag is cleared.
+        impl_->defaultDisabled = true;
+        return impl_->save();
+    }
     auto it = std::find_if(impl_->userRepos.begin(), impl_->userRepos.end(),
                            [&](const Repository& r) { return r.url == url; });
     if (it == impl_->userRepos.end()) return "not registered: " + url;
@@ -522,9 +533,11 @@ std::string RepositoryRegistry::setEnabled(const std::string& url, bool enabled)
 std::string RepositoryRegistry::refresh() {
     std::lock_guard<std::mutex> lock(impl_->mu);
     std::vector<std::string> errs;
-    impl_->refreshOne(impl_->defaultRepo);
-    if (!impl_->defaultRepo.resolveError.empty()) {
-        errs.push_back("default: " + impl_->defaultRepo.resolveError);
+    if (!impl_->defaultDisabled) {
+        impl_->refreshOne(impl_->defaultRepo);
+        if (!impl_->defaultRepo.resolveError.empty()) {
+            errs.push_back("default: " + impl_->defaultRepo.resolveError);
+        }
     }
     for (auto& r : impl_->userRepos) {
         impl_->refreshOne(r);

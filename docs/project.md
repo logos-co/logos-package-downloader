@@ -178,10 +178,10 @@ Logos module wrapper and existing CLI code use that name).
 ### `lgpd::RepositoryRegistry`
 
 Defined in `src/package_downloader_lib.h`. Manages the default repo + persisted
-user repos. The default repo is **always present** in the merged view; only
-user repos are written to disk. Mutations return a **non-empty error string on
-failure** and persist only when the registry was constructed with a config
-path.
+user repos. The default repo is listed first when enabled; when
+`defaultDisabled` is set it is **omitted from `list()`**. Only user repos are
+written to disk. Mutations return a **non-empty error string on failure** and
+persist only when the registry was constructed with a config path.
 
 ```cpp
 RepositoryRegistry();                            // in-memory; user mutations error
@@ -193,7 +193,7 @@ explicit RepositoryRegistry(std::string configPath);  // persisted
 | `void setFetcher(std::shared_ptr<Fetcher>)` | Set the metadata fetcher (defaults to `HttpsFetcher`). |
 | `std::vector<Repository> list() const` | Default-first, then user repos in declared order; each with its `enabled` flag and resolved metadata. |
 | `std::string addRepository(const std::string& url)` | Add a user repo by its `logos-repo.json` URL; resolves metadata and persists. Empty string = success. |
-| `std::string removeRepository(const std::string& url)` | Remove a user repo (cannot remove the default). Persists on success. |
+| `std::string removeRepository(const std::string& url)` | Remove a user repo, or permanently disable the default repo. Persists on success. |
 | `std::string setEnabled(const std::string& url, bool enabled)` | Enable/disable any repo. Toggling the default sets the `defaultDisabled` config flag. |
 | `std::string refresh()` | Re-fetch `logos-repo.json` for every repo. Best-effort: per-entry failures land in `resolveError`, never abort. |
 | `std::optional<Repository> findByUrlOrName(const std::string& s) const` | Look up by URL or canonical name. |
@@ -343,8 +343,10 @@ stored.
 }
 ```
 
-The default repository can be **disabled** (`defaultDisabled: true`) but is
-never written into `repositories[]` and never removed.
+The default repository can be **disabled** (`defaultDisabled: true`) via
+`removeRepository` / `setEnabled(..., false)`. It is never written into
+`repositories[]`; while disabled it is omitted from `list()`. Re-adding
+`kDefaultRepositoryUrl` clears the flag.
 
 ## Building and Testing
 
@@ -389,9 +391,11 @@ The test suite (`tests/test_downloader.cpp`, GoogleTest via CTest) covers:
 | `Semver.ExactAndComparator` | Exact match + `>=` / `<` comparators. |
 | `Semver.CaretAndTilde` | `^` and `~` range semantics (including `0.x` caret behaviour). |
 | `Semver.WildcardAndConjunction` | `*`, `1.x` wildcards, whitespace conjunction (`>=1.0 <2.0`), `\|\|` alternation. |
-| `Registry.DefaultIsAlwaysPresent` | An in-memory registry always lists the default repo first. |
-| `Registry.MutationsRequireConfig` | `addRepository` on an in-memory client returns a non-empty error. |
-| `Registry.RoundTripsConfigFile` | Toggling the default's `enabled` flag persists and reloads from disk. |
+| `Registry.DefaultIsPresentWhenEnabled` | An in-memory registry lists the default repo first. |
+| `Registry.MutationsRequireConfig` | `add`/`remove` on an in-memory client return a non-empty error. |
+| `Registry.DisableDefaultOmitsFromListAndPersists` | `setEnabled(default, false)` omits the default from `list()` and persists `defaultDisabled`. |
+| `Registry.RemoveDefaultThenReAdd` | `removeRepository(default)` omits + persists; `addRepository(defaultUrl)` restores; re-add while present errors. |
+| `Registry.RefreshSkipsDisabledDefault` | `refresh()` does not fetch (or error on) a disabled default. |
 | `Catalog.ReturnsJsonArrayWhenNoNetwork` | `getCatalogJson()` parses to a JSON array even with no network (lazy fetch degrades to empty). |
 
 ### Raw CMake (inside `nix develop`)
@@ -482,8 +486,9 @@ lgpd_free(ctx);
 - **Repo mutations need a config path.** `repo add/remove/enable/disable` and
   `config show` require `--config <path>`; an in-memory client returns errors
   for these mutations.
-- **The default repository can be disabled but never removed** (and cannot be
-  re-added) — it is hardcoded as `kDefaultRepositoryUrl`.
+- **The default repository URL is hardcoded** as `kDefaultRepositoryUrl`. It can
+  be disabled (`defaultDisabled`) — omitted from `list()` — and restored by
+  re-adding that same URL; it is never written into `repositories[]`.
 - **Semver matcher is a subset of semver 2.0** — build metadata is ignored for
   comparison; pre-release ordering only handles the basic `X-pre < X` rule.
 - **Deep Ed25519 trust is out of scope.** `lgpd` only binds index→file
