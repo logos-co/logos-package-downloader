@@ -206,38 +206,123 @@ TEST(Resolver, UnpinnedTransitiveDepStillResolvesToNewest) {
 
 // ─── Repository registry (in-memory) ─────────────────────────────────────────
 
-TEST(Registry, DefaultIsAlwaysPresent) {
+TEST(Registry, DefaultIsPresentWhenEnabled) {
     lgpd::PackageDownloaderLib lib;
     auto repos = lib.registry().list();
     ASSERT_FALSE(repos.empty());
     EXPECT_TRUE(repos.front().isDefault);
+    EXPECT_TRUE(repos.front().enabled);
 }
 
 TEST(Registry, MutationsRequireConfig) {
     lgpd::PackageDownloaderLib lib;
     auto err = lib.registry().addRepository("https://example.com/logos-repo.json");
     EXPECT_FALSE(err.empty());
+    // remove of the default also requires a config-backed registry
+    err = lib.registry().removeRepository(lgpd::kDefaultRepositoryUrl);
+    EXPECT_FALSE(err.empty());
 }
 
-TEST(Registry, RoundTripsConfigFile) {
+// defaultDisabled omits the default from list() (not "present but disabled").
+TEST(Registry, DisableDefaultOmitsFromListAndPersists) {
     fs::path cfg = fs::temp_directory_path() / ("lgpd_test_cfg_" + std::to_string(std::rand()) + ".json");
     {
         lgpd::PackageDownloaderLib lib(cfg.string());
-        // Adding a bogus URL fails fast (no fetcher will reach it). Just
-        // exercise the persistence layer by toggling the default's enabled
-        // flag, which doesn't require a successful fetch.
         auto err = lib.registry().setEnabled(lgpd::kDefaultRepositoryUrl, false);
         EXPECT_TRUE(err.empty()) << err;
+        EXPECT_TRUE(lib.registry().list().empty());
     }
     ASSERT_TRUE(fs::exists(cfg));
     {
+        // Config on disk carries defaultDisabled: true.
+        std::ifstream in(cfg);
+        json j; in >> j;
+        EXPECT_TRUE(j.value("defaultDisabled", false));
+
         lgpd::PackageDownloaderLib lib2(cfg.string());
-        // The default appears as disabled after reload.
-        auto repos = lib2.registry().list();
-        ASSERT_FALSE(repos.empty());
-        EXPECT_TRUE(repos.front().isDefault);
-        EXPECT_FALSE(repos.front().enabled);
+        EXPECT_TRUE(lib2.registry().list().empty());
     }
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// removeRepository on the default URL is the permanent-disable path used by
+// Settings → Repositories. It must round-trip through the config file, and
+// addRepository(defaultUrl) must restore it.
+TEST(Registry, RemoveDefaultThenReAdd) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_test_rm_" + std::to_string(std::rand()) + ".json");
+    auto mock = std::make_shared<MockFetcher>();
+    mock->repoJson = json{{"schemaVersion", 1}, {"name", "test"},
+                          {"displayName", "Test"}, {"indexUrl", kIndexUrl},
+                          {"trustedSigners", json::array()}}.dump();
+    mock->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "test"},
+                           {"packages", json::array()}}.dump();
+    {
+        lgpd::PackageDownloaderLib lib(cfg.string());
+        lib.setFetcher(mock);
+        ASSERT_FALSE(lib.registry().list().empty());
+
+        auto err = lib.registry().removeRepository(lgpd::kDefaultRepositoryUrl);
+        EXPECT_TRUE(err.empty()) << err;
+        EXPECT_TRUE(lib.registry().list().empty());
+
+        // Re-removing while already disabled is still a success (idempotent
+        // disable) — it just rewrites defaultDisabled: true.
+        err = lib.registry().removeRepository(lgpd::kDefaultRepositoryUrl);
+        EXPECT_TRUE(err.empty()) << err;
+
+        // Re-add by the hardcoded default URL restores the entry.
+        err = lib.registry().addRepository(lgpd::kDefaultRepositoryUrl);
+        EXPECT_TRUE(err.empty()) << err;
+        auto repos = lib.registry().list();
+        ASSERT_EQ(repos.size(), 1u);
+        EXPECT_TRUE(repos.front().isDefault);
+        EXPECT_EQ(repos.front().url, lgpd::kDefaultRepositoryUrl);
+
+        // Adding again while present is rejected.
+        err = lib.registry().addRepository(lgpd::kDefaultRepositoryUrl);
+        EXPECT_FALSE(err.empty());
+        EXPECT_NE(err.find("already registered"), std::string::npos);
+    }
+    // Persistence: after remove + save, a fresh client sees an empty list.
+    {
+        lgpd::PackageDownloaderLib lib(cfg.string());
+        lib.setFetcher(mock);
+        ASSERT_FALSE(lib.registry().list().empty());
+        auto err = lib.registry().removeRepository(lgpd::kDefaultRepositoryUrl);
+        EXPECT_TRUE(err.empty()) << err;
+    }
+    {
+        lgpd::PackageDownloaderLib lib2(cfg.string());
+        lib2.setFetcher(mock);
+        EXPECT_TRUE(lib2.registry().list().empty());
+
+        auto err = lib2.registry().addRepository(lgpd::kDefaultRepositoryUrl);
+        EXPECT_TRUE(err.empty()) << err;
+        ASSERT_EQ(lib2.registry().list().size(), 1u);
+        EXPECT_TRUE(lib2.registry().list().front().isDefault);
+    }
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// refresh() must not try to fetch the default when it is disabled — otherwise
+// a missing/unreachable default would keep showing up as a refresh error
+// after the user removed it.
+TEST(Registry, RefreshSkipsDisabledDefault) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_test_ref_" + std::to_string(std::rand()) + ".json");
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    // Inject a fetcher that fails every URL. With the default enabled this
+    // would produce a "default: ..." error; after remove it must be quiet.
+    auto failing = std::make_shared<MockFetcher>();
+    failing->repoJson.clear();
+    failing->indexJson.clear();
+    lib.setFetcher(failing);
+
+    auto err = lib.registry().removeRepository(lgpd::kDefaultRepositoryUrl);
+    ASSERT_TRUE(err.empty()) << err;
+
+    err = lib.registry().refresh();
+    EXPECT_TRUE(err.empty()) << "refresh reported errors for a disabled default: " << err;
+
     std::error_code ec; fs::remove(cfg, ec);
 }
 

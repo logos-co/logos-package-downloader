@@ -54,13 +54,14 @@ struct Repository {
 };
 
 /// Registry of repositories. Persists `{ url, enabled }` plus a
-/// `defaultDisabled` flag. The default repo is ALWAYS present in the
-/// merged view; only user repos are written to disk.
+/// `defaultDisabled` flag. When enabled, the default repo is listed first;
+/// when disabled it is omitted from `list()` entirely. Only user repos are
+/// written into `repositories[]`.
 class RepositoryRegistry {
 public:
     /// Construct an in-memory registry with no config-file backing. Mutating
-    /// methods (add/remove/setEnabled for user repos) will return an error.
-    /// The default repo is always present.
+    /// methods (add/remove/setEnabled) will return an error. The default
+    /// repo is present (enabled).
     RepositoryRegistry();
 
     /// Construct backed by a JSON config file. The file is loaded if it
@@ -73,30 +74,33 @@ public:
     /// libcurl-backed `HttpsFetcher`.
     void setFetcher(std::shared_ptr<Fetcher> fetcher);
 
-    /// Returns the in-memory list, default-first then user repos in
-    /// declared order. Each entry has its `enabled` flag and its resolved
-    /// metadata (if `refresh()` has been called and the fetch succeeded).
+    /// Returns the in-memory list, default-first (when not disabled) then
+    /// user repos in declared order. Each entry has its `enabled` flag and
+    /// its resolved metadata (if `refresh()` has been called and the fetch
+    /// succeeded).
     std::vector<Repository> list() const;
 
-    /// Add a user repo by URL. The URL must point to a `logos-repo.json`
+    /// Add a user repo by URL, or re-enable the default repo when `url` is
+    /// `kDefaultRepositoryUrl`. The URL must point to a `logos-repo.json`
     /// (or wherever the client can fetch one). On success persists the
     /// updated config to disk. Returns an empty string on success, or an
     /// error message.
     std::string addRepository(const std::string& url);
 
-    /// Remove a user repo by URL. Cannot remove the default. Persists on
-    /// success.
+    /// Remove a user repo by URL, or permanently disable the default repo
+    /// (sets `defaultDisabled`; `list()` omits it). Persists on success.
     std::string removeRepository(const std::string& url);
 
     /// Enable or disable a repo. Allowed for any entry. Toggling the
-    /// default sets the `defaultDisabled` flag in the config file.
+    /// default sets the `defaultDisabled` flag in the config file (same
+    /// omit-from-list semantics as `removeRepository` on the default).
     std::string setEnabled(const std::string& url, bool enabled);
 
-    /// Re-fetch `logos-repo.json` for every repo (default + user). After
-    /// calling, `list()` returns entries with resolved metadata fields
-    /// populated. Returns an empty string on overall success or a summary
-    /// of fetch errors (the registry is best-effort: failures are recorded
-    /// per-entry in `resolveError` but do not abort).
+    /// Re-fetch `logos-repo.json` for every enabled repo (skips a disabled
+    /// default). After calling, `list()` returns entries with resolved
+    /// metadata fields populated. Returns an empty string on overall
+    /// success or a summary of fetch errors (the registry is best-effort:
+    /// failures are recorded per-entry in `resolveError` but do not abort).
     std::string refresh();
 
     /// Look up a repo by URL or by canonical name. Returns nullopt if no
