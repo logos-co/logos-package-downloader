@@ -13,25 +13,34 @@ pkgs.stdenv.mkDerivation {
 
     mkdir -p $out/lib $out/include
 
-    if [ -f lib/libpackage_downloader_lib.dylib ]; then
-      cp lib/libpackage_downloader_lib.dylib $out/lib/
-    elif [ -f lib/libpackage_downloader_lib.so ]; then
-      cp lib/libpackage_downloader_lib.so $out/lib/
-    else
-      echo "Error: No library file found"
+    # Windows adds a third spelling -- libpackage_downloader_lib.dll plus its
+    # .dll.a import library, which consumers must link against. Every pattern
+    # carries a wildcard so nullglob can drop the ones that do not match; a
+    # literal path with no wildcard would survive and break the copy.
+    shopt -s nullglob
+    libs=(lib/libpackage_downloader_lib*.dylib lib/libpackage_downloader_lib*.so \
+          lib/libpackage_downloader_lib*.dll lib/libpackage_downloader_lib*.dll.a)
+    if [ ''${#libs[@]} -eq 0 ]; then
+      echo "Error: No library file found" >&2
+      ls -la lib >&2 || true
       exit 1
     fi
+    cp "''${libs[@]}" $out/lib/
 
     # Bundle liblgx alongside so the downloader lib can resolve it at
     # runtime via @loader_path / $ORIGIN (the verify-against-index step
     # links lgx). Mirrors what logos-package-manager's lib.nix does.
-    if [ -f ${logosPackageLib}/lib/liblgx.dylib ]; then
-      cp ${logosPackageLib}/lib/liblgx.dylib $out/lib/
-    elif [ -f ${logosPackageLib}/lib/liblgx.so ]; then
-      cp ${logosPackageLib}/lib/liblgx.so $out/lib/
-    else
-      echo "Warning: liblgx library not found in ${logosPackageLib}/lib/"
+    # liblgx.dll lives in bin/, not lib/: CMake installs Windows RUNTIME
+    # artifacts there. Missing it used to be a WARNING, which on Windows would
+    # have produced a package that links but cannot start.
+    lgxlibs=(${logosPackageLib}/lib/liblgx*.dylib ${logosPackageLib}/lib/liblgx*.so \
+             ${logosPackageLib}/bin/liblgx*.dll ${logosPackageLib}/lib/liblgx*.dll.a)
+    if [ ''${#lgxlibs[@]} -eq 0 ]; then
+      echo "Error: no liblgx runtime found under ${logosPackageLib}" >&2
+      ls -la ${logosPackageLib}/lib ${logosPackageLib}/bin >&2 || true
+      exit 1
     fi
+    cp "''${lgxlibs[@]}" $out/lib/
 
     cp ${src}/src/package_downloader_lib.h $out/include/
     cp ${src}/src/lgpd.h $out/include/

@@ -153,6 +153,20 @@ std::string cacheBustedUrl(const std::string& url) {
 // Resolved once and shared by every transfer (the lgpd CLI and the
 // in-process package_downloader module both reach here).
 void applyCaBundle(CURL* c) {
+#ifdef _WIN32
+    // Windows has no filesystem CA bundle to probe for: trust anchors live in
+    // the system certificate store, reachable only through the Win32 crypto
+    // API. Every path below would miss, leaving curl on its compiled-in
+    // default -- which for a Nix-cross-built libcurl is a /nix/store path that
+    // does not exist on the target machine, so every HTTPS fetch fails with an
+    // opaque "fetch failed".
+    //
+    // CURLSSLOPT_NATIVE_CA (curl >= 7.71) makes the OpenSSL backend import the
+    // Windows store instead. Set rather than probed, so it is also correct on
+    // a machine whose certificates were updated after this binary was built.
+    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+    return;
+#else
     // { CAINFO file, CAPATH dir }. Both empty ⇒ nothing usable found, so
     // leave curl on its compiled-in default rather than break a working host.
     static const std::pair<std::string, std::string> ca = [] {
@@ -192,6 +206,7 @@ void applyCaBundle(CURL* c) {
 
     if (!ca.first.empty())  curl_easy_setopt(c, CURLOPT_CAINFO, ca.first.c_str());
     if (!ca.second.empty()) curl_easy_setopt(c, CURLOPT_CAPATH, ca.second.c_str());
+#endif  // _WIN32
 }
 
 // Compact reason a libcurl transfer failed: the libcurl error string (with

@@ -27,15 +27,29 @@ pkgs.stdenv.mkDerivation {
     runHook preInstall
 
     mkdir -p $out/bin $out/lib
-    if [ -f bin/lgpd ]; then
-      cp bin/lgpd $out/bin/
+    # .exe when cross-compiling to Windows.
+    exe="bin/lgpd${pkgs.stdenv.hostPlatform.extensions.executable}"
+    if [ -f "$exe" ]; then
+      cp "$exe" $out/bin/
     else
-      echo "Error: lgpd executable not found"
+      echo "Error: $exe not found"
       exit 1
     fi
 
     # Copy libraries alongside the binary so RPATH can find them
     cp -a ${lib}/lib/* $out/lib/
+
+    # Windows has no RPATH: a DLL is found in the EXECUTABLE's directory, so
+    # the runtime DLLs must sit in bin/ next to the .exe, not in lib/.
+    # nixpkgs' win-dll-link.sh stages dependency DLLs automatically but only
+    # scans $out/bin, so it never saw these -- lgpm.exe exited 53 with no
+    # output because libpackage_manager_lib.dll was in lib/ where Windows does
+    # not look. (.dll.a import libraries stay in lib/; they are link-time only.)
+    shopt -s nullglob
+    dlls=($out/lib/*.dll)
+    if [ ''${#dlls[@]} -gt 0 ]; then
+      cp -a "''${dlls[@]}" $out/bin/
+    fi
 
     runHook postInstall
   '';

@@ -41,10 +41,27 @@
         dirBundler = nix-bundle-dir.bundlers.${system}.permissive;
         logosPackageLib = logos-package.packages.${system}.lib;
       });
+      # Adds the "x86_64-windows" pseudo-system. PACKAGES only -- `checks` cannot
+      # run (ctest would have to execute PE binaries on the Linux build host)
+      # and a cross devShell offers no way to run what it produces.
+      forAllTargets = logos-nix.lib.forAllTargets;
     in
     {
-      packages = forAllSystems ({ pkgs, system, dirBundler, logosPackageLib }:
+      packages = forAllTargets ({ pkgs, system }:
         let
+          logosPackageLib = logos-package.packages.${system}.lib;
+          dirBundler = nix-bundle-dir.bundlers.${system}.permissive;
+          # Windows exposes the bare CLI only. nix-bundle-dir has no PE backend --
+          # and does not need one for a plain console tool: PE import tables
+          # carry DLL BASE NAMES rather than paths (no rpath exists in the
+          # format), Windows searches the executable's own directory first, and
+          # nixpkgs' win-dll-link.sh already stages every dependency DLL there.
+          # So a dereferencing copy of $out/bin is self-contained, and the path
+          # rewriting the ELF/Mach-O bundlers exist to do has no analogue here.
+          # Verified end to end: lgx.exe round-trips a package on a Windows box
+          # with no Nix installed.
+          isWindows = pkgs.stdenv.hostPlatform.isWindows;
+
           common = import ./nix/default.nix { inherit pkgs logosPackageLib; };
           src = ./.;
 
@@ -62,6 +79,7 @@
           lib = lib;
           cli = cli;
 
+        } // pkgs.lib.optionalAttrs (!isWindows) {
           cli-bundle-dir = dirBundler cli;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           cli-appimage = nix-bundle-appimage.lib.${system}.mkAppImage {
@@ -71,10 +89,10 @@
             desktopFile = ./assets/lgpd.desktop;
             icon = ./assets/lgpd.png;
           };
-        } // {
+        } // pkgs.lib.optionalAttrs (!isWindows) {
           # Tests
           tests = import ./nix/tests.nix { inherit pkgs common src logosPackageLib; };
-
+        } // {
           default = combined;
         }
       );

@@ -26,6 +26,14 @@
   cmakeFlags = [
     "-GNinja"
     "-DLGX_ROOT=${logosPackageLib}"
+  ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isWindows [
+    # WINDOWS_EXPORT_ALL_SYMBOLS builds its .def file by running objdump over
+    # the object files. CMake looks up CMAKE_OBJDUMP to do that, nixpkgs does
+    # not set it for a cross build (it sets AR/RANLIB/STRIP but not OBJDUMP),
+    # and when it is missing CMake skips def-file generation SILENTLY -- the
+    # property appears to be honoured and exports nothing. Point it at the
+    # target objdump explicitly.
+    "-DCMAKE_OBJDUMP=${pkgs.stdenv.cc.bintools.bintools}/bin/${pkgs.stdenv.cc.targetPrefix}objdump"
   ];
 
   env = {
@@ -34,6 +42,6 @@
 
   meta = with pkgs.lib; {
     description = "Logos Package Downloader - Online package catalog and download library";
-    platforms = platforms.unix;
+    platforms = platforms.unix ++ platforms.windows;
   };
 }

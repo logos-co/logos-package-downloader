@@ -40,6 +40,23 @@ set(LIB_SOURCES
 # Create the shared library
 add_library(package_downloader_lib SHARED ${LIB_SOURCES})
 
+# The C API in src/lgpd.h is explicitly __declspec(dllexport)-ed, and GNU ld
+# disables PE auto-export for the ENTIRE image as soon as any symbol is
+# explicitly exported. The C++ classes the CLI links against carry no
+# annotation, so they silently vanished from the export table and lgpm/lgpd
+# failed to link with 42 undefined references to perfectly ordinary methods.
+# Ask CMake to generate a .def covering everything else as well.
+if(WIN32)
+    # Ask ld directly rather than via WINDOWS_EXPORT_ALL_SYMBOLS. That property
+    # generates a .def file, and under this cross toolchain CMake never emits
+    # one -- no .def appears in the build and no objdump runs -- so it silently
+    # exports nothing. (Supplying CMAKE_OBJDUMP, the usual cause, made no
+    # difference; verified.) --export-all-symbols is ld's own switch and needs
+    # none of that machinery.
+    target_link_options(package_downloader_lib PRIVATE -Wl,--export-all-symbols)
+endif()
+
+
 # Export macro for shared library
 target_compile_definitions(package_downloader_lib PRIVATE LGPD_BUILD_SHARED=1)
 
