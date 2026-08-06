@@ -990,9 +990,18 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // Derive destination path.
             std::string destDir = outputDir;
             if (destDir.empty()) {
-                const char* tmp = std::getenv("TMPDIR");
-                if (!tmp) tmp = "/tmp";
-                destDir = tmp;
+                // temp_directory_path() is the portable form of what this used
+                // to hand-roll. The old code read TMPDIR and fell back to
+                // "/tmp", neither of which exists on Windows -- downloads would
+                // have gone to a non-existent directory. The standard function
+                // consults TMPDIR/TMP/TEMP/TEMPDIR then /tmp on POSIX, and
+                // TMP/TEMP/USERPROFILE then the Windows directory on Windows.
+                // Uses the error_code overload so a missing temp dir surfaces
+                // as a failed download rather than an exception escaping here.
+                std::error_code ec;
+                const fs::path tmp = fs::temp_directory_path(ec);
+                if (ec || tmp.empty()) return {};   // caller reports the failure
+                destDir = tmp.string();
             }
             std::string filename = fs::path(url).filename().string();
             if (filename.empty()) filename = packageName + ".lgx";
