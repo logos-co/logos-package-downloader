@@ -47,4 +47,25 @@ pkgs.stdenv.mkDerivation {
 
     runHook postInstall
   '';
+
+  # Windows: stage this library's own DLL closure beside it.
+  #
+  # A PE embeds no store paths, so Nix's reference scanner finds nothing and
+  # this output records NO dependency on curl -- even though
+  # libpackage_downloader_lib.dll imports libcurl-4.dll. Measured: the closure
+  # of this output contained zero curl paths, while the cli output (whose bin/
+  # nixpkgs' win-dll-link.sh does process) both referenced curl and shipped
+  # libcurl-4.dll.
+  #
+  # The consequence lands far away: a module consuming this library as an
+  # external lib inherits the DLL but not curl, and fails at load with "The
+  # specified module could not be found" -- naming the plugin rather than curl.
+  # Nothing downstream can fix it, because by then the dependency is genuinely
+  # not recorded anywhere.
+  #
+  # linkDLLsInfolder is win-dll-link.sh's own worker; its _linkDLLs entry point
+  # only ever processes $prefix/bin, which is why lib/ was missed.
+  postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isWindows ''
+    linkDLLsInfolder "$out/lib"
+  '';
 }
