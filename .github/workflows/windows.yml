@@ -1,0 +1,48 @@
+name: Windows
+
+# The entire per-repo cost of Windows CI. The Nix install and cache, the
+# target-existence guard, the cold-cache refusal, the PE-format and
+# import-closure gates, the artifact hand-off and its round-trip check, the wine
+# pre-filter and the real-Windows execution all live once in
+# logos-co/logos-windows-ci.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      # `cli` produces lgpd.exe. Measured on the Linux builder from this repo's
+      # own master: bin/lgpd.exe plus 48 DLLs and two import libraries -- the
+      # largest DLL closure of any Qt-free target here, which is exactly what
+      # makes the one smoke command below worth running.
+      targets: cli
+      # DELIBERATELY ONLY `--help`, and the reason is worth stating rather than
+      # leaving as apparent laziness.
+      #
+      # Every other lgpd verb -- search, list, categories, info, download --
+      # talks to the GitHub release catalogue. Putting those on the Windows leg
+      # would make this job's colour depend on a network round trip and on
+      # catalogue contents nobody here controls, which is how a smoke test
+      # becomes a thing people re-run until it passes.
+      #
+      # `--help` is not a token gesture in this repo. lgpd links 48 DLLs, and a
+      # single unresolved one kills the process before main() with NO output at
+      # all -- exit 0xC0000135, silence. This repo has already shipped exactly
+      # that: the package_downloader module failed to load on Windows because
+      # libcurl-4.dll reached neither the module directory nor bin/. So a
+      # command that starts, prints, and exits 0 is a real assertion about the
+      # import closure the gates just checked statically.
+      #
+      # NOT covered, and worth knowing: TLS. lgpd's HTTPS path needs a CA
+      # bundle, and a portable build finding none is a runtime failure this job
+      # cannot see. That needs the network surface, and belongs in a separate,
+      # deliberately-network-dependent job rather than here.
+      smoke: |
+        run cli/bin/lgpd.exe --help | tee help.txt
+        grep -qi usage help.txt
