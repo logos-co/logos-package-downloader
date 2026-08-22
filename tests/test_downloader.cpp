@@ -708,3 +708,285 @@ TEST(Catalog, IconAbsentWhenNoTopLevelIcon) {
     ASSERT_EQ(catalog.size(), 1u);
     EXPECT_FALSE(catalog[0].contains("icon"));
 }
+
+// ─── Dependency signer pin ────────────────────────────────────────────────────
+//
+// A dependency's `signer` field DISAMBIGUATES among same-named candidates:
+// "of the several packages called `bm` in the merged catalog, I mean the one
+// this identity published". It is NOT an authorization. Matching a pin does
+// not make a package installable — that decision is the install-time
+// trust-anchor policy in logos-package-manager, which rejects a package no
+// ACTIVE anchor validates. The two checks live in different processes, run at
+// different times, and neither substitutes for the other; these tests cover
+// only the first.
+//
+// The property under test is one-directional: a pin can only ever SHRINK the
+// candidate set. It must never widen it, and it must never be a route to the
+// candidates that carry no signature at all.
+
+namespace {
+
+constexpr const char* kGoodDid  = "did:jwk:eyJrdHkiOiJPS1AiLCJnb29kIn0";
+constexpr const char* kOtherDid = "did:jwk:eyJrdHkiOiJPS1AiLCJvdGhlciJ9";
+
+// One row of the `bm` package's version list. `signature` is placed verbatim
+// into the catalog entry; a null means the key is absent entirely, which is
+// what every one of the 49 versions in the live official catalog looks like.
+struct SignerRow {
+    std::string version;
+    json        signature;
+};
+
+// A catalog holding one package `bm` with the given versions, and optionally a
+// package `app` @0.1.0 whose MANIFEST declares `appDep` as a dependency. The
+// two shapes exercise the resolver's two entry paths: the caller-supplied
+// top-level array, and a transitive entry read out of a catalog-embedded
+// manifest. Only the first is ever seen by `lgx verify`, so the second is the
+// one with no upstream validation whatsoever — both must be covered.
+std::shared_ptr<MockFetcher> signerCatalogFetcher(const std::vector<SignerRow>& rows,
+                                                  const json& appDep = json()) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+
+    json versions = json::array();
+    for (const auto& r : rows) {
+        const std::string hash = "h_bm_" + r.version;
+        json v = makeVersion(r.version.c_str(), hash.c_str(), json::array());
+        v["manifest"]["name"] = "bm";
+        if (!r.signature.is_null()) v["signature"] = r.signature;
+        versions.push_back(std::move(v));
+    }
+
+    json packages = json::array({ json{{"name", "bm"}, {"versions", versions}} });
+    if (!appDep.is_null()) {
+        json app = makeVersion("0.1.0", "h_app_010", json::array({appDep}));
+        app["manifest"]["name"] = "app";
+        app["manifest"]["type"] = "ui_qml";
+        packages.push_back(json{{"name", "app"}, {"versions", json::array({app})}});
+    }
+
+    f->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "test"},
+                        {"packages", packages}}.dump();
+    return f;
+}
+
+std::vector<std::string> resolverErrors(const std::string& raw) {
+    std::vector<std::string> errs;
+    for (const auto& e : json::parse(raw))
+        if (e.contains("error")) errs.push_back(e.value("error", ""));
+    return errs;
+}
+
+// bm 2.0.0 signed by the good key, bm 1.0.0 with no signature at all. This is
+// the shape that makes an empty pin dangerous: the newest release is signed
+// and an OLDER one is not, so "select the unsigned rows" is also "downgrade".
+std::vector<SignerRow> signedNewUnsignedOld() {
+    return { {"2.0.0", json{{"did", kGoodDid}, {"sig", "deadbeef"}}},
+             {"1.0.0", json()} };
+}
+
+}  // namespace
+
+// ── ABSENT: no pin declared, no filtering ────────────────────────────────────
+
+TEST(SignerPin, AbsentPinDoesNotFilterAndResolvesTheNewest) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}}
+    }).dump());
+    const auto byName = resolvedVersions(raw);
+    ASSERT_EQ(byName.count("bm"), 1u) << raw;
+    EXPECT_EQ(byName.at("bm"), (std::vector<std::string>{"2.0.0"})) << raw;
+    EXPECT_TRUE(resolverErrors(raw).empty()) << raw;
+}
+
+// ── MATCHING: the pin selects that signer's release ──────────────────────────
+
+TEST(SignerPin, MatchingPinSelectsThatSignersRelease) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", kGoodDid}}
+    }).dump());
+    const auto byName = resolvedVersions(raw);
+    ASSERT_EQ(byName.count("bm"), 1u) << raw;
+    EXPECT_EQ(byName.at("bm"), (std::vector<std::string>{"2.0.0"})) << raw;
+}
+
+// A pin genuinely DISAMBIGUATES: with the newest release published by someone
+// else, the pin picks the older one its signer published rather than the newest.
+TEST(SignerPin, MatchingPinPicksItsSignersOlderReleaseOverAnotherSignersNewer) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher({
+        {"2.0.0", json{{"did", kOtherDid}, {"sig", "beef"}}},
+        {"1.0.0", json{{"did", kGoodDid},  {"sig", "cafe"}}},
+    }));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", kGoodDid}}
+    }).dump());
+    const auto byName = resolvedVersions(raw);
+    ASSERT_EQ(byName.count("bm"), 1u) << raw;
+    EXPECT_EQ(byName.at("bm"), (std::vector<std::string>{"1.0.0"})) << raw;
+}
+
+// ── NON-MATCHING: an error, never a fallback ─────────────────────────────────
+
+TEST(SignerPin, NonMatchingPinIsAnErrorAndResolvesNothing) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", kOtherDid}}
+    }).dump());
+    EXPECT_EQ(resolvedVersions(raw).count("bm"), 0u)
+        << "an unmatched pin fell back to some other candidate; raw: " << raw;
+    ASSERT_FALSE(resolverErrors(raw).empty()) << raw;
+    EXPECT_NE(resolverErrors(raw)[0].find("no candidate matches"), std::string::npos) << raw;
+}
+
+// ── EMPTY: rejected, and never a route to the unsigned candidates ────────────
+
+// REGRESSION (B1). `"signer": ""` used to parse clean with the option ENGAGED
+// holding "". findBest compared it against each candidate's `signature.did`,
+// and an unsigned row yields "" — so the pin matched exactly the rows with NO
+// signature and skipped every signed one. Against this catalog it resolved the
+// unsigned, older 1.0.0 over the signed 2.0.0, with no error and exit 0.
+TEST(SignerPin, EmptyPinIsRejectedAndNeverSelectsAnUnsignedRelease) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", ""}}
+    }).dump());
+    EXPECT_EQ(resolvedVersions(raw).count("bm"), 0u)
+        << "empty signer pin resolved a candidate (the unsigned one); raw: " << raw;
+    ASSERT_FALSE(resolverErrors(raw).empty())
+        << "empty signer pin was accepted silently; raw: " << raw;
+    EXPECT_NE(resolverErrors(raw)[0].find("signer"), std::string::npos) << raw;
+}
+
+// The same pin arriving through the OTHER entry path. A transitive dep comes
+// out of a catalog-embedded manifest, which the downloader never runs
+// Manifest::validate() on — so logos-package's did:jwk regex, the one gate
+// that would have caught this, never sees it.
+TEST(SignerPin, EmptyPinInATransitiveManifestIsReportedNotSilentlyHonoured) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld(),
+                                        json{{"name", "bm"}, {"signer", ""}}));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "app"}}
+    }).dump());
+    EXPECT_EQ(resolvedVersions(raw).count("bm"), 0u)
+        << "empty signer pin in a manifest resolved the unsigned release; raw: " << raw;
+    ASSERT_FALSE(resolverErrors(raw).empty())
+        << "a dependency entry that cannot be parsed was dropped, not reported; raw: " << raw;
+    EXPECT_NE(resolverErrors(raw)[0].find("signer"), std::string::npos) << raw;
+}
+
+// ── MALFORMED: null, non-string, not a did:jwk ───────────────────────────────
+//
+// All three used to fall through `&& j["signer"].is_string()` and leave the
+// dep UNPINNED — a declared constraint silently widened to "anything", which
+// is the one outcome a pin exists to prevent.
+
+TEST(SignerPin, NullPinIsRejectedRatherThanTreatedAsUnpinned) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", nullptr}}
+    }).dump());
+    EXPECT_EQ(resolvedVersions(raw).count("bm"), 0u) << raw;
+    ASSERT_FALSE(resolverErrors(raw).empty())
+        << "null signer silently widened the pin to unconstrained; raw: " << raw;
+}
+
+TEST(SignerPin, NonStringPinIsRejectedRatherThanTreatedAsUnpinned) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", 42}}
+    }).dump());
+    EXPECT_EQ(resolvedVersions(raw).count("bm"), 0u) << raw;
+    ASSERT_FALSE(resolverErrors(raw).empty())
+        << "non-string signer silently widened the pin to unconstrained; raw: " << raw;
+    EXPECT_NE(resolverErrors(raw)[0].find("signer"), std::string::npos) << raw;
+}
+
+TEST(SignerPin, MalformedDidPinIsRejected) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    for (const char* bad : { "GOODKEY", "did:key:abc", "did:jwk:", "did:jwk:has space" }) {
+        const std::string raw = lib.resolveDependenciesJson(json::array({
+            json{{"name", "bm"}, {"signer", bad}}
+        }).dump());
+        EXPECT_EQ(resolvedVersions(raw).count("bm"), 0u) << bad << " -> " << raw;
+        const auto errs = resolverErrors(raw);
+        ASSERT_FALSE(errs.empty()) << "malformed pin '" << bad << "' was accepted; raw: " << raw;
+        // It must fail AS A MALFORMED PIN. Falling through to "no candidate
+        // matches" is the wrong diagnosis -- it blames the catalog for not
+        // carrying a signer that could never have been spelled that way, and
+        // it is indistinguishable from the case where the pin is well-formed
+        // and the publisher simply has not released yet.
+        EXPECT_EQ(errs[0].find("no candidate matches"), std::string::npos)
+            << "malformed pin '" << bad << "' was diagnosed as a catalog miss; raw: " << raw;
+        EXPECT_NE(errs[0].find("signer"), std::string::npos) << raw;
+    }
+}
+
+// ── The invariant, at the comparison itself ──────────────────────────────────
+//
+// parseDep refuses an empty pin, but that is input validation on one call
+// path. signerPinMatches is the property, sitting next to the comparison it
+// constrains, so a ParsedDep built some other way cannot reopen the hole.
+
+TEST(SignerPin, PinNeverMatchesACandidateWithNoOrEmptySignerDid) {
+    using lgpd::PackageDownloaderLib;
+    // An unsigned candidate (empty DID) matches NOTHING — not a real pin...
+    EXPECT_FALSE(PackageDownloaderLib::signerPinMatches(kGoodDid, ""));
+    // ...and not an empty one. This is B1 stated as a property: an empty pin
+    // must never be the thing that selects the unsigned rows.
+    EXPECT_FALSE(PackageDownloaderLib::signerPinMatches("", ""));
+    EXPECT_FALSE(PackageDownloaderLib::signerPinMatches("", kGoodDid));
+    // A real pin matches its own signer and nobody else's.
+    EXPECT_TRUE (PackageDownloaderLib::signerPinMatches(kGoodDid, kGoodDid));
+    EXPECT_FALSE(PackageDownloaderLib::signerPinMatches(kGoodDid, kOtherDid));
+}
+
+// ...and the same property through the resolver, for the two catalog shapes
+// that produce an empty DID: no `signature` key, `"signature": {}`, and
+// `"signature": {"did": ""}`.
+TEST(SignerPin, PinFindsNoCandidateWhenEveryCandidateIsEffectivelyUnsigned) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher({
+        {"3.0.0", json()},                        // no signature key
+        {"2.0.0", json::object()},                // signature present, no did
+        {"1.0.0", json{{"did", ""}}},             // did present, empty
+    }));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", kGoodDid}}
+    }).dump());
+    EXPECT_EQ(resolvedVersions(raw).count("bm"), 0u)
+        << "a pin matched an unsigned candidate; raw: " << raw;
+    ASSERT_FALSE(resolverErrors(raw).empty()) << raw;
+}
+
+// ── The pin is not an authorization ──────────────────────────────────────────
+//
+// Nothing about matching a pin makes a package trusted. The resolver has no
+// keyring, consults no anchor set, and a satisfied pin produces an ordinary
+// resolved entry that the installer will still judge on its own terms. This
+// test pins the SHAPE of that output so nobody later adds a "trusted" flag
+// here and turns a self-asserted identity into an install decision.
+TEST(SignerPin, ResolvedEntryCarriesNoTrustVerdict) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(signerCatalogFetcher(signedNewUnsignedOld()));
+    const std::string raw = lib.resolveDependenciesJson(json::array({
+        json{{"name", "bm"}, {"signer", kGoodDid}}
+    }).dump());
+    for (const auto& e : json::parse(raw)) {
+        if (!e.contains("name")) continue;
+        EXPECT_FALSE(e.contains("trusted"))    << raw;
+        EXPECT_FALSE(e.contains("trusted_as")) << raw;
+        EXPECT_FALSE(e.contains("verified"))   << raw;
+    }
+}

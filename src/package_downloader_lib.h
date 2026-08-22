@@ -49,6 +49,23 @@ struct Repository {
     std::string description;
     std::string homepage;
     std::string indexUrl;
+    /// `trustedSigners[].did` as ADVERTISED by the repository's own
+    /// logos-repo.json. ADVISORY ONLY — parsed, stored, and echoed back in
+    /// listRepositoriesJson(); consulted by nothing, deliberately.
+    ///
+    /// This is a repository's self-assertion about itself, and a downloaded
+    /// claim establishes no trust anchor. Wiring it into an install decision
+    /// would let a repository authorise its own packages, which is exactly the
+    /// failure the name invites. The only anchor set is the LOCAL keyring
+    /// (`lgx keyring`, and logos-package-manager's addTrustedKey /
+    /// removeTrustedKey / listTrustedKeys), which nothing enters except by an
+    /// explicit user act.
+    ///
+    /// Legitimate future use: an "this repository publishes as X — add to your
+    /// keyring?" affordance in the UI, behind a user action that calls
+    /// addTrustedKey. Never an auto-promotion, and never read by the installer.
+    /// (The official catalog ships `"trustedSigners": []` today, so it vouches
+    /// for nobody in any case.)
     std::vector<std::string> trustedSignerDids;
     std::string resolveError; ///< non-empty when the fetch / parse failed
 };
@@ -202,6 +219,23 @@ public:
     /// Exposed for tests and for callers that want to filter without going
     /// through the full resolver.
     static bool semverMatches(const std::string& range, const std::string& version);
+
+    /// Does a candidate whose catalog signature carries `candidateSignerDid`
+    /// satisfy a dependency's `signer` pin?
+    ///
+    /// SELECTION, not authorization. A signer pin disambiguates among
+    /// same-named candidates; satisfying it says nothing about whether the
+    /// package may be installed, which is decided later and elsewhere by the
+    /// trust-anchor policy in logos-package-manager. Keep the two apart.
+    ///
+    /// An empty pin never matches anything, and a candidate with no signature
+    /// DID is never matched by anything. The predicate used to be a bare
+    /// inequality, which made `"signer": ""` select exactly the UNSIGNED
+    /// releases of a package rather than mean "unpinned".
+    ///
+    /// Exposed so the invariant can be tested without standing up a catalog.
+    static bool signerPinMatches(const std::string& pin,
+                                 const std::string& candidateSignerDid);
 
     /// The resolver's ranking rule: does the candidate outrank the incumbent?
     ///
