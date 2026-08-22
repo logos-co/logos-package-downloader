@@ -15,11 +15,18 @@ extern const char* kDefaultRepositoryUrl;
 
 /// Minimal HTTP(S) fetcher abstraction. The concrete implementation in the
 /// .cpp uses libcurl. Tests can inject their own implementation.
+///
+/// Thread-safety: the registry refresh and the catalog build call `get()`
+/// for every repository at once, each on its own thread, on ONE shared
+/// instance. Implementations must therefore tolerate concurrent `get()`
+/// calls, and `lastError()` must report the CALLING thread's most recent
+/// failure (the libcurl implementation keeps it thread-local).
 class Fetcher {
 public:
     virtual ~Fetcher() = default;
 
     /// HTTP GET. Returns true on 2xx with the response body in `out`.
+    /// May be called concurrently from several threads.
     virtual bool get(const std::string& url, std::string& out) = 0;
 
     /// HTTP GET to a file. Returns true on 2xx after writing all bytes.
@@ -96,11 +103,14 @@ public:
     /// omit-from-list semantics as `removeRepository` on the default).
     std::string setEnabled(const std::string& url, bool enabled);
 
-    /// Re-fetch `logos-repo.json` for every enabled repo (skips a disabled
-    /// default). After calling, `list()` returns entries with resolved
-    /// metadata fields populated. Returns an empty string on overall
-    /// success or a summary of fetch errors (the registry is best-effort:
-    /// failures are recorded per-entry in `resolveError` but do not abort).
+    /// Re-fetch `logos-repo.json` for every listed repo (skips a removed
+    /// default). All repos are fetched concurrently, with the registry
+    /// unlocked, so the call costs the slowest fetch rather than the sum
+    /// and `list()` stays responsive meanwhile. After calling, `list()`
+    /// returns entries with resolved metadata fields populated. Returns an
+    /// empty string on overall success or a summary of fetch errors (the
+    /// registry is best-effort: failures are recorded per-entry in
+    /// `resolveError` but do not abort).
     std::string refresh();
 
     /// Look up a repo by URL or by canonical name. Returns nullopt if no
@@ -142,6 +152,9 @@ public:
     /// JSON array of repositories. Each element:
     /// `{ url, enabled, isDefault, name, displayName, description,
     ///    homepage, indexUrl, trustedSignerDids[], resolveError }`.
+    /// `resolveError` covers both halves of a repo: a failed
+    /// `logos-repo.json` fetch/parse, or — when that succeeded — a failed
+    /// `index.json` fetch from the most recent catalog build.
     std::string listRepositoriesJson();
 
     /// JSON array of all packages across all enabled repos. Each element:
@@ -155,8 +168,10 @@ public:
     /// Same shape as `getCatalogJson()` filtered to one source.
     std::string getCatalogForRepoJson(const std::string& urlOrName);
 
-    /// Force re-fetch of every enabled repo's `index.json`. Returns an
-    /// empty string on success or a summary of errors.
+    /// Force re-fetch of every enabled repo's `logos-repo.json` and
+    /// `index.json` (all repos concurrently). Returns an empty string on
+    /// success or a summary of errors, one line per failed repo. A repo
+    /// that fails is excluded from the catalog; the others are unaffected.
     std::string refreshCatalogs();
 
     /// Download a package. If `rootHash` is empty and multiple entries
