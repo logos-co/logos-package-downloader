@@ -412,6 +412,10 @@ The test suite (`tests/test_downloader.cpp`, GoogleTest via CTest) covers:
 | `Registry.AddDefaultWhileDisabledClearsDisabledFlag` | `addRepository(default)` while the default is disabled (but not removed) flips it back to `enabled=true`. |
 | `Registry.RefreshSkipsDisabledAndRemovedDefault` | `refresh()` does not fetch (or error on) a disabled or removed default. |
 | `Catalog.ReturnsJsonArrayWhenNoNetwork` | `getCatalogJson()` parses to a JSON array even with no network (lazy fetch degrades to empty). |
+| `Concurrency.RefreshFetchesEveryRepoAtOnce` | `refresh()` fetches all repos' `logos-repo.json` concurrently (a rendezvous fetcher proves the gets overlap). |
+| `Concurrency.CatalogFetchesEveryIndexAtOnce` | `getCatalogJson()` fetches all `index.json` files concurrently and merges every repo's packages. |
+| `Concurrency.BrokenIndexIsIsolatedReportedAndRecovers` | A repo whose `index.json` is down is dropped from the catalog, reported in `resolveError` and in the `refreshCatalogs()` summary, and clears once the index is back. |
+| `Concurrency.BrokenRepoMetadataDoesNotHideTheOthers` | A repo whose `logos-repo.json` is down is reported; the other repos' packages are still served. |
 
 ### Raw CMake (inside `nix develop`)
 

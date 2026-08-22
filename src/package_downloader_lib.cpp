@@ -22,13 +22,16 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <regex>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 
 #include <curl/curl.h>
@@ -90,6 +93,27 @@ bool semverRangeMatches(const std::string& range, const std::string& version) {
 }
 
 // ─── libcurl fetcher ──────────────────────────────────────────────────────────
+
+// Connect-phase budget for every transfer, separate from the total timeout.
+//
+// libcurl tries a host's addresses one after another and gives an attempt
+// half of the remaining CONNECT budget while more addresses are left. With
+// no connect timeout set, that budget is the whole transfer timeout — so a
+// single address that silently drops SYNs cost 30 s of the 60 s metadata
+// budget (150 s of a download's 600 s) before curl moved on to the next
+// one. raw.githubusercontent.com publishes four A records; one of them being
+// unreachable from a user's network turned every catalog call into a
+// 60–120 s stall and the package-manager UI timed out on all of them
+// (logos-package-downloader-module#23). With this cap the same fault costs
+// ~5 s per fetch, and the fetch still succeeds via the next address.
+constexpr long kConnectTimeoutSec  = 10;
+constexpr long kMetadataTimeoutSec = 60;    // logos-repo.json / index.json
+constexpr long kDownloadTimeoutSec = 600;   // .lgx bodies
+
+// Transfers slower than this are reported on stderr (which the Logos host
+// captures into its log). The stall above left no trace in the module's
+// output; a one-line "slow fetch" per transfer would have named the host.
+constexpr std::chrono::milliseconds kSlowFetchThreshold{3000};
 
 class CurlGlobalInit {
 public:
@@ -221,6 +245,25 @@ std::string curlFailDetail(CURLcode res, long httpCode) {
     return "HTTP status " + std::to_string(httpCode);
 }
 
+// Seconds with one decimal, for the stderr lines below.
+std::string fmtSeconds(std::chrono::steady_clock::duration d) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+    return std::to_string(ms / 1000) + "." + std::to_string((ms % 1000) / 100) + "s";
+}
+
+// One stderr line per failed or slow transfer. `url` is the caller's URL
+// (without the cache-buster) so the line is greppable against the config.
+void reportTransfer(const std::string& url, bool ok, const std::string& detail,
+                    std::chrono::steady_clock::duration elapsed) {
+    if (!ok) {
+        std::cerr << "package_downloader: fetch failed: " << url
+                  << " — " << detail << " (" << fmtSeconds(elapsed) << ")\n";
+    } else if (elapsed >= kSlowFetchThreshold) {
+        std::cerr << "package_downloader: slow fetch: " << url
+                  << " (" << fmtSeconds(elapsed) << ")\n";
+    }
+}
+
 class HttpsFetcher : public Fetcher {
 public:
     bool get(const std::string& url, std::string& out) override {
@@ -240,15 +283,19 @@ public:
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteMem);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, kMetadataTimeoutSec);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
+        const auto t0 = std::chrono::steady_clock::now();
         CURLcode res = curl_easy_perform(c);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
         long code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_slist_free_all(hdrs);
         curl_easy_cleanup(c);
         const bool ok = (res == CURLE_OK && code >= 200 && code < 300);
-        m_lastError = ok ? std::string() : curlFailDetail(res, code);
+        tlsLastError = ok ? std::string() : curlFailDetail(res, code);
+        reportTransfer(url, ok, tlsLastError, elapsed);
         return ok;
     }
 
@@ -278,28 +325,65 @@ public:
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteFile);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &f);
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
+        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, kDownloadTimeoutSec);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
+        const auto t0 = std::chrono::steady_clock::now();
         CURLcode res = curl_easy_perform(c);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
         long code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(c);
         f.close();
         if (res != CURLE_OK || code < 200 || code >= 300) {
-            m_lastError = curlFailDetail(res, code);
+            tlsLastError = curlFailDetail(res, code);
+            reportTransfer(url, false, tlsLastError, elapsed);
             std::error_code rmEc;
             fs::remove(path, rmEc);
             return false;
         }
-        m_lastError.clear();
+        tlsLastError.clear();
+        reportTransfer(url, true, {}, elapsed);
         return true;
     }
 
-    std::string lastError() const override { return m_lastError; }
+    std::string lastError() const override { return tlsLastError; }
 
 private:
-    std::string m_lastError;
+    // Per-thread, not per-instance: one HttpsFetcher is shared by the
+    // concurrent repo / index fetches in RepositoryRegistry::refresh and
+    // PackageDownloaderLib::Impl::prefetchIndexes, and Fetcher::lastError
+    // is defined as "the calling thread's most recent failure".
+    static thread_local std::string tlsLastError;
 };
+
+thread_local std::string HttpsFetcher::tlsLastError;
+
+// Run fn(0..n-1) on one thread each and join. Repositories number in the
+// single digits, so a thread per item beats a pool for simplicity, and a
+// refresh costs the slowest fetch instead of the sum of all of them. An
+// exception thrown by any item is rethrown here after every thread has
+// joined, so callers see the same failure they would from a serial loop.
+void forEachConcurrently(size_t n, const std::function<void(size_t)>& fn) {
+    if (n == 0) return;
+    if (n == 1) { fn(0); return; }
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    std::mutex errMu;
+    std::exception_ptr firstError;
+    for (size_t i = 0; i < n; ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                fn(i);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(errMu);
+                if (!firstError) firstError = std::current_exception();
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    if (firstError) std::rethrow_exception(firstError);
+}
 
 // ─── logos-repo.json + index.json parsers ─────────────────────────────────────
 
@@ -440,15 +524,19 @@ struct RepositoryRegistry::Impl {
         return f.good() ? std::string() : ("write failed: " + configPath);
     }
 
-    void refreshOne(Repository& r) {
+    // Resolve one row's logos-repo.json through `f`. Static and
+    // lock-free so refresh() can run it on several threads at once with
+    // the registry mutex released; the fetcher is passed in because the
+    // member may be swapped by setFetcher while a refresh is in flight.
+    static void refreshOne(Fetcher& f, Repository& r) {
         r.resolveError.clear();
         if (!isHttpsUrl(r.url)) {
             r.resolveError = "unsupported URL scheme (https required in v1)";
             return;
         }
         std::string body;
-        if (!fetcher->get(r.url, body)) {
-            const std::string detail = fetcher->lastError();
+        if (!f.get(r.url, body)) {
+            const std::string detail = f.lastError();
             r.resolveError = "fetch failed: " + r.url +
                              (detail.empty() ? "" : " — " + detail);
             return;
@@ -506,7 +594,7 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
             return "already registered: " + url;
         Repository probe = impl_->defaultRepo;
         probe.enabled = true;
-        impl_->refreshOne(probe);
+        Impl::refreshOne(*impl_->fetcher, probe);
         if (!probe.resolveError.empty()) return probe.resolveError;
         impl_->defaultRepo     = std::move(probe);
         impl_->defaultRemoved  = false;
@@ -522,7 +610,7 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
     r.enabled = true;
     // Try to resolve metadata now so the caller learns about a bad URL
     // immediately instead of at first list time.
-    impl_->refreshOne(r);
+    Impl::refreshOne(*impl_->fetcher, r);
     if (!r.resolveError.empty()) return r.resolveError;
     impl_->userRepos.push_back(std::move(r));
     return impl_->save();
@@ -561,17 +649,41 @@ std::string RepositoryRegistry::setEnabled(const std::string& url, bool enabled)
 }
 
 std::string RepositoryRegistry::refresh() {
+    // Snapshot the rows and the fetcher, fetch every repo at once with the
+    // mutex RELEASED, then merge the results back by URL. Holding the lock
+    // across serial fetches meant one slow host stalled list() and
+    // findByUrlOrName() — and with it every call into the module — for the
+    // sum of all fetch times. A row removed while the fetch ran is dropped;
+    // one added meanwhile was hydrated by addRepository itself; an enabled
+    // flag toggled meanwhile wins over the stale snapshot.
+    std::vector<Repository> rows;
+    std::shared_ptr<Fetcher> fetcher;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        fetcher = impl_->fetcher;
+        if (!impl_->defaultRemoved) rows.push_back(impl_->defaultRepo);
+        for (const auto& r : impl_->userRepos) rows.push_back(r);
+    }
+
+    forEachConcurrently(rows.size(),
+                        [&](size_t i) { Impl::refreshOne(*fetcher, rows[i]); });
+
     std::lock_guard<std::mutex> lock(impl_->mu);
     std::vector<std::string> errs;
-    if (!impl_->defaultRemoved) {
-        impl_->refreshOne(impl_->defaultRepo);
-        if (!impl_->defaultRepo.resolveError.empty()) {
-            errs.push_back("default: " + impl_->defaultRepo.resolveError);
+    for (auto& fresh : rows) {
+        if (fresh.isDefault) {
+            if (impl_->defaultRemoved) continue;
+            impl_->defaultRepo = std::move(fresh);
+            if (!impl_->defaultRepo.resolveError.empty())
+                errs.push_back("default: " + impl_->defaultRepo.resolveError);
+            continue;
         }
-    }
-    for (auto& r : impl_->userRepos) {
-        impl_->refreshOne(r);
-        if (!r.resolveError.empty()) errs.push_back(r.url + ": " + r.resolveError);
+        auto it = std::find_if(impl_->userRepos.begin(), impl_->userRepos.end(),
+                               [&](const Repository& r) { return r.url == fresh.url; });
+        if (it == impl_->userRepos.end()) continue;
+        fresh.enabled = it->enabled;
+        *it = std::move(fresh);
+        if (!it->resolveError.empty()) errs.push_back(it->url + ": " + it->resolveError);
     }
     if (errs.empty()) return {};
     std::string out;
@@ -605,8 +717,14 @@ struct PackageDownloaderLib::Impl {
     RepositoryRegistry registry;
     std::shared_ptr<Fetcher> fetcher = std::make_shared<HttpsFetcher>();
 
-    // Caches: url -> body
+    // Caches: repo url -> index.json body
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
+    // repo url -> why its last index.json fetch failed. Surfaced through
+    // listRepositoriesJson's resolveError (when logos-repo.json itself
+    // resolved) so a repo whose index is down shows up as broken instead
+    // of silently contributing no packages. Cleared per repo on the next
+    // successful fetch and wholesale by clearCaches.
+    std::unordered_map<std::string, std::string> indexErrorByRepoUrl;
     // True once registry.refresh() has resolved every repo's
     // logos-repo.json this process. Guards ensureMetadata so a catalog
     // browse doesn't re-fetch all repo metadata on every call. Reset by
@@ -632,21 +750,55 @@ struct PackageDownloaderLib::Impl {
 
     std::string fetchIndex(const Repository& r) {
         if (r.indexUrl.empty()) return {};
+        std::shared_ptr<Fetcher> f;
         {
             std::lock_guard<std::mutex> lock(mu);
             auto it = indexJsonByRepoUrl.find(r.url);
             if (it != indexJsonByRepoUrl.end()) return it->second;
+            f = fetcher;
         }
         std::string body;
-        if (!fetcher->get(r.indexUrl, body)) return {};
+        const bool ok = f->get(r.indexUrl, body);
+        const std::string detail = ok ? std::string() : f->lastError();
         std::lock_guard<std::mutex> lock(mu);
+        if (!ok) {
+            indexErrorByRepoUrl[r.url] = "index.json fetch failed: " + r.indexUrl +
+                                         (detail.empty() ? "" : " — " + detail);
+            return {};
+        }
+        indexErrorByRepoUrl.erase(r.url);
         indexJsonByRepoUrl[r.url] = body;
         return body;
+    }
+
+    // Fetch the index.json of every repo in `repos` that isn't cached yet,
+    // all at once, so a later fetchIndex per repo is a cache hit. Repos
+    // whose index is already cached or that never resolved (no indexUrl)
+    // are skipped. Errors are recorded per repo, never raised.
+    void prefetchIndexes(const std::vector<Repository>& repos) {
+        std::vector<const Repository*> pending;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            for (const auto& r : repos) {
+                if (r.indexUrl.empty()) continue;
+                if (indexJsonByRepoUrl.count(r.url)) continue;
+                pending.push_back(&r);
+            }
+        }
+        forEachConcurrently(pending.size(),
+                            [&](size_t i) { fetchIndex(*pending[i]); });
+    }
+
+    std::string indexError(const std::string& repoUrl) const {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = indexErrorByRepoUrl.find(repoUrl);
+        return it == indexErrorByRepoUrl.end() ? std::string() : it->second;
     }
 
     void clearCaches() {
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl.clear();
+        indexErrorByRepoUrl.clear();
     }
 
     // Synthesise the catalog entries for one repo from its index.json
@@ -708,7 +860,10 @@ PackageDownloaderLib::PackageDownloaderLib(std::string configPath)
 PackageDownloaderLib::~PackageDownloaderLib() = default;
 
 void PackageDownloaderLib::setFetcher(std::shared_ptr<Fetcher> fetcher) {
-    impl_->fetcher = fetcher;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        impl_->fetcher = fetcher;
+    }
     impl_->registry.setFetcher(fetcher);
     impl_->clearCaches();
     // New fetcher → the once-per-process metadata resolution must run
@@ -733,18 +888,35 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
         e["homepage"] = r.homepage;
         e["indexUrl"] = r.indexUrl;
         e["trustedSignerDids"] = r.trustedSignerDids;
-        e["resolveError"] = r.resolveError;
+        // A repo whose logos-repo.json resolved but whose index.json did
+        // not is just as unusable; report that failure in the same field.
+        e["resolveError"] = r.resolveError.empty() ? impl_->indexError(r.url)
+                                                   : r.resolveError;
         arr.push_back(std::move(e));
     }
     return arr.dump();
 }
 
+namespace {
+
+// The repos that contribute to the merged catalog: enabled, and with a
+// resolved logos-repo.json.
+std::vector<Repository> catalogRepos(const RepositoryRegistry& registry) {
+    std::vector<Repository> out;
+    for (auto& r : registry.list()) {
+        if (r.enabled && r.resolveError.empty()) out.push_back(std::move(r));
+    }
+    return out;
+}
+
+} // namespace
+
 std::string PackageDownloaderLib::getCatalogJson() {
     impl_->ensureMetadata();
+    const std::vector<Repository> repos = catalogRepos(impl_->registry);
+    impl_->prefetchIndexes(repos);
     json out = json::array();
-    for (const auto& r : impl_->registry.list()) {
-        if (!r.enabled) continue;
-        if (!r.resolveError.empty()) continue;
+    for (const auto& r : repos) {
         impl_->appendCatalogEntries(r, impl_->fetchIndex(r), out);
     }
     return out.dump();
@@ -768,7 +940,19 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     // Explicit reload: force the metadata refresh now and mark it done
     // so the next ensureMetadata() doesn't redundantly refresh again.
     impl_->metadataResolved = true;
-    return impl_->registry.refresh();
+    std::string errs = impl_->registry.refresh();
+    // Re-fetch the indexes too, so the getCatalog that follows a refresh
+    // is a cache hit and an index that is down is reported here rather
+    // than as a silently thinner catalog. (The contract always said
+    // "re-fetch every enabled repo's logos-repo.json + index.json"; only
+    // the invalidation half was implemented.)
+    const std::vector<Repository> repos = catalogRepos(impl_->registry);
+    impl_->prefetchIndexes(repos);
+    for (const auto& r : repos) {
+        const std::string e = impl_->indexError(r.url);
+        if (!e.empty()) errs += r.url + ": " + e + '\n';
+    }
+    return errs;
 }
 
 namespace {
@@ -979,6 +1163,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         if (!r) return {};
         candidates.push_back(*r);
     }
+    impl_->prefetchIndexes(candidates);
 
     for (const auto& repo : candidates) {
         std::string body = impl_->fetchIndex(repo);
