@@ -1093,7 +1093,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             const json* v = pickVersion(pkg, version, rootHash);
             if (!v || !v->is_object()) continue;
             std::string url = v->value("url", "");
-            if (url.empty()) continue;
+
             // Derive destination path.
             std::string destDir = outputDir;
             if (destDir.empty()) {
@@ -1110,11 +1110,11 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 if (ec || tmp.empty()) return {};   // caller reports the failure
                 destDir = tmp.string();
             }
-            std::string filename = fs::path(url).filename().string();
-            if (filename.empty()) filename = packageName + ".lgx";
+            std::string filename = packageName + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
-
-            std::string cid, httpsUrl;
+            std::string cid;
+            // Fallback on `url` if `urls` doesn't exist or is empty.
+            std::string httpsUrl = url;
             for (const auto& u : v->value("urls", json::array())) {
                 if (!u.is_string()) {
                     // Just being defensive here, this should never happen.
@@ -1127,19 +1127,14 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 // any others.
                 const std::string candidate = u.get<std::string>();
                 if (candidate.rfind("logos:", 0) == 0) {
-                    if (cid.empty()) {
-                        cid = candidate.substr(6);
-                    }
+                    cid = candidate.substr(6);
                 } else if (candidate.rfind("https:", 0) == 0) {
-                    if (httpsUrl.empty()) {
-                        httpsUrl = candidate;
-                    }
+                    httpsUrl = candidate;
                 }
             }
 
-            // Fallback on `url` if `urls` doesn't not exist or is empty.
-            if (httpsUrl.empty()) {
-                httpsUrl = url;
+            if (cid.empty() && httpsUrl.empty()) {
+                continue;
             }
 
             // Use a random suffix to avoid collisions.
@@ -1186,6 +1181,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                            : ProgressFn{};
 
             bool downloaded = false;
+            // Define the source URL for logging purposes.
+            std::string source = httpsUrl;
             if (!cid.empty() && impl_->storageFetcher) {
                 const FetchResult storageFetched =
                     impl_->storageFetcher->getToFile(cid, pendingFile, progressSink);
@@ -1195,6 +1192,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                               << packageName << " (" << cid << ") failed — "
                               << storageFetched.error
                               << ", falling back to " << httpsUrl << "\n";
+                } else {
+                    source = "logos:" + cid;
                 }
             }
 
@@ -1223,7 +1222,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
                     std::error_code rmEc;
                     fs::remove(pendingFile, rmEc);
-                    errorMessage = "rejected " + packageName + " from " + url
+                    errorMessage = "rejected " + packageName + " from " + source
                                  + ": " + verr;
                     return {};
                 }

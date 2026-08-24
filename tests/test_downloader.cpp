@@ -1316,7 +1316,7 @@ namespace {
 
 constexpr const char* cid = "zDvZRwzm3g3mPcYu1NmDKV5jCccw4FZ83XKyu85AjSCg7gH7zQdL";
 constexpr const char* uiDep = R"({"name":"blockchain_module","version":"*"})";
-constexpr const char* lgxStorageUrl = "https://test.local/0.2.0.lgx";
+constexpr const char* lgxStorageUrl = "https://mirror.local/bm-0.2.0.lgx";
 constexpr const char* legacyLgxStorageUrl = "https://test.local/0.2.0.lgx";
 constexpr const char* repoUrl = "";
 constexpr const char* packageName = "blockchain_module";
@@ -1378,8 +1378,6 @@ TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
-
-    testing::internal::CaptureStderr();
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
     const std::string logged = testing::internal::GetCapturedStderr();
