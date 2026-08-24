@@ -1127,7 +1127,10 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 // any others.
                 const std::string candidate = u.get<std::string>();
                 if (candidate.rfind("logos:", 0) == 0) {
-                    cid = candidate.substr(6);
+                    cid = candidate.substr("logos:".size());
+
+                    // Just in case logos:// was used (https:// reflection)
+                    cid = cid.substr("//".size());
                 } else if (candidate.rfind("https:", 0) == 0) {
                     httpsUrl = candidate;
                 }
@@ -1203,11 +1206,19 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 if (!fetched.ok) {
                     std::error_code rmEc;
                     fs::remove(pendingFile, rmEc);
-                    errorMessage = "download of " + packageName + " from " + httpsUrl
-                                 + " failed: " + fetched.error;
-                    continue;
+                    errorMessage = "https download of " + packageName + " from "
+                                 + httpsUrl + " failed: " + fetched.error;
+                    return {};
                 }
             }
+
+            // Super defensive here: check destination file existence
+            if (!fs::exists(pendingFile)) {
+                errorMessage = "download of " + packageName + " from " + source
+                             + " failed: file not found after download";
+                return {};
+            }
+
             // Bind the downloaded artifact to what the index advertised
             // — manifest fields + signer DID. The .lgx `url` and the
             // `index.json` come from independent hosts; without this a

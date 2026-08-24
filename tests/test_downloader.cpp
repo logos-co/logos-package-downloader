@@ -1329,7 +1329,7 @@ public:
     // Define if the mock should be a success or not.
     explicit StorageFetcher(bool succeed) : succeed_(succeed) {}
 
-    // Simulated success downloads by recording the requested CIDs.
+    // Keep track of the CIDs that were requested to be fetched to file.
     std::vector<std::string> fileGets;
 
     lgpd::FetchResult get(const std::string&, std::string&) override {
