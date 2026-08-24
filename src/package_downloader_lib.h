@@ -164,6 +164,8 @@ public:
 
     void setFetcher(std::shared_ptr<Fetcher> fetcher);
 
+    void setStorageFetcher(std::shared_ptr<Fetcher> fetcher);
+
     /// Returns the registry (mutable).
     RepositoryRegistry& registry();
     const RepositoryRegistry& registry() const;

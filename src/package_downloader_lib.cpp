@@ -648,6 +648,7 @@ std::string RepositoryRegistry::configPath() const { return impl_->configPath; }
 struct PackageDownloaderLib::Impl {
     RepositoryRegistry registry;
     std::shared_ptr<Fetcher> fetcher = std::make_shared<HttpsFetcher>();
+    std::shared_ptr<Fetcher> storageFetcher;
 
     // Caches: url -> body
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
@@ -768,6 +769,10 @@ void PackageDownloaderLib::setFetcher(std::shared_ptr<Fetcher> fetcher) {
     // New fetcher → the once-per-process metadata resolution must run
     // again (against the new fetcher) on the next ensureMetadata.
     impl_->metadataResolved = false;
+}
+
+void PackageDownloaderLib::setStorageFetcher(std::shared_ptr<Fetcher> fetcher) {
+    impl_->storageFetcher = fetcher;
 }
 
 RepositoryRegistry& PackageDownloaderLib::registry() { return impl_->registry; }
@@ -1109,6 +1114,34 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             if (filename.empty()) filename = packageName + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
 
+            std::string cid, httpsUrl;
+            for (const auto& u : v->value("urls", json::array())) {
+                if (!u.is_string()) {
+                    // Just being defensive here, this should never happen.
+                    // The index builder should write only strings into the urls array.
+                    continue;
+                }
+
+                // urls is not guaranteed to be in any particular order,
+                // so we take logos and https protocols explicitly and ignore
+                // any others.
+                const std::string candidate = u.get<std::string>();
+                if (candidate.rfind("logos:", 0) == 0) {
+                    if (cid.empty()) {
+                        cid = candidate.substr(6);
+                    }
+                } else if (candidate.rfind("https:", 0) == 0) {
+                    if (httpsUrl.empty()) {
+                        httpsUrl = candidate;
+                    }
+                }
+            }
+
+            // Fallback on `url` if `urls` doesn't not exist or is empty.
+            if (httpsUrl.empty()) {
+                httpsUrl = url;
+            }
+
             // Use a random suffix to avoid collisions.
             // This is rare: the filename contains the version.
             // Download the same version twice in parallel is not common.
@@ -1152,15 +1185,30 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                              })
                            : ProgressFn{};
 
-            const FetchResult fetched =
-                impl_->fetcher->getToFile(url, pendingFile, progressSink);
+            bool downloaded = false;
+            if (!cid.empty() && impl_->storageFetcher) {
+                const FetchResult storageFetched =
+                    impl_->storageFetcher->getToFile(cid, pendingFile, progressSink);
+                downloaded = storageFetched.ok;
+                if (!downloaded) {
+                    std::cerr << "package_downloader: storage download of "
+                              << packageName << " (" << cid << ") failed — "
+                              << storageFetched.error
+                              << ", falling back to " << httpsUrl << "\n";
+                }
+            }
 
-            if (!fetched.ok) {
-                std::error_code rmEc;
-                fs::remove(pendingFile, rmEc);
-                errorMessage = "download of " + packageName + " from " + url
-                             + " failed: " + fetched.error;
-                return {};
+            if (!downloaded) {
+                const FetchResult fetched =
+                    impl_->fetcher->getToFile(httpsUrl, pendingFile, progressSink);
+
+                if (!fetched.ok) {
+                    std::error_code rmEc;
+                    fs::remove(pendingFile, rmEc);
+                    errorMessage = "download of " + packageName + " from " + httpsUrl
+                                 + " failed: " + fetched.error;
+                    return {};
+                }
             }
             // Bind the downloaded artifact to what the index advertised
             // — manifest fields + signer DID. The .lgx `url` and the
