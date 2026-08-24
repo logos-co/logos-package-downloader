@@ -1127,10 +1127,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 // any others.
                 const std::string candidate = u.get<std::string>();
                 if (candidate.rfind("logos:", 0) == 0) {
-                    cid = candidate.substr("logos:".size());
-
-                    // Just in case logos:// was used (https:// reflection)
-                    cid = cid.substr("//".size());
+                    cid = candidate.substr(std::string_view("logos:").size());
                 } else if (candidate.rfind("https:", 0) == 0) {
                     httpsUrl = candidate;
                 }
