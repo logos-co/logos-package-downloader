@@ -1190,8 +1190,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 if (!downloaded) {
                     std::cerr << "package_downloader: storage download of "
                               << packageName << " (" << cid << ") failed — "
-                              << storageFetched.error
-                              << ", falling back to " << httpsUrl << "\n";
+                              << storageFetched.error << "\n";
                 } else {
                     source = "logos:" + cid;
                 }
@@ -1206,7 +1205,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                     fs::remove(pendingFile, rmEc);
                     errorMessage = "download of " + packageName + " from " + httpsUrl
                                  + " failed: " + fetched.error;
-                    return {};
+                    continue;
                 }
             }
             // Bind the downloaded artifact to what the index advertised
