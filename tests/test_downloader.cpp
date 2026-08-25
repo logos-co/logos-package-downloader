@@ -26,6 +26,7 @@ public:
     std::string repoJson;   // served for the default repo URL
     std::string indexJson;  // served for kIndexUrl
     std::vector<std::string> fileGets;  // URLs passed to getToFile
+    std::string lastDest;               // path passed to the last getToFile
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
         if (url == lgpd::kDefaultRepositoryUrl) {
             out = repoJson;
@@ -39,8 +40,9 @@ public:
 
         return {false, "no such url"};
     }
-    lgpd::FetchResult getToFile(const std::string& url, const std::string&) override {
+    lgpd::FetchResult getToFile(const std::string& url, const std::string& dest) override {
         fileGets.push_back(url);
+        lastDest = dest;
         return {false, "not served"};
     }
 };
@@ -1377,7 +1379,8 @@ TEST(FetchSelection, StorageCidIsPreferredOverTheHttpsMirror) {
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
     lib.setNetwork(network);
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_EQ(storage->fileGets, std::vector<std::string>{cid});
     EXPECT_TRUE(http->fileGets.empty());
@@ -1392,7 +1395,8 @@ TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
     lib.setNetwork(network);
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_EQ(storage->attempts, std::vector<std::string>{cid});
     EXPECT_TRUE(storage->fileGets.empty());
@@ -1404,7 +1408,8 @@ TEST(FetchSelection, HttpsIsUsedWhenNoStorageFetcherIsDefined) {
 
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(http);
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
 }
@@ -1418,7 +1423,8 @@ TEST(FetchSelection, LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls) {
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
     lib.setNetwork(network);
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{legacyLgxStorageUrl});
@@ -1433,7 +1439,8 @@ TEST(FetchSelection, HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork) {
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
     lib.setNetwork("logos.dev");
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
@@ -1447,7 +1454,8 @@ TEST(FetchSelection, HttpsIsUsedWhenTheStorageNetworkIsUnknown) {
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
@@ -1463,7 +1471,8 @@ TEST(FetchSelection, HttpsIsUsedWhenTheRepositoryDeclaresNoNetwork) {
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
     lib.setNetwork(network);
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
@@ -1478,8 +1487,22 @@ TEST(FetchSelection, StorageCidIsTriedWhenNeitherSideDeclaresANetwork) {
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
-    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
 
     EXPECT_EQ(storage->fileGets, std::vector<std::string>{cid});
     EXPECT_TRUE(http->fileGets.empty());
+}
+
+TEST(FetchDestination, DestinationContainsPackageVersion) {
+    auto http = storageCatalogFetcher();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, "", rootHash, outputDir);
+
+    // The fetcher writes to the pending file, `<dest>.<random suffix>`.
+    const std::string filename = fs::path(http->lastDest).filename().string();
+    EXPECT_EQ(filename.rfind("blockchain_module-0.2.0.lgx.", 0), 0u) << filename;
 }

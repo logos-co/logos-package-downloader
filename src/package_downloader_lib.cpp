@@ -1118,7 +1118,9 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 if (ec || tmp.empty()) return {};   // caller reports the failure
                 destDir = tmp.string();
             }
-            std::string filename = packageName + ".lgx";
+
+            const std::string packageVersion = objOrEmpty(*v, "manifest").value("version", "");
+            std::string filename = packageName + "-" + packageVersion + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
             std::string cid;
             // Fallback on `url` if `urls` doesn't exist or is empty.
