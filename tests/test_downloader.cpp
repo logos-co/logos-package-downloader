@@ -1338,6 +1338,8 @@ public:
     explicit StorageFetcher(bool succeed) : succeed_(succeed) {}
 
     // Keep track of the CIDs that were requested to be fetched to file.
+    std::vector<std::string> attempts;
+    // Keep track of the CIDs that were actually fetched to file.
     std::vector<std::string> fileGets;
 
     lgpd::FetchResult get(const std::string&, std::string&) override {
@@ -1345,6 +1347,8 @@ public:
     }
 
     lgpd::FetchResult getToFile(const std::string& cid, const std::string&) override {
+        attempts.push_back(cid);
+
         if (!succeed_) {
             return {false, "storage node unreachable"};
         }
@@ -1390,10 +1394,8 @@ TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
     lib.setNetwork(network);
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
-    const std::string logged = testing::internal::GetCapturedStderr();
-
+    EXPECT_EQ(storage->attempts, std::vector<std::string>{cid});
     EXPECT_TRUE(storage->fileGets.empty());
-    EXPECT_NE(logged.find("storage node unreachable"), std::string::npos);
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
 }
 
@@ -1418,7 +1420,7 @@ TEST(FetchSelection, LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls) {
     lib.setNetwork(network);
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
-    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{legacyLgxStorageUrl});
 }
 
@@ -1433,7 +1435,7 @@ TEST(FetchSelection, HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork) {
     lib.setNetwork("logos.dev");
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
-    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
 }
 
@@ -1447,7 +1449,7 @@ TEST(FetchSelection, HttpsIsUsedWhenTheStorageNetworkIsUnknown) {
     lib.setStorageFetcher(storage);
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
-    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
 }
 
@@ -1463,7 +1465,7 @@ TEST(FetchSelection, HttpsIsUsedWhenTheRepositoryDeclaresNoNetwork) {
     lib.setNetwork(network);
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
-    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_TRUE(storage->attempts.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
 }
 
