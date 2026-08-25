@@ -361,6 +361,7 @@ bool parseLogosRepoJson(const std::string& body, Repository& dst, std::string& e
         dst.description = j.value("description", "");
         dst.homepage    = j.value("homepage", "");
         dst.indexUrl    = j["indexUrl"].get<std::string>();
+        dst.network     = j.value("network", "");
         dst.trustedSignerDids.clear();
         if (j.contains("trustedSigners") && j["trustedSigners"].is_array()) {
             for (const auto& s : j["trustedSigners"]) {
@@ -504,6 +505,7 @@ struct RepositoryRegistry::Impl {
         parsed.description.clear();
         parsed.homepage.clear();
         parsed.indexUrl.clear();
+        parsed.network.clear();
         parsed.trustedSignerDids.clear();
         if (!parseLogosRepoJson(body, parsed, err)) {
             r.resolveError = "logos-repo.json: " + err;
@@ -649,6 +651,7 @@ struct PackageDownloaderLib::Impl {
     RepositoryRegistry registry;
     std::shared_ptr<Fetcher> fetcher = std::make_shared<HttpsFetcher>();
     std::shared_ptr<Fetcher> storageFetcher;
+    std::string network;
 
     // Caches: url -> body
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
@@ -775,6 +778,10 @@ void PackageDownloaderLib::setStorageFetcher(std::shared_ptr<Fetcher> fetcher) {
     impl_->storageFetcher = fetcher;
 }
 
+void PackageDownloaderLib::setNetwork(const std::string& network) {
+    impl_->network = network;
+}
+
 RepositoryRegistry& PackageDownloaderLib::registry() { return impl_->registry; }
 const RepositoryRegistry& PackageDownloaderLib::registry() const { return impl_->registry; }
 
@@ -791,6 +798,7 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
         e["description"] = r.description;
         e["homepage"] = r.homepage;
         e["indexUrl"] = r.indexUrl;
+        e["network"] = r.network;
         e["trustedSignerDids"] = r.trustedSignerDids;
         e["resolveError"] = r.resolveError;
         arr.push_back(std::move(e));
@@ -1183,7 +1191,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             bool downloaded = false;
             // Define the source URL for logging purposes.
             std::string source = httpsUrl;
-            if (!cid.empty() && impl_->storageFetcher) {
+
+            if (!cid.empty() && impl_->storageFetcher && impl_->network == repo.network) {
                 const FetchResult storageFetched =
                     impl_->storageFetcher->getToFile(cid, pendingFile, progressSink);
                 downloaded = storageFetched.ok;

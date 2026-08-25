@@ -61,6 +61,7 @@ struct Repository {
     std::string description;
     std::string homepage;
     std::string indexUrl;
+    std::string network;
     /// `trustedSigners[].did` as ADVERTISED by the repository's own
     /// logos-repo.json. ADVISORY ONLY — parsed, stored, and echoed back in
     /// listRepositoriesJson(); consulted by nothing, deliberately.
@@ -165,6 +166,8 @@ public:
     void setFetcher(std::shared_ptr<Fetcher> fetcher);
 
     void setStorageFetcher(std::shared_ptr<Fetcher> fetcher);
+
+    void setNetwork(const std::string& network);
 
     /// Returns the registry (mutable).
     RepositoryRegistry& registry();

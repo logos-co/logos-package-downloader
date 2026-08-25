@@ -63,10 +63,17 @@ json makeVersion(const char* ver, const char* hash, const json& deps) {
 // A two-package catalog: blockchain_module @ {0.1.0, 0.2.0} and blockchain_ui
 // @ 0.1.0 which depends on blockchain_module (range configurable).
 std::shared_ptr<MockFetcher> catalogFetcher(const json& uiDepRange,
-                                            const json& urls = json()) {
+                                            const json& urls = json(),
+                                            const char* network = nullptr) {
     auto f = std::make_shared<MockFetcher>();
-    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
-                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json repo = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                     {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}};
+
+    if (network) {
+        repo["network"] = network;
+    }
+
+    f->repoJson = repo.dump();
     json bmV1 = makeVersion("0.1.0", "h_bm_010", json::array());
     bmV1["manifest"]["name"] = "blockchain_module";
     json bmV2 = makeVersion("0.2.0", "h_bm_020", json::array());
@@ -1323,6 +1330,7 @@ constexpr const char* packageName = "blockchain_module";
 constexpr const char* version = "0.2.0";
 constexpr const char* rootHash = "";
 constexpr const char* outputDir = "";
+constexpr const char* network = "logos.test";
 
 class StorageFetcher : public lgpd::Fetcher {
 public:
@@ -1351,7 +1359,7 @@ private:
 std::shared_ptr<MockFetcher> storageCatalogFetcher() {
     const json uiDepRangeJson = json::parse(uiDep);
     const json urlsJson = json::array({std::string("logos:") + cid, lgxStorageUrl});
-    return catalogFetcher(uiDepRangeJson, urlsJson);
+    return catalogFetcher(uiDepRangeJson, urlsJson, network);
 }
 
 }
@@ -1364,6 +1372,7 @@ TEST(FetchSelection, StorageCidIsPreferredOverTheHttpsMirror) {
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
+    lib.setNetwork(network);
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
     EXPECT_EQ(storage->fileGets, std::vector<std::string>{cid});
@@ -1378,6 +1387,7 @@ TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(http);
     lib.setStorageFetcher(storage);
+    lib.setNetwork(network);
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
     const std::string logged = testing::internal::GetCapturedStderr();
@@ -1398,7 +1408,37 @@ TEST(FetchSelection, HttpsIsUsedWhenNoStorageFetcherIsDefined) {
 }
 
 TEST(FetchSelection, LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls) {
-    auto http = catalogFetcher(json::parse(uiDep));
+    auto http = catalogFetcher(json::parse(uiDep), json(), network);
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.setNetwork(network);
+    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+
+    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{legacyLgxStorageUrl});
+}
+
+TEST(FetchSelection, HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork) {
+    auto http = storageCatalogFetcher();
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.setNetwork("logos.dev");
+    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+
+    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(FetchSelection, HttpsIsUsedWhenTheStorageNetworkIsUnknown) {
+    auto http = storageCatalogFetcher();
     bool success = true;
     auto storage = std::make_shared<StorageFetcher>(success);
 
@@ -1408,5 +1448,36 @@ TEST(FetchSelection, LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls) {
     lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
 
     EXPECT_TRUE(storage->fileGets.empty());
-    EXPECT_EQ(http->fileGets, std::vector<std::string>{legacyLgxStorageUrl});
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(FetchSelection, HttpsIsUsedWhenTheRepositoryDeclaresNoNetwork) {
+    const json urlsJson = json::array({std::string("logos:") + cid, lgxStorageUrl});
+    auto http = catalogFetcher(json::parse(uiDep), urlsJson);
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.setNetwork(network);
+    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+
+    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(FetchSelection, StorageCidIsTriedWhenNeitherSideDeclaresANetwork) {
+    const json urlsJson = json::array({std::string("logos:") + cid, lgxStorageUrl});
+    auto http = catalogFetcher(json::parse(uiDep), urlsJson);
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.downloadPackage(repoUrl, packageName, version, rootHash, outputDir);
+
+    EXPECT_EQ(storage->fileGets, std::vector<std::string>{cid});
+    EXPECT_TRUE(http->fileGets.empty());
 }
