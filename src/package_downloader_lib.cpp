@@ -1006,29 +1006,24 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             if (filename.empty()) filename = packageName + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
 
-            // Use a random subdirectory to avoid collisions
-            // with concurrency: multi.
-            // Cannot use mkdtemp for Windows portability.
+            // Use a random suffix to avoid collisions.
+            // This is rare: the filename contains the version.
+            // Download the same version twice in parallel is not common.
             std::random_device rd;
-            const std::uint64_t randomBytes = (std::uint64_t(rd()) << 32) | rd();
-            const fs::path randomFolder = fs::path(destDir) / std::to_string(randomBytes);
-            const std::string pendingFile = (randomFolder / filename).string();
+            std::ostringstream suffix;
 
-            std::error_code dirEc;
-            fs::create_directories(randomFolder, dirEc);
+            // Example: 3f9a2c1b.
+            suffix << std::hex << rd();
 
-            if (dirEc) {
-                errorMessage = "cannot create " + randomFolder.string() + ": "
-                             + dirEc.message();
-                return {};
-            }
+            const std::string pendingFile =
+                (fs::path(destDir) / (filename + "." + suffix.str())).string();
 
             const FetchResult fetched =
                 impl_->fetcher->getToFile(url, pendingFile);
 
             if (!fetched.ok) {
                 std::error_code rmEc;
-                fs::remove_all(randomFolder, rmEc);
+                fs::remove(pendingFile, rmEc);
                 errorMessage = "download of " + packageName + " from " + url
                              + " failed: " + fetched.error;
                 return {};
@@ -1045,7 +1040,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 std::string verr;
                 if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
                     std::error_code rmEc;
-                    fs::remove_all(randomFolder, rmEc);
+                    fs::remove(pendingFile, rmEc);
                     errorMessage = "rejected " + packageName + " from " + url
                                  + ": " + verr;
                     return {};
@@ -1055,12 +1050,9 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             std::error_code mvEc;
             fs::rename(pendingFile, dest, mvEc);
 
-            // Cleanup the random folder whatever the result
-            // of the rename.
-            std::error_code rmEc;
-            fs::remove_all(randomFolder, rmEc);
-
             if (mvEc) {
+                std::error_code rmEc;
+                fs::remove(pendingFile, rmEc);
                 errorMessage = "cannot publish " + packageName + " to " + dest
                              + ": " + mvEc.message();
                 return {};
