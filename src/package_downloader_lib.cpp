@@ -1012,6 +1012,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
 
             // Use a random subdirectory to avoid collisions
             // with concurrency: multi.
+            // Cannot use mkdtemp for Windows portability.
             std::random_device rd;
             const std::uint64_t randomBytes = (std::uint64_t(rd()) << 32) | rd();
             const fs::path randomFolder = fs::path(destDir) / std::to_string(randomBytes);
