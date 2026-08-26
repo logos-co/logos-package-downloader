@@ -30,6 +30,7 @@
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -1005,6 +1006,14 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             const std::uint64_t randomBytes = (std::uint64_t(rd()) << 32) | rd();
             const fs::path randomFolder = fs::path(destDir) / std::to_string(randomBytes);
             const std::string pendingFile = (randomFolder / filename).string();
+
+            std::error_code dirEc;
+            fs::create_directories(randomFolder, dirEc);
+            if (dirEc) {
+                std::cerr << "package_downloader: cannot create " << randomFolder.string()
+                          << " — " << dirEc.message() << "\n";
+                return {};
+            }
 
             const FetchResult fetched =
                 impl_->currentFetcher()->getToFile(url, pendingFile);
