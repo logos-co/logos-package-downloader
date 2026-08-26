@@ -620,7 +620,6 @@ struct PackageDownloaderLib::Impl {
         return true;
     }
 
-    // Copy the fetcher to not hold the lock during the network transfer.
     std::shared_ptr<Fetcher> currentFetcher() const {
         std::lock_guard<std::mutex> lock(mu);
         return fetcher;
@@ -629,7 +628,6 @@ struct PackageDownloaderLib::Impl {
     std::string fetchIndex(const Repository& r) {
         if (r.indexUrl.empty()) return {};
 
-        // Copy the fetch to not hold the lock during the network transfer.
         std::shared_ptr<Fetcher> f;
         {
             std::lock_guard<std::mutex> lock(mu);
