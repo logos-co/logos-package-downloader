@@ -20,12 +20,22 @@ class MockFetcher : public lgpd::Fetcher {
 public:
     std::string repoJson;   // served for the default repo URL
     std::string indexJson;  // served for kIndexUrl
-    bool get(const std::string& url, std::string& out) override {
-        if (url == lgpd::kDefaultRepositoryUrl) { out = repoJson;  return true; }
-        if (url == kIndexUrl)                    { out = indexJson; return true; }
-        return false;
+    lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        if (url == lgpd::kDefaultRepositoryUrl) {
+            out = repoJson;
+            return {true, {}};
+        }
+
+        if (url == kIndexUrl) {
+            out = indexJson;
+            return {true, {}};
+        }
+
+        return {false, "no such url"};
     }
-    bool getToFile(const std::string&, const std::string&) override { return false; }
+    lgpd::FetchResult getToFile(const std::string&, const std::string&) override {
+        return {false, "not served"};
+    }
 };
 
 json makeVersion(const char* ver, const char* hash, const json& deps) {
@@ -349,12 +359,18 @@ TEST(Registry, UserRepoLifecycle) {
     public:
         std::string repoJson;
         std::string indexJson;
-        bool get(const std::string& u, std::string& out) override {
-            if (u == kIndexUrl) { out = indexJson; return true; }
+        lgpd::FetchResult get(const std::string& u, std::string& out) override {
+            if (u == kIndexUrl) {
+                out = indexJson;
+                return {true, {}};
+            }
+
             // Any logos-repo.json variant, including the default.
-            out = repoJson; return true;
+            out = repoJson; return {true, {}};
         }
-        bool getToFile(const std::string&, const std::string&) override { return false; }
+        lgpd::FetchResult getToFile(const std::string&, const std::string&) override {
+            return {false, "not served"};
+        }
     };
     auto mock = std::make_shared<AllUrlsFetcher>();
     mock->repoJson = json{{"schemaVersion", 1}, {"name", "ext"},
@@ -495,8 +511,12 @@ TEST(Registry, AddDefaultAfterRemoveIsAtomicOnFetchFailure) {
     // "network unreachable".
     class NoNetworkFetcher : public lgpd::Fetcher {
     public:
-        bool get(const std::string&, std::string&) override { return false; }
-        bool getToFile(const std::string&, const std::string&) override { return false; }
+        lgpd::FetchResult get(const std::string&, std::string&) override {
+            return {false, "network unreachable"};
+        }
+        lgpd::FetchResult getToFile(const std::string&, const std::string&) override {
+            return {false, "network unreachable"};
+        }
     };
     auto failing = std::make_shared<NoNetworkFetcher>();
     lgpd::PackageDownloaderLib lib(cfg.string());

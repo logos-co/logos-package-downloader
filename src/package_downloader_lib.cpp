@@ -196,7 +196,7 @@ void applyCaBundle(CURL* c) {
 
 // Compact reason a libcurl transfer failed: the libcurl error string (with
 // its numeric code) when the request never completed, else the non-2xx HTTP
-// status. Surfaced via Fetcher::lastError so an opaque "fetch failed"
+// status. Carried in FetchResult::error so an opaque "fetch failed"
 // becomes diagnosable — e.g. a host with no usable CA bundle reports
 // "SSL peer certificate or SSH remote key was not OK" instead of nothing.
 std::string curlFailDetail(CURLcode res, long httpCode) {
@@ -208,10 +208,10 @@ std::string curlFailDetail(CURLcode res, long httpCode) {
 
 class HttpsFetcher : public Fetcher {
 public:
-    bool get(const std::string& url, std::string& out) override {
+    FetchResult get(const std::string& url, std::string& out) override {
         curlInit();
         CURL* c = curl_easy_init();
-        if (!c) return false;
+        if (!c) return {false, "curl_easy_init failed"};
         applyCaBundle(c);
         out.clear();
         // Cache-buster + no-cache headers so a reload right after an
@@ -232,32 +232,37 @@ public:
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_slist_free_all(hdrs);
         curl_easy_cleanup(c);
-        const bool ok = (res == CURLE_OK && code >= 200 && code < 300);
-        m_lastError = ok ? std::string() : curlFailDetail(res, code);
-        return ok;
+        if (res != CURLE_OK || code < 200 || code >= 300)
+            return {false, curlFailDetail(res, code)};
+        return {true, {}};
     }
 
-    bool getToFile(const std::string& url, const std::string& path) override {
+    FetchResult getToFile(const std::string& url, const std::string& path) override {
         curlInit();
         std::error_code ec;
         fs::create_directories(fs::path(path).parent_path(), ec);
         std::ofstream f(path, std::ios::binary);
-        if (!f.is_open()) return false;
+        if (!f.is_open()) {
+            return {false, "cannot open " + path + " for writing"};
+        }
 
         // Remove the destination on any failure so a half-written or
         // empty file is never left behind for a later step (or the
         // user) to mistake for a good download. The body may already
         // have been partially streamed to disk by curlWriteFile before
         // a non-2xx status or transfer error is known.
-        auto fail = [&]() -> bool {
+        auto fail = [&](std::string why) -> FetchResult {
             f.close();
             std::error_code rmEc;
             fs::remove(path, rmEc);
-            return false;
+            return {false, std::move(why)};
         };
 
         CURL* c = curl_easy_init();
-        if (!c) return fail();
+        if (!c) {
+            return fail("curl_easy_init failed");
+        }
+
         applyCaBundle(c);
         curl_easy_setopt(c, CURLOPT_URL, url.c_str());
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteFile);
@@ -270,20 +275,13 @@ public:
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(c);
         f.close();
+
         if (res != CURLE_OK || code < 200 || code >= 300) {
-            m_lastError = curlFailDetail(res, code);
-            std::error_code rmEc;
-            fs::remove(path, rmEc);
-            return false;
+            return fail(curlFailDetail(res, code));
         }
-        m_lastError.clear();
-        return true;
+
+        return {true, {}};
     }
-
-    std::string lastError() const override { return m_lastError; }
-
-private:
-    std::string m_lastError;
 };
 
 // ─── logos-repo.json + index.json parsers ─────────────────────────────────────
@@ -432,10 +430,13 @@ struct RepositoryRegistry::Impl {
             return;
         }
         std::string body;
-        if (!fetcher->get(r.url, body)) {
-            const std::string detail = fetcher->lastError();
-            r.resolveError = "fetch failed: " + r.url +
-                             (detail.empty() ? "" : " — " + detail);
+        const FetchResult result = fetcher->get(r.url, body);
+        if (!result.ok) {
+            r.resolveError = "fetch failed: " + r.url;
+            if (!result.error.empty())  {
+                r.resolveError += " — " + result.error;
+            }
+
             return;
         }
         std::string err;
@@ -623,7 +624,7 @@ struct PackageDownloaderLib::Impl {
             if (it != indexJsonByRepoUrl.end()) return it->second;
         }
         std::string body;
-        if (!fetcher->get(r.indexUrl, body)) return {};
+        if (!fetcher->get(r.indexUrl, body).ok) return {};
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl[r.url] = body;
         return body;
@@ -981,7 +982,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             std::string filename = fs::path(url).filename().string();
             if (filename.empty()) filename = packageName + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
-            if (!impl_->fetcher->getToFile(url, dest)) return {};
+            if (!impl_->fetcher->getToFile(url, dest).ok) return {};
             // Bind the downloaded artifact to what the index advertised
             // — manifest fields + signer DID. The .lgx `url` and the
             // `index.json` come from independent hosts; without this a

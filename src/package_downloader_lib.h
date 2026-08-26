@@ -13,26 +13,22 @@ namespace lgpd {
 /// when no config file is provided.
 extern const char* kDefaultRepositoryUrl;
 
+struct FetchResult {
+    bool ok = false;
+    std::string error;
+};
+
 /// Minimal HTTP(S) fetcher abstraction. The concrete implementation in the
 /// .cpp uses libcurl. Tests can inject their own implementation.
 class Fetcher {
 public:
     virtual ~Fetcher() = default;
 
-    /// HTTP GET. Returns true on 2xx with the response body in `out`.
-    virtual bool get(const std::string& url, std::string& out) = 0;
+    /// HTTP GET. Succeeds on 2xx with the response body in `out`.
+    virtual FetchResult get(const std::string& url, std::string& out) = 0;
 
-    /// HTTP GET to a file. Returns true on 2xx after writing all bytes.
-    virtual bool getToFile(const std::string& url, const std::string& path) = 0;
-
-    /// Human-readable detail for this fetcher's most recent FAILED get() /
-    /// getToFile() — e.g. the libcurl error string or the HTTP status. Empty
-    /// after a success, or when the implementation doesn't track it (the
-    /// default). Lets callers turn an opaque "fetch failed" into something
-    /// actionable: a missing CA bundle surfaces here as an SSL error rather
-    /// than vanishing. Valid on the calling thread immediately after the
-    /// failed call returns.
-    virtual std::string lastError() const { return {}; }
+    /// HTTP GET to a file. Succeeds on 2xx after writing all bytes.
+    virtual FetchResult getToFile(const std::string& url, const std::string& path) = 0;
 };
 
 /// One repository entry in the in-memory registry. The persisted form is
