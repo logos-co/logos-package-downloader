@@ -636,7 +636,12 @@ struct PackageDownloaderLib::Impl {
             f = fetcher;
         }
         std::string body;
-        if (!f->get(r.indexUrl, body).ok) return {};
+        FetchResult result = f->get(r.indexUrl, body);
+
+        if (!result.ok) {
+            return {};
+        }
+
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl[r.url] = body;
         return body;
