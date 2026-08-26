@@ -209,9 +209,18 @@ int cmdDownload(const CliOpts& o, const std::string& name) {
     auto lib = makeLib(o);
     std::cout << "Downloading " << name;
     if (!o.version.empty()) std::cout << " v" << o.version;
+
     std::cout << "..." << std::flush;
-    std::string path = lib->downloadPackage(o.repo, name, o.version, o.rootHash, o.outputDir);
-    if (path.empty()) { std::cout << " FAILED\n"; return 1; }
+    std::string err;
+    std::string path =
+        lib->downloadPackage(o.repo, name, err, o.version, o.rootHash, o.outputDir);
+
+    if (path.empty()) {
+        std::cout << " FAILED\n";
+        std::cerr << "lgpd: " << err << "\n";
+        return 1;
+    }
+
     std::cout << " done\n  -> " << path << "\n";
     return 0;
 }

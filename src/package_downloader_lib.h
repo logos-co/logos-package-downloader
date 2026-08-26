@@ -159,9 +159,11 @@ public:
     /// share the same `version`, pick the newest by `releasedAt`. If
     /// `version` is empty, pick the newest version. `repoUrlOrName` may be
     /// empty to mean "any enabled repo, in registry order".
-    /// Returns the local path to the downloaded `.lgx`, or empty on error.
+    /// Returns the local path to the downloaded `.lgx`, or empty on error
+    /// with the reason in `errorMessage`.
     std::string downloadPackage(const std::string& repoUrlOrName,
                                 const std::string& packageName,
+                                std::string& errorMessage,
                                 const std::string& version = "",
                                 const std::string& rootHash = "",
                                 const std::string& outputDir = "");

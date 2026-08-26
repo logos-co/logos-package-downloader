@@ -959,9 +959,14 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
 
 std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrName,
                                                   const std::string& packageName,
+                                                  std::string& errorMessage,
                                                   const std::string& version,
                                                   const std::string& rootHash,
                                                   const std::string& outputDir) {
+
+    // Clear any previous error message before starting a new download attempt.
+    errorMessage.clear();
+
     impl_->ensureMetadata();
 
     // Build the list of repos to consider.
@@ -972,7 +977,12 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         }
     } else {
         auto r = impl_->registry.findByUrlOrName(repoUrlOrName);
-        if (!r) return {};
+
+        if (!r) {
+            errorMessage = "no such repository: " + repoUrlOrName;
+            return {};
+        }
+
         candidates.push_back(*r);
     }
 
@@ -1009,20 +1019,21 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
 
             std::error_code dirEc;
             fs::create_directories(randomFolder, dirEc);
+
             if (dirEc) {
-                std::cerr << "package_downloader: cannot create " << randomFolder.string()
-                          << " — " << dirEc.message() << "\n";
+                errorMessage = "cannot create " + randomFolder.string() + ": "
+                             + dirEc.message();
                 return {};
             }
 
             const FetchResult fetched =
                 impl_->currentFetcher()->getToFile(url, pendingFile);
+
             if (!fetched.ok) {
                 std::error_code rmEc;
                 fs::remove_all(randomFolder, rmEc);
-                std::cerr << "package_downloader: download of " << packageName
-                          << " from " << url << " failed — " << fetched.error
-                          << "\n";
+                errorMessage = "download of " + packageName + " from " + url
+                             + " failed: " + fetched.error;
                 return {};
             }
             // Bind the downloaded artifact to what the index advertised
@@ -1038,8 +1049,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
                     std::error_code rmEc;
                     fs::remove_all(randomFolder, rmEc);
-                    std::cerr << "package_downloader: rejected " << packageName
-                              << " from " << url << " — " << verr << "\n";
+                    errorMessage = "rejected " + packageName + " from " + url
+                                 + ": " + verr;
                     return {};
                 }
             }
@@ -1053,13 +1064,16 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             fs::remove_all(randomFolder, rmEc);
 
             if (mvEc) {
-                std::cerr << "package_downloader: cannot publish " << packageName
-                          << " to " << dest << " — " << mvEc.message() << "\n";
+                errorMessage = "cannot publish " + packageName + " to " + dest
+                             + ": " + mvEc.message();
                 return {};
             }
             return dest;
         }
     }
+    if (errorMessage.empty())
+        errorMessage = "no repository advertises " + packageName
+                     + (version.empty() ? "" : " " + version);
     return {};
 }
 
