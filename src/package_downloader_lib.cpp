@@ -934,10 +934,26 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
 
     // ── 2c. Signer binding ───────────────────────────────────────────
     // When the index advertised a signer DID, the file must be signed
-    // by the SAME DID. We don't re-verify the Ed25519 here
-    // (package_manager does, against the trust keyring) — we only bind
-    // index→file so a swap to a differently-signed (or unsigned)
-    // package is caught even under the WARN signature policy.
+    // by the SAME DID — and the signature must actually VERIFY.
+    //
+    // `signature_valid`, not `is_signed`, and never `signer_did` on its
+    // own. logos-package populates signer_did straight out of
+    // manifest.sig BEFORE it runs the Ed25519 check
+    // (Package::verifySignature sets info.signer_did, then may return
+    // early on a bad DID, a malformed signature, or a failed verify),
+    // so signer_did is a CLAIM the package makes about itself until
+    // that check passes. This block used to read only is_signed and
+    // signer_did, so a substituted package carrying a hand-written
+    // manifest.sig that merely NAMED the advertised DID satisfied the
+    // binding: an attacker did not need the key, only the DID string,
+    // which the catalog publishes.
+    //
+    // Verifying here does NOT make this an authorization check — no
+    // keyring is consulted and none should be; the trust-anchor gate in
+    // logos-package-manager owns that. All this asks is whether the
+    // bytes we downloaded really are the ones the advertised publisher
+    // signed, which is the only reading under which "binds index→file"
+    // is true at all.
     const json& advSig = objOrEmpty(indexEntry, "signature");
     if (!advSig.empty()) {
         const std::string advDid = advSig.value("did", "");
@@ -945,12 +961,24 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
             lgx_signature_info_t info =
                 lgx_verify_signature(lgxPath.c_str(), nullptr);
             const bool fileSigned = info.is_signed;
+            const bool fileSigValid = info.signature_valid;
             const std::string fileDid =
                 info.signer_did ? info.signer_did : "";
             lgx_free_signature_info(info);
-            if (!fileSigned || fileDid != advDid) {
+            if (!PackageDownloaderLib::downloadedSignerBinds(
+                    fileSigned, fileSigValid, fileDid, advDid)) {
                 errMsg = "downloaded package signer does not match the "
-                         "catalog (expected " + advDid + ")";
+                         "catalog (expected " + advDid;
+                // Name WHICH of the three it was: "expected X" alone
+                // reads as a DID mismatch, and sends whoever hits the
+                // forged case looking for the wrong problem entirely.
+                if (!fileSigned)
+                    errMsg += ", file is unsigned)";
+                else if (!fileSigValid)
+                    errMsg += ", file claims " + (fileDid.empty() ? std::string("no DID") : fileDid)
+                            + " but its signature does not verify)";
+                else
+                    errMsg += ", got " + fileDid + ")";
                 return false;
             }
         }
@@ -1398,6 +1426,26 @@ bool PackageDownloaderLib::signerPinMatches(const std::string& pin,
     // can satisfy anything.
     if (pin.empty() || candidateSignerDid.empty()) return false;
     return pin == candidateSignerDid;
+}
+
+bool PackageDownloaderLib::downloadedSignerBinds(bool fileSigned,
+                                                 bool fileSignatureValid,
+                                                 const std::string& fileSignerDid,
+                                                 const std::string& advertisedDid) {
+    // Stated as a conjunction of everything that must hold, for the same
+    // reason signerPinMatches is stated positively: the predicate this
+    // replaced was `fileSigned && fileDid == advDid`, and the missing term was
+    // invisible precisely because the two present ones read as sufficient.
+    //
+    // An empty advertised DID never binds anything — callers only reach here
+    // with a non-empty one, but the invariant belongs next to the comparison
+    // so a caller constructed some other way cannot reopen it.
+    if (advertisedDid.empty()) return false;
+    if (!fileSigned) return false;
+    // THE TERM THAT WAS MISSING. Without it, `fileSignerDid` is only what the
+    // package says about itself.
+    if (!fileSignatureValid) return false;
+    return fileSignerDid == advertisedDid;
 }
 
 bool PackageDownloaderLib::outranks(const std::string& candidateVersion, const std::string& candidateDate,

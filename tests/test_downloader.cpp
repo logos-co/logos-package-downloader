@@ -990,3 +990,44 @@ TEST(SignerPin, ResolvedEntryCarriesNoTrustVerdict) {
         EXPECT_FALSE(e.contains("verified"))   << raw;
     }
 }
+
+// ── Binding a DOWNLOADED FILE to the signer the catalog advertised ───────────
+//
+// A different question from the pin above, on different inputs. signerPinMatches
+// compares two pieces of CATALOG metadata while choosing what to fetch;
+// downloadedSignerBinds compares the catalog against the BYTES THAT ARRIVED.
+//
+// The term that was missing is `fileSignatureValid`. logos-package sets
+// `signer_did` from manifest.sig BEFORE it runs the Ed25519 check
+// (Package::verifySignature), so a DID read off a downloaded file is a CLAIM
+// until that check passes — and the DID being claimed is published in the
+// catalog for anyone to copy. The binding used to read `is_signed` and
+// `signer_did` only, so a substituted package carrying a hand-written
+// manifest.sig that merely NAMED the advertised DID bound successfully. No key
+// required, and nothing downstream re-checks: package_manager under the default
+// WARN policy installs a package whose signature failed... no. It refuses that
+// one. What it does NOT refuse is the swap this binding exists to catch, which
+// is the whole reason 2c is here at all.
+
+TEST(DownloadedSignerBinding, AForgedSignatureNamingTheAdvertisedDidDoesNotBind) {
+    using lgpd::PackageDownloaderLib;
+
+    // The attack, stated exactly: signed=true (there IS a manifest.sig), the
+    // DID inside it is the advertised one, and it does not verify.
+    EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(
+        /*fileSigned=*/true, /*fileSignatureValid=*/false, kGoodDid, kGoodDid))
+        << "a manifest.sig that merely NAMES the advertised DID bound to the catalog";
+
+    // The honest case still binds.
+    EXPECT_TRUE(PackageDownloaderLib::downloadedSignerBinds(true, true, kGoodDid, kGoodDid));
+
+    // ...and every other way of failing still fails.
+    EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(false, false, "", kGoodDid))
+        << "an unsigned substitute bound to a signed catalog entry";
+    EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, true, kOtherDid, kGoodDid))
+        << "a validly signed package by the WRONG publisher bound";
+    EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, false, kOtherDid, kGoodDid));
+    // An empty advertised DID binds nothing — the same shape of hole B1 was.
+    EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, true, kGoodDid, ""));
+    EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, true, "", ""));
+}
