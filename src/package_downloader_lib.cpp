@@ -599,12 +599,15 @@ struct PackageDownloaderLib::Impl {
     // setFetcher (new fetcher → must re-resolve) and forced by
     // refreshCatalogs (explicit reload).
     bool metadataResolved = false;
+
     mutable std::mutex mu;
 
     Impl() {}
     explicit Impl(std::string configPath) : registry(std::move(configPath)) {}
 
     bool ensureMetadata() {
+        std::lock_guard<std::mutex> lock(mu);
+
         // Lazy: resolve repo metadata once per process. The first
         // catalog/list/resolve call pays the network cost; later calls
         // reuse it. Best-effort — refresh() records per-repo errors and
@@ -631,7 +634,6 @@ struct PackageDownloaderLib::Impl {
     }
 
     void clearCaches() {
-        std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl.clear();
     }
 
@@ -687,6 +689,7 @@ PackageDownloaderLib::PackageDownloaderLib(std::string configPath)
 PackageDownloaderLib::~PackageDownloaderLib() = default;
 
 void PackageDownloaderLib::setFetcher(std::shared_ptr<Fetcher> fetcher) {
+    std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->fetcher = fetcher;
     impl_->registry.setFetcher(fetcher);
     impl_->clearCaches();
@@ -743,11 +746,17 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
 }
 
 std::string PackageDownloaderLib::refreshCatalogs() {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+
     impl_->clearCaches();
+
     // Explicit reload: force the metadata refresh now and mark it done
     // so the next ensureMetadata() doesn't redundantly refresh again.
+    // Marked done only after refresh() returns: otherwise a concurrent
+    // ensureMetadata() sees the flag and reads a half-resolved registry.
+    std::string out = impl_->registry.refresh();
     impl_->metadataResolved = true;
-    return impl_->registry.refresh();
+    return out;
 }
 
 namespace {
