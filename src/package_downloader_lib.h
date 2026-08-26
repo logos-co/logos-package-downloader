@@ -237,6 +237,32 @@ public:
     static bool signerPinMatches(const std::string& pin,
                                  const std::string& candidateSignerDid);
 
+    /// Does a DOWNLOADED FILE satisfy the signer the catalog advertised for
+    /// it? A different question from signerPinMatches, on a different input:
+    /// that one compares two pieces of CATALOG metadata while choosing what to
+    /// fetch; this one compares the catalog against the bytes that arrived.
+    ///
+    /// All three facts must line up: the file is signed, its signature
+    /// VERIFIES, and the DID it verifies under is the advertised one.
+    ///
+    /// `fileSignatureValid` is the half that was missing. logos-package
+    /// populates `signer_did` out of manifest.sig BEFORE running the Ed25519
+    /// check, so a DID alone is a CLAIM — and the advertised DID is public
+    /// catalog data. Without the validity term, substituting a package that
+    /// merely NAMES the advertised DID in a hand-written manifest.sig passed
+    /// the binding, no key required.
+    ///
+    /// Still not authorization: no keyring is consulted here, and none should
+    /// be. This asks only whether the bytes we received are the ones the
+    /// advertised publisher actually signed.
+    ///
+    /// Exposed, like signerPinMatches, so the invariant can be tested next to
+    /// the comparison it constrains rather than only through a live download.
+    static bool downloadedSignerBinds(bool fileSigned,
+                                      bool fileSignatureValid,
+                                      const std::string& fileSignerDid,
+                                      const std::string& advertisedDid);
+
     /// The resolver's ranking rule: does the candidate outrank the incumbent?
     ///
     /// SemVer precedence decides; `releasedAt` only breaks ties between equal
