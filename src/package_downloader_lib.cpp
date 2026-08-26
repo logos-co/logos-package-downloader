@@ -20,14 +20,14 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <mutex>
-#include <regex>
+#include <random>
 #include <sstream>
 #include <unordered_map>
 
@@ -619,15 +619,25 @@ struct PackageDownloaderLib::Impl {
         return true;
     }
 
+    // Copy the fetcher to not hold the lock during the network transfer.
+    std::shared_ptr<Fetcher> currentFetcher() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return fetcher;
+    }
+
     std::string fetchIndex(const Repository& r) {
         if (r.indexUrl.empty()) return {};
+
+        // Copy the fetch to not hold the lock during the network transfer.
+        std::shared_ptr<Fetcher> f;
         {
             std::lock_guard<std::mutex> lock(mu);
             auto it = indexJsonByRepoUrl.find(r.url);
             if (it != indexJsonByRepoUrl.end()) return it->second;
+            f = fetcher;
         }
         std::string body;
-        if (!fetcher->get(r.indexUrl, body).ok) return {};
+        if (!f->get(r.indexUrl, body).ok) return {};
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl[r.url] = body;
         return body;
@@ -746,15 +756,12 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
 }
 
 std::string PackageDownloaderLib::refreshCatalogs() {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-
-    impl_->clearCaches();
-
     // Explicit reload: force the metadata refresh now and mark it done
     // so the next ensureMetadata() doesn't redundantly refresh again.
-    // Marked done only after refresh() returns: otherwise a concurrent
-    // ensureMetadata() sees the flag and reads a half-resolved registry.
     std::string out = impl_->registry.refresh();
+
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->clearCaches();
     impl_->metadataResolved = true;
     return out;
 }
@@ -991,7 +998,24 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             std::string filename = fs::path(url).filename().string();
             if (filename.empty()) filename = packageName + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
-            if (!impl_->fetcher->getToFile(url, dest).ok) return {};
+
+            // Use a random subdirectory to avoid collisions
+            // with concurrency: multi.
+            std::random_device rd;
+            const std::uint64_t randomBytes = (std::uint64_t(rd()) << 32) | rd();
+            const fs::path randomFolder = fs::path(destDir) / std::to_string(randomBytes);
+            const std::string pendingFile = (randomFolder / filename).string();
+
+            const FetchResult fetched =
+                impl_->currentFetcher()->getToFile(url, pendingFile);
+            if (!fetched.ok) {
+                std::error_code rmEc;
+                fs::remove_all(randomFolder, rmEc);
+                std::cerr << "package_downloader: download of " << packageName
+                          << " from " << url << " failed — " << fetched.error
+                          << "\n";
+                return {};
+            }
             // Bind the downloaded artifact to what the index advertised
             // — manifest fields + signer DID. The .lgx `url` and the
             // `index.json` come from independent hosts; without this a
@@ -1002,13 +1026,27 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // artifact and fail the download.
             {
                 std::string verr;
-                if (!verifyDownloadAgainstIndex(dest, *v, verr)) {
+                if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
                     std::error_code rmEc;
-                    fs::remove(dest, rmEc);
+                    fs::remove_all(randomFolder, rmEc);
                     std::cerr << "package_downloader: rejected " << packageName
                               << " from " << url << " — " << verr << "\n";
                     return {};
                 }
+            }
+
+            std::error_code mvEc;
+            fs::rename(pendingFile, dest, mvEc);
+
+            // Cleanup the random folder whatever the result
+            // of the rename.
+            std::error_code rmEc;
+            fs::remove_all(randomFolder, rmEc);
+
+            if (mvEc) {
+                std::cerr << "package_downloader: cannot publish " << packageName
+                          << " to " << dest << " — " << mvEc.message() << "\n";
+                return {};
             }
             return dest;
         }
