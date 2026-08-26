@@ -620,23 +620,16 @@ struct PackageDownloaderLib::Impl {
         return true;
     }
 
-    std::shared_ptr<Fetcher> currentFetcher() const {
-        std::lock_guard<std::mutex> lock(mu);
-        return fetcher;
-    }
-
     std::string fetchIndex(const Repository& r) {
         if (r.indexUrl.empty()) return {};
 
-        std::shared_ptr<Fetcher> f;
         {
             std::lock_guard<std::mutex> lock(mu);
             auto it = indexJsonByRepoUrl.find(r.url);
             if (it != indexJsonByRepoUrl.end()) return it->second;
-            f = fetcher;
         }
         std::string body;
-        FetchResult result = f->get(r.indexUrl, body);
+        FetchResult result = fetcher->get(r.indexUrl, body);
 
         if (!result.ok) {
             return {};
@@ -1031,7 +1024,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             }
 
             const FetchResult fetched =
-                impl_->currentFetcher()->getToFile(url, pendingFile);
+                impl_->fetcher->getToFile(url, pendingFile);
 
             if (!fetched.ok) {
                 std::error_code rmEc;
