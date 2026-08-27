@@ -681,6 +681,7 @@ struct PackageDownloaderLib::Impl {
                     entry["category"]    = firstManifest.value("category", "");
                     entry["author"]      = firstManifest.value("author", "");
                     entry["manifestVersion"] = firstManifest.value("manifestVersion", "");
+                    entry["provides"] = firstManifest.value("provides", "");
                     const std::string iconPath =
                         objOrEmpty(firstVersion, "icon").value("path", "");
                     const auto slash = r.indexUrl.find_last_of('/');
