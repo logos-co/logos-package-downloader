@@ -109,16 +109,26 @@ char* lgpd_download_package(lgpd_context_t ctx,
         set_error("invalid arguments");
         return nullptr;
     }
+    std::string err;
     std::string path = ctx->lib->downloadPackage(
         safeStr(repo_url_or_name),
         safeStr(package_name),
+        err,
         safeStr(version),
         safeStr(root_hash),
         safeStr(output_dir));
+
     if (path.empty()) {
-        set_error("download failed for package: " + std::string(package_name));
+        std::string errMsg = "download failed for package: " + std::string(package_name);
+
+        if (!err.empty()) {
+            errMsg += " — " + err;
+        }
+
+        set_error(errMsg);
         return nullptr;
     }
+
     return to_c_string(path);
 }
 

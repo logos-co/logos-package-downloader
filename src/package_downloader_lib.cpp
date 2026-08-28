@@ -20,16 +20,17 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <mutex>
-#include <regex>
+#include <random>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -211,7 +212,7 @@ void applyCaBundle(CURL* c) {
 
 // Compact reason a libcurl transfer failed: the libcurl error string (with
 // its numeric code) when the request never completed, else the non-2xx HTTP
-// status. Surfaced via Fetcher::lastError so an opaque "fetch failed"
+// status. Carried in FetchResult::error so an opaque "fetch failed"
 // becomes diagnosable — e.g. a host with no usable CA bundle reports
 // "SSL peer certificate or SSH remote key was not OK" instead of nothing.
 std::string curlFailDetail(CURLcode res, long httpCode) {
@@ -223,10 +224,10 @@ std::string curlFailDetail(CURLcode res, long httpCode) {
 
 class HttpsFetcher : public Fetcher {
 public:
-    bool get(const std::string& url, std::string& out) override {
+    FetchResult get(const std::string& url, std::string& out) override {
         curlInit();
         CURL* c = curl_easy_init();
-        if (!c) return false;
+        if (!c) return {false, "curl_easy_init failed"};
         applyCaBundle(c);
         out.clear();
         // Cache-buster + no-cache headers so a reload right after an
@@ -247,32 +248,37 @@ public:
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_slist_free_all(hdrs);
         curl_easy_cleanup(c);
-        const bool ok = (res == CURLE_OK && code >= 200 && code < 300);
-        m_lastError = ok ? std::string() : curlFailDetail(res, code);
-        return ok;
+        if (res != CURLE_OK || code < 200 || code >= 300)
+            return {false, curlFailDetail(res, code)};
+        return {true, {}};
     }
 
-    bool getToFile(const std::string& url, const std::string& path) override {
+    FetchResult getToFile(const std::string& url, const std::string& path) override {
         curlInit();
         std::error_code ec;
         fs::create_directories(fs::path(path).parent_path(), ec);
         std::ofstream f(path, std::ios::binary);
-        if (!f.is_open()) return false;
+        if (!f.is_open()) {
+            return {false, "cannot open " + path + " for writing"};
+        }
 
         // Remove the destination on any failure so a half-written or
         // empty file is never left behind for a later step (or the
         // user) to mistake for a good download. The body may already
         // have been partially streamed to disk by curlWriteFile before
         // a non-2xx status or transfer error is known.
-        auto fail = [&]() -> bool {
+        auto fail = [&](std::string why) -> FetchResult {
             f.close();
             std::error_code rmEc;
             fs::remove(path, rmEc);
-            return false;
+            return {false, std::move(why)};
         };
 
         CURL* c = curl_easy_init();
-        if (!c) return fail();
+        if (!c) {
+            return fail("curl_easy_init failed");
+        }
+
         applyCaBundle(c);
         curl_easy_setopt(c, CURLOPT_URL, url.c_str());
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteFile);
@@ -285,20 +291,13 @@ public:
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(c);
         f.close();
+
         if (res != CURLE_OK || code < 200 || code >= 300) {
-            m_lastError = curlFailDetail(res, code);
-            std::error_code rmEc;
-            fs::remove(path, rmEc);
-            return false;
+            return fail(curlFailDetail(res, code));
         }
-        m_lastError.clear();
-        return true;
+
+        return {true, {}};
     }
-
-    std::string lastError() const override { return m_lastError; }
-
-private:
-    std::string m_lastError;
 };
 
 // ─── logos-repo.json + index.json parsers ─────────────────────────────────────
@@ -447,10 +446,13 @@ struct RepositoryRegistry::Impl {
             return;
         }
         std::string body;
-        if (!fetcher->get(r.url, body)) {
-            const std::string detail = fetcher->lastError();
-            r.resolveError = "fetch failed: " + r.url +
-                             (detail.empty() ? "" : " — " + detail);
+        const FetchResult result = fetcher->get(r.url, body);
+        if (!result.ok) {
+            r.resolveError = "fetch failed: " + r.url;
+            if (!result.error.empty())  {
+                r.resolveError += " — " + result.error;
+            }
+
             return;
         }
         std::string err;
@@ -613,12 +615,15 @@ struct PackageDownloaderLib::Impl {
     // setFetcher (new fetcher → must re-resolve) and forced by
     // refreshCatalogs (explicit reload).
     bool metadataResolved = false;
+
     mutable std::mutex mu;
 
     Impl() {}
     explicit Impl(std::string configPath) : registry(std::move(configPath)) {}
 
     bool ensureMetadata() {
+        std::lock_guard<std::mutex> lock(mu);
+
         // Lazy: resolve repo metadata once per process. The first
         // catalog/list/resolve call pays the network cost; later calls
         // reuse it. Best-effort — refresh() records per-repo errors and
@@ -632,20 +637,25 @@ struct PackageDownloaderLib::Impl {
 
     std::string fetchIndex(const Repository& r) {
         if (r.indexUrl.empty()) return {};
+
         {
             std::lock_guard<std::mutex> lock(mu);
             auto it = indexJsonByRepoUrl.find(r.url);
             if (it != indexJsonByRepoUrl.end()) return it->second;
         }
         std::string body;
-        if (!fetcher->get(r.indexUrl, body)) return {};
+        FetchResult result = fetcher->get(r.indexUrl, body);
+
+        if (!result.ok) {
+            return {};
+        }
+
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl[r.url] = body;
         return body;
     }
 
     void clearCaches() {
-        std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl.clear();
     }
 
@@ -709,6 +719,7 @@ PackageDownloaderLib::PackageDownloaderLib(std::string configPath)
 PackageDownloaderLib::~PackageDownloaderLib() = default;
 
 void PackageDownloaderLib::setFetcher(std::shared_ptr<Fetcher> fetcher) {
+    std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->fetcher = fetcher;
     impl_->registry.setFetcher(fetcher);
     impl_->clearCaches();
@@ -765,11 +776,14 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
 }
 
 std::string PackageDownloaderLib::refreshCatalogs() {
-    impl_->clearCaches();
     // Explicit reload: force the metadata refresh now and mark it done
     // so the next ensureMetadata() doesn't redundantly refresh again.
+    std::string out = impl_->registry.refresh();
+
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->clearCaches();
     impl_->metadataResolved = true;
-    return impl_->registry.refresh();
+    return out;
 }
 
 namespace {
@@ -992,9 +1006,14 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
 
 std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrName,
                                                   const std::string& packageName,
+                                                  std::string& errorMessage,
                                                   const std::string& version,
                                                   const std::string& rootHash,
                                                   const std::string& outputDir) {
+
+    // Clear any previous error message before starting a new download attempt.
+    errorMessage.clear();
+
     impl_->ensureMetadata();
 
     // Build the list of repos to consider.
@@ -1005,7 +1024,12 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         }
     } else {
         auto r = impl_->registry.findByUrlOrName(repoUrlOrName);
-        if (!r) return {};
+
+        if (!r) {
+            errorMessage = "no such repository: " + repoUrlOrName;
+            return {};
+        }
+
         candidates.push_back(*r);
     }
 
@@ -1041,7 +1065,29 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             std::string filename = fs::path(url).filename().string();
             if (filename.empty()) filename = packageName + ".lgx";
             std::string dest = (fs::path(destDir) / filename).string();
-            if (!impl_->fetcher->getToFile(url, dest)) return {};
+
+            // Use a random suffix to avoid collisions.
+            // This is rare: the filename contains the version.
+            // Download the same version twice in parallel is not common.
+            std::random_device rd;
+            std::ostringstream suffix;
+
+            // Example: 3f9a2c1b.
+            suffix << std::hex << rd();
+
+            const std::string pendingFile =
+                (fs::path(destDir) / (filename + "." + suffix.str())).string();
+
+            const FetchResult fetched =
+                impl_->fetcher->getToFile(url, pendingFile);
+
+            if (!fetched.ok) {
+                std::error_code rmEc;
+                fs::remove(pendingFile, rmEc);
+                errorMessage = "download of " + packageName + " from " + url
+                             + " failed: " + fetched.error;
+                return {};
+            }
             // Bind the downloaded artifact to what the index advertised
             // — manifest fields + signer DID. The .lgx `url` and the
             // `index.json` come from independent hosts; without this a
@@ -1052,17 +1098,31 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // artifact and fail the download.
             {
                 std::string verr;
-                if (!verifyDownloadAgainstIndex(dest, *v, verr)) {
+                if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
                     std::error_code rmEc;
-                    fs::remove(dest, rmEc);
-                    std::cerr << "package_downloader: rejected " << packageName
-                              << " from " << url << " — " << verr << "\n";
+                    fs::remove(pendingFile, rmEc);
+                    errorMessage = "rejected " + packageName + " from " + url
+                                 + ": " + verr;
                     return {};
                 }
+            }
+
+            std::error_code mvEc;
+            fs::rename(pendingFile, dest, mvEc);
+
+            if (mvEc) {
+                std::error_code rmEc;
+                fs::remove(pendingFile, rmEc);
+                errorMessage = "cannot publish " + packageName + " to " + dest
+                             + ": " + mvEc.message();
+                return {};
             }
             return dest;
         }
     }
+    if (errorMessage.empty())
+        errorMessage = "no repository advertises " + packageName
+                     + (version.empty() ? "" : " " + version);
     return {};
 }
 
