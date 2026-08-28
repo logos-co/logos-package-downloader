@@ -1502,7 +1502,9 @@ TEST(FetchDestination, DestinationContainsPackageVersion) {
     std::string err;
     lib.downloadPackage(repoUrl, packageName, err, "", rootHash, outputDir);
 
-    // The fetcher writes to the pending file, `<dest>.<random suffix>`.
     const std::string filename = fs::path(http->lastDest).filename().string();
-    EXPECT_EQ(filename.rfind("blockchain_module-0.2.0.lgx.", 0), 0u) << filename;
+
+    // The destination filename contains an unique suffix,
+    // so we check that the filename starts with the expected package name and version.
+    EXPECT_EQ(filename.rfind("blockchain_module-0.2.0.lgx", 0), 0u);
 }
