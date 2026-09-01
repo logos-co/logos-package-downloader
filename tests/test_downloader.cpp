@@ -1,10 +1,15 @@
 #include <gtest/gtest.h>
 #include "package_downloader_lib.h"
+#include "progress_throttle.h"   // private header; reachable via the lib's PUBLIC src/ include dir
 #include <nlohmann/json.hpp>
+#include <cstdint>
+#include <stdexcept>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 using json = nlohmann::json;
@@ -212,6 +217,252 @@ TEST(Resolver, UnpinnedTransitiveDepStillResolvesToNewest) {
     const auto byName = resolvedVersions(lib.resolveDependenciesJson(input));
     ASSERT_EQ(byName.count("blockchain_module"), 1u);
     EXPECT_EQ(byName.at("blockchain_module"), (std::vector<std::string>{"0.2.0"}));
+}
+
+// The resolver's output doubles as an install plan, so it carries each pick's
+// size — what lets a caller show a denominator before any bytes move.
+TEST(Resolver, ResolvedEntryCarriesAdvertisedSize) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json v = makeVersion("1.0.0", "h_sized", json::array());
+    v["manifest"]["name"] = "sized_module";
+    v["size"] = 17083080;
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "sized_module"}, {"versions", json::array({v})}},
+        })},
+    }.dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    const auto out = json::parse(lib.resolveDependenciesJson(
+        json::array({json{{"name", "sized_module"}}}).dump()));
+
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].value("size", std::uint64_t{0}), 17083080u);
+}
+
+// A catalog predating the field must still resolve, reporting 0 rather than
+// dropping the entry or producing a garbage denominator.
+TEST(Resolver, MissingSizeResolvesToZeroNotAnError) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(catalogFetcher(json{{"name", "blockchain_module"}, {"version", "*"}}));
+
+    const auto out = json::parse(lib.resolveDependenciesJson(
+        json::array({json{{"name", "blockchain_ui"}, {"version", "0.1.0"}}}).dump()));
+
+    ASSERT_FALSE(out.empty());
+    for (const auto& e : out) {
+        ASSERT_FALSE(e.contains("error")) << "resolver failed: " << e.dump();
+        EXPECT_EQ(e.value("size", std::uint64_t{999}), 0u)
+            << "absent size should read as 0, not the fallback";
+    }
+}
+
+// ─── ProgressThrottle ────────────────────────────────────────────────────────
+//
+// Time is injected, so these are deterministic — no sleeping, no flake.
+
+TEST(ProgressThrottle, FirstSampleAlwaysPasses) {
+    lgpd::ProgressThrottle t(200);
+    EXPECT_TRUE(t.shouldEmit(0, 1000, 0));
+}
+
+TEST(ProgressThrottle, RateLimitsWithinTheInterval) {
+    lgpd::ProgressThrottle t(200);
+    ASSERT_TRUE(t.shouldEmit(0, 1000, 0));
+    EXPECT_FALSE(t.shouldEmit(100, 1000, 50));
+    EXPECT_FALSE(t.shouldEmit(200, 1000, 199));
+    EXPECT_TRUE(t.shouldEmit(300, 1000, 200)) << "interval elapsed";
+    EXPECT_FALSE(t.shouldEmit(400, 1000, 250));
+    EXPECT_TRUE(t.shouldEmit(500, 1000, 400));
+}
+
+TEST(ProgressThrottle, DropsSamplesCarryingNoNewBytes) {
+    lgpd::ProgressThrottle t(200);
+    ASSERT_TRUE(t.shouldEmit(500, 1000, 0));
+    // A stalled transfer must not emit a stream of identical events.
+    EXPECT_FALSE(t.shouldEmit(500, 1000, 1000));
+    EXPECT_FALSE(t.shouldEmit(499, 1000, 2000)) << "counters must never go backwards";
+    EXPECT_TRUE(t.shouldEmit(501, 1000, 3000));
+}
+
+TEST(ProgressThrottle, CompletionAlwaysPassesEvenInsideTheInterval) {
+    lgpd::ProgressThrottle t(200);
+    ASSERT_TRUE(t.shouldEmit(0, 1000, 0));
+    EXPECT_FALSE(t.shouldEmit(500, 1000, 10));
+    EXPECT_TRUE(t.shouldEmit(1000, 1000, 11));
+}
+
+TEST(ProgressThrottle, UnknownTotalStillRateLimitsAndNeverFakesCompletion) {
+    lgpd::ProgressThrottle t(200);
+    ASSERT_TRUE(t.shouldEmit(0, 0, 0));
+    // total == 0 is "size unknown"; reading received >= total as complete
+    // would let every sample bypass the rate limit.
+    EXPECT_FALSE(t.shouldEmit(100, 0, 10));
+    EXPECT_TRUE(t.shouldEmit(200, 0, 300));
+}
+
+// ─── downloadPackage progress plumbing ───────────────────────────────────────
+
+namespace {
+
+// Replays a scripted sequence of (received, total) samples the way libcurl
+// would. Delivered back-to-back, so anything the caller sees survived the
+// rate limit.
+class ProgressFetcher : public MockFetcher {
+public:
+    using Sample = std::pair<std::uint64_t, std::uint64_t>;
+
+    explicit ProgressFetcher(std::vector<Sample> script)
+        : m_script(std::move(script)) {}
+
+    lgpd::FetchResult getToFile(const std::string&, const std::string& path,
+                                const lgpd::ProgressFn& onProgress) override {
+        std::ofstream(path, std::ios::binary) << "not a real lgx";
+        if (onProgress)
+            for (const auto& s : m_script) onProgress(s.first, s.second);
+        return {true, {}};
+    }
+
+private:
+    std::vector<Sample> m_script;
+};
+
+// Overrides ONLY the two-argument getToFile, like every pre-existing Fetcher
+// implementation.
+class LegacyOnlyFetcher : public MockFetcher {
+public:
+    bool called = false;
+    lgpd::FetchResult getToFile(const std::string&, const std::string& path) override {
+        called = true;
+        std::ofstream(path, std::ios::binary) << "not a real lgx";
+        return {true, {}};
+    }
+};
+
+// A one-package catalog whose single version advertises `size`.
+template <typename F>
+std::shared_ptr<F> sizedFetcher(std::uint64_t advertisedSize, F* seed) {
+    std::shared_ptr<F> f(seed);
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json v = makeVersion("1.0.0", "h_dl", json::array());
+    v["manifest"]["name"] = "dl_module";
+    v["size"] = advertisedSize;
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "dl_module"}, {"versions", json::array({v})}},
+        })},
+    }.dump();
+    return f;
+}
+
+}  // namespace
+
+// The download itself fails afterwards — the served bytes are not a valid
+// .lgx — deliberately: progress must be reported DURING the transfer, before
+// the verdict is known.
+TEST(DownloadProgress, ReportsByteCountsAndRateLimitsOnTheWayOut) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(sizedFetcher(4096, new ProgressFetcher(
+        {{0, 4096}, {2048, 4096}, {4096, 4096}})));
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> samples;
+    std::string err;
+    lib.downloadPackage("", "dl_module", err, "", "", "",
+                        [&](std::uint64_t received, std::uint64_t total) {
+                            samples.emplace_back(received, total);
+                        });
+
+    // First and completing survive; the mid-transfer one lands inside the
+    // rate-limit window.
+    ASSERT_EQ(samples.size(), 2u);
+    EXPECT_EQ(samples[0], (std::pair<std::uint64_t, std::uint64_t>{0, 4096}));
+    EXPECT_EQ(samples[1], (std::pair<std::uint64_t, std::uint64_t>{4096, 4096}));
+}
+
+// A chunked response reports dltotal == 0; the catalog's size stands in so
+// the UI still gets a denominator.
+TEST(DownloadProgress, AdvertisedSizeSubstitutesForAnUnknownTransportTotal) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(sizedFetcher(9999, new ProgressFetcher(
+        {{0, 0}, {512, 0}, {9999, 0}})));
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> samples;
+    std::string err;
+    lib.downloadPackage("", "dl_module", err, "", "", "",
+                        [&](std::uint64_t received, std::uint64_t total) {
+                            samples.emplace_back(received, total);
+                        });
+
+    ASSERT_FALSE(samples.empty());
+    for (const auto& s : samples)
+        EXPECT_EQ(s.second, 9999u)
+            << "unknown transport total should fall back to the catalog size";
+    // The substituted denominator must also drive completion detection, or
+    // the final sample is rate-limited away and the bar stalls.
+    EXPECT_EQ(samples.back().first, 9999u);
+}
+
+// With neither a transport total nor a catalog size, `total` stays 0 rather
+// than being faked into something divisible.
+TEST(DownloadProgress, TotalStaysZeroWhenNobodyKnowsTheSize) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(sizedFetcher(0, new ProgressFetcher({{0, 0}, {512, 0}})));
+
+    std::vector<std::uint64_t> totals;
+    std::string err;
+    lib.downloadPackage("", "dl_module", err, "", "", "",
+                        [&](std::uint64_t, std::uint64_t total) {
+                            totals.push_back(total);
+                        });
+
+    ASSERT_EQ(totals.size(), 1u);
+    EXPECT_EQ(totals.front(), 0u) << "no size anywhere must stay 0, not be "
+                                     "substituted with the absent catalog size";
+}
+
+// A throwing sink must cost a progress sample, never the download — and
+// never the process. In production the sink is called from inside a libcurl
+// C callback, where letting an exception unwind is undefined behaviour.
+TEST(DownloadProgress, AThrowingSinkDoesNotBreakTheDownload) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(sizedFetcher(4096, new ProgressFetcher(
+        {{0, 4096}, {2048, 4096}, {4096, 4096}})));
+
+    int calls = 0;
+    std::string err;
+    // Reaching verifyDownloadAgainstIndex at all proves the transfer ran to
+    // completion rather than being torn down by the throw.
+    lib.downloadPackage("", "dl_module", err, "", "", "",
+                        [&](std::uint64_t, std::uint64_t) {
+                            ++calls;
+                            throw std::runtime_error("sink blew up");
+                        });
+
+    EXPECT_GT(calls, 0) << "the sink must actually have been called";
+    EXPECT_NE(err.find("verification"), std::string::npos)
+        << "download should fail on the bad .lgx, not on the throwing sink; err=" << err;
+}
+
+// A Fetcher implementing only the two-argument getToFile must still be
+// driven, and the download must still succeed — it just reports no progress.
+TEST(DownloadProgress, FetcherWithoutProgressSupportStillDownloads) {
+    auto* seed = new LegacyOnlyFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(sizedFetcher(4096, seed));
+
+    bool progressed = false;
+    std::string err;
+    lib.downloadPackage("", "dl_module", err, "", "", "",
+                        [&](std::uint64_t, std::uint64_t) { progressed = true; });
+
+    EXPECT_TRUE(seed->called) << "the legacy overload must still be reached";
+    EXPECT_FALSE(progressed);
 }
 
 // ─── Repository registry (in-memory) ─────────────────────────────────────────

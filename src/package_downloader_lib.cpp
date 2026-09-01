@@ -15,6 +15,7 @@
 // [{ url, enabled }] }`) is described in RepositoryRegistry::Impl below.
 
 #include "package_downloader_lib.h"
+#include "progress_throttle.h"
 
 #include <algorithm>
 #include <atomic>
@@ -114,6 +115,33 @@ size_t curlWriteFile(void* contents, size_t size, size_t nmemb, void* userp) {
     file->write(static_cast<const char*>(contents),
                 static_cast<std::streamsize>(size * nmemb));
     return file->good() ? size * nmemb : 0;
+}
+
+// Monotonic ms for rate limiting. Steady, not system, clock: a wall-clock
+// adjustment mid-download must not stall or spam progress.
+std::uint64_t monotonicNowMs() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// libcurl progress trampoline; `userp` is the caller's ProgressFn. Always
+// returns 0 — non-zero would ABORT the transfer, and a slow sink must not be
+// able to fail a good download.
+int curlXferInfo(void* userp, curl_off_t dltotal, curl_off_t dlnow,
+                 curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+    const auto& fn = *static_cast<const ProgressFn*>(userp);
+    if (fn && dlnow >= 0 && dltotal >= 0) {
+        // This is a C boundary: letting an exception unwind through libcurl's
+        // frames is undefined behaviour. A sink that throws — bad_alloc while
+        // marshalling an event, say — must cost a progress sample, not the
+        // process.
+        try {
+            fn(static_cast<std::uint64_t>(dlnow), static_cast<std::uint64_t>(dltotal));
+        } catch (...) {
+        }
+    }
+    return 0;
 }
 
 // Append a unique cache-busting query param.
@@ -254,6 +282,11 @@ public:
     }
 
     FetchResult getToFile(const std::string& url, const std::string& path) override {
+        return getToFile(url, path, ProgressFn{});
+    }
+
+    FetchResult getToFile(const std::string& url, const std::string& path,
+                          const ProgressFn& onProgress) override {
         curlInit();
         std::error_code ec;
         fs::create_directories(fs::path(path).parent_path(), ec);
@@ -286,6 +319,15 @@ public:
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
+        // Reports the FINAL response's size, after FOLLOWLOCATION has chased
+        // redirects — needed for GitHub release assets, where only the
+        // redirect target carries a Content-Length. `dltotal` is 0 until the
+        // headers land, and stays 0 for a chunked response.
+        if (onProgress) {
+            curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curlXferInfo);
+            curl_easy_setopt(c, CURLOPT_XFERINFODATA, &onProgress);
+            curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+        }
         CURLcode res = curl_easy_perform(c);
         long code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
@@ -1009,7 +1051,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                                                   std::string& errorMessage,
                                                   const std::string& version,
                                                   const std::string& rootHash,
-                                                  const std::string& outputDir) {
+                                                  const std::string& outputDir,
+                                                  const ProgressFn& onProgress) {
 
     // Clear any previous error message before starting a new download attempt.
     errorMessage.clear();
@@ -1078,8 +1121,39 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             const std::string pendingFile =
                 (fs::path(destDir) / (filename + "." + suffix.str())).string();
 
+            // Known before any byte moves, and still right for a chunked
+            // response where curl reports dltotal == 0 throughout. It is also
+            // the ONLY denominator a transport with no Content-Length can
+            // offer, so it is resolved once here rather than per transport.
+            const std::uint64_t advertisedSize = v->value("size", std::uint64_t{0});
+            // Rate-limit at the source, not in each caller.
+            ProgressThrottle throttle;
+
+            // Built once and shared by every transport that may fetch this
+            // package. PASS THIS TO EACH ONE: the two-argument getToFile
+            // reports nothing (see Fetcher's progress overload), so a
+            // transport wired up with it goes silently progress-less — the
+            // bar simply never moves, with no error to notice.
+            const ProgressFn progressSink =
+                onProgress ? ProgressFn([&](std::uint64_t received,
+                                            std::uint64_t total) {
+                                 const std::uint64_t denom =
+                                     total ? total : advertisedSize;
+                                 if (!throttle.shouldEmit(received, denom, monotonicNowMs()))
+                                     return;
+                                 // Guarded here too, so the "a bad sink never
+                                 // fails a good download" guarantee holds for
+                                 // any Fetcher, not just the libcurl one whose
+                                 // trampoline also catches.
+                                 try {
+                                     onProgress(received, denom);
+                                 } catch (...) {
+                                 }
+                             })
+                           : ProgressFn{};
+
             const FetchResult fetched =
-                impl_->fetcher->getToFile(url, pendingFile);
+                impl_->fetcher->getToFile(url, pendingFile, progressSink);
 
             if (!fetched.ok) {
                 std::error_code rmEc;
@@ -1428,6 +1502,9 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         entry["rootHash"] = hash;
         entry["repositoryUrl"] = chosenRepo;
         entry["url"] = chosen.value("url", "");
+        // Lets a caller total an install plan before downloading; 0 when the
+        // index omits it.
+        entry["size"] = chosen.value("size", std::uint64_t{0});
         entry["topLevel"] = qe.isTopLevel;
         out.push_back(std::move(entry));
         // Remember the version an explicit top-level input resolved to, so a

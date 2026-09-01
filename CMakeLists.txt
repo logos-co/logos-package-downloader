@@ -33,6 +33,8 @@ message(STATUS "Found lgx library: ${LGX_LIB}")
 set(LIB_SOURCES
     src/package_downloader_lib.cpp
     src/package_downloader_lib.h
+    src/progress_throttle.cpp
+    src/progress_throttle.h
     src/lgpd.cpp
     src/lgpd.h
 )
