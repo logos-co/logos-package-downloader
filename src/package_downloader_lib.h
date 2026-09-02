@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -18,6 +20,10 @@ struct FetchResult {
     std::string error;
 };
 
+/// Byte-progress sink for one transfer. `total` is 0 for "size unknown" —
+/// never divide by it.
+using ProgressFn = std::function<void(std::uint64_t received, std::uint64_t total)>;
+
 /// Minimal HTTP(S) fetcher abstraction. The concrete implementation in the
 /// .cpp uses libcurl. Tests can inject their own implementation.
 class Fetcher {
@@ -29,6 +35,16 @@ public:
 
     /// HTTP GET to a file. Succeeds on 2xx after writing all bytes.
     virtual FetchResult getToFile(const std::string& url, const std::string& path) = 0;
+
+    /// Same, reporting byte progress as the body streams in. Defaulted to
+    /// the progress-free overload so existing implementations still compile
+    /// and simply report nothing.
+    virtual FetchResult getToFile(const std::string& url,
+                                  const std::string& path,
+                                  const ProgressFn& onProgress) {
+        (void)onProgress;
+        return getToFile(url, path);
+    }
 };
 
 /// One repository entry in the in-memory registry. The persisted form is
@@ -178,20 +194,28 @@ public:
     /// empty to mean "any enabled repo, in registry order".
     /// Returns the local path to the downloaded `.lgx`, or empty on error
     /// with the reason in `errorMessage`.
+    ///
+    /// `onProgress` runs on the calling thread, already rate-limited. `total`
+    /// is the transport's Content-Length, else the catalog's advertised size,
+    /// else 0. It covers the TRANSFER ONLY — index-binding verification runs
+    /// after the last callback, so 100% is not "done".
     std::string downloadPackage(const std::string& repoUrlOrName,
                                 const std::string& packageName,
                                 std::string& errorMessage,
                                 const std::string& version = "",
                                 const std::string& rootHash = "",
-                                const std::string& outputDir = "");
+                                const std::string& outputDir = "",
+                                const ProgressFn& onProgress = {});
 
     /// Cross-repo dependency resolution.
     ///
     /// Given a starting package's dependency list (one element per
     /// dependency, in the Dependency JSON form described by the manifest
     /// schema), returns a JSON array of resolved versions:
-    ///   `[{ repositoryUrl, name, version, rootHash, url, topLevel }, ...]`
+    ///   `[{ repositoryUrl, name, version, rootHash, url, size, topLevel }, ...]`
     /// in install order (deps before dependents, no duplicates).
+    /// `size` is the advertised `.lgx` size in bytes (0 if the index omits
+    /// it), so a caller can total a whole plan before any bytes move.
     /// `topLevel: true` marks entries that came from the input array (the
     /// packages the caller explicitly requested); other entries are
     /// transitive deps the resolver pulled in.
