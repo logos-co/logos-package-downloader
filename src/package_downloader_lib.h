@@ -61,6 +61,7 @@ struct Repository {
     std::string description;
     std::string homepage;
     std::string indexUrl;
+    std::string network;
     /// `trustedSigners[].did` as ADVERTISED by the repository's own
     /// logos-repo.json. ADVISORY ONLY — parsed, stored, and echoed back in
     /// listRepositoriesJson(); consulted by nothing, deliberately.
@@ -164,6 +165,10 @@ public:
 
     void setFetcher(std::shared_ptr<Fetcher> fetcher);
 
+    void setStorageFetcher(std::shared_ptr<Fetcher> fetcher);
+
+    void setNetwork(const std::string& network);
+
     /// Returns the registry (mutable).
     RepositoryRegistry& registry();
     const RepositoryRegistry& registry() const;
@@ -199,6 +204,11 @@ public:
     /// is the transport's Content-Length, else the catalog's advertised size,
     /// else 0. It covers the TRANSFER ONLY — index-binding verification runs
     /// after the last callback, so 100% is not "done".
+    ///
+    /// Best effort: will try Storage if the Storage Module is available, the
+    /// index contains a CID and the repository declares the network set with
+    /// setNetwork(), otherwise will fallback on `urls` if it exists, if not,
+    /// will use the `url` entry.
     std::string downloadPackage(const std::string& repoUrlOrName,
                                 const std::string& packageName,
                                 std::string& errorMessage,
