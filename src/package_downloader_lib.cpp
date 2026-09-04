@@ -1194,14 +1194,17 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // Define the source URL for logging purposes.
             std::string source = httpsUrl;
 
+            // Keep Storage error for error reporting when
+            // https fails.
+            std::string storageError;
+
             if (!cid.empty() && impl_->storageFetcher && impl_->network == repo.network) {
                 const FetchResult storageFetched =
                     impl_->storageFetcher->getToFile(cid, pendingFile, progressSink);
                 downloaded = storageFetched.ok;
+
                 if (!downloaded) {
-                    std::cerr << "package_downloader: storage download of "
-                              << packageName << " (" << cid << ") failed — "
-                              << storageFetched.error << "\n";
+                    storageError = storageFetched.error;
                 } else {
                     source = "logos:" + cid;
                 }
@@ -1216,6 +1219,11 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                     fs::remove(pendingFile, rmEc);
                     errorMessage = "https download of " + packageName + " from "
                                  + httpsUrl + " failed: " + fetched.error;
+
+                    if (!storageError.empty()) {
+                        errorMessage += "; storage " + cid + " failed: " + storageError;
+                    }
+
                     return {};
                 }
             }

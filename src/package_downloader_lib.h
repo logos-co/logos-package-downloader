@@ -204,6 +204,11 @@ public:
     /// is the transport's Content-Length, else the catalog's advertised size,
     /// else 0. It covers the TRANSFER ONLY — index-binding verification runs
     /// after the last callback, so 100% is not "done".
+    ///
+    /// Best effort: will try Storage if the Storage Module is available, the
+    /// index contains a CID and the repository declares the network set with
+    /// setNetwork(), otherwise will fallback on `urls` if it exists, if not,
+    /// will use the `url` entry.
     std::string downloadPackage(const std::string& repoUrlOrName,
                                 const std::string& packageName,
                                 std::string& errorMessage,
