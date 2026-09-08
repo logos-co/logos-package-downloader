@@ -1302,3 +1302,133 @@ TEST(DownloadedSignerBinding, AForgedSignatureNamingTheAdvertisedDidDoesNotBind)
     EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, true, kGoodDid, ""));
     EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, true, "", ""));
 }
+
+// ─── Download staging + failure attribution ──────────────────────────────────
+
+namespace {
+
+// Captures the path downloadPackage asked for and stops there: producing a
+// real .lgx is unnecessary to observe WHERE the transfer was staged.
+class PathCapturingFetcher : public MockFetcher {
+public:
+    std::string seenPath;
+    lgpd::FetchResult getToFile(const std::string&, const std::string& path) override {
+        seenPath = path;
+        return {false, "stopped by test"};
+    }
+};
+
+// Serves logos-repo.json but fails index.json, i.e. a resolved repository
+// whose catalog cannot be read.
+class IndexlessFetcher : public MockFetcher {
+public:
+    lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        if (url == lgpd::kDefaultRepositoryUrl) {
+            out = repoJson;
+            return {true, {}};
+        }
+        return {false, "connection refused"};
+    }
+};
+
+std::shared_ptr<MockFetcher> repoWith(MockFetcher* seed, const json& packages) {
+    std::shared_ptr<MockFetcher> f(seed);
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    f->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "test"},
+                        {"packages", packages}}.dump();
+    return f;
+}
+
+json onePackage(const char* name, const char* ver) {
+    json v = makeVersion(ver, "h_stage", json::array());
+    v["manifest"]["name"] = name;
+    return json::array({json{{"name", name}, {"versions", json::array({v})}}});
+}
+
+}  // namespace
+
+// The published name is package+version, so staging in the shared temp ROOT
+// let two accounts on one host collide on a single path: the loser cannot
+// overwrite a file it does not own, and cannot unlink it either because the
+// temp root is sticky. Staging must therefore happen somewhere private.
+TEST(DownloadStaging, StagesOutsideTheSharedTempRoot) {
+    auto f = repoWith(new PathCapturingFetcher, onePackage("stage_module", "1.0.0"));
+    auto* capture = static_cast<PathCapturingFetcher*>(f.get());
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    std::string err;
+    lib.downloadPackage("", "stage_module", err);
+
+    ASSERT_FALSE(capture->seenPath.empty());
+    const fs::path staged(capture->seenPath);
+    EXPECT_NE(staged.parent_path(), fs::temp_directory_path());
+    EXPECT_EQ(staged.parent_path().parent_path(), fs::temp_directory_path());
+#ifndef _WIN32
+    // Per-uid, and private: another account must not be able to plant a file
+    // at a path we are going to write.
+    EXPECT_EQ(staged.parent_path().filename().string().rfind("lgpd-", 0), 0u);
+    EXPECT_EQ(fs::status(staged.parent_path()).permissions() &
+                  (fs::perms::group_all | fs::perms::others_all),
+              fs::perms::none);
+#endif
+}
+
+// An explicit outputDir is still honoured verbatim.
+TEST(DownloadStaging, ExplicitOutputDirIsUnchanged) {
+    auto f = repoWith(new PathCapturingFetcher, onePackage("stage_module", "1.0.0"));
+    auto* capture = static_cast<PathCapturingFetcher*>(f.get());
+    const fs::path out =
+        fs::temp_directory_path() / ("lgpd_out_" + std::to_string(std::rand()));
+    fs::create_directories(out);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    std::string err;
+    lib.downloadPackage("", "stage_module", err, "", "", out.string());
+
+    ASSERT_FALSE(capture->seenPath.empty());
+    EXPECT_EQ(fs::path(capture->seenPath).parent_path(), out);
+    fs::remove_all(out);
+}
+
+// An unreachable catalog used to be indistinguishable from one that simply
+// does not carry the package — both produced an empty path and, later, the
+// same "no repository advertises it" verdict.
+TEST(DownloadErrors, UnreadableIndexIsNotReportedAsAMissingPackage) {
+    auto f = repoWith(new IndexlessFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    std::string err;
+    EXPECT_TRUE(lib.downloadPackage("", "stage_module", err).empty());
+    EXPECT_NE(err.find("could not read any repository index"), std::string::npos);
+    EXPECT_NE(err.find("connection refused"), std::string::npos);
+    EXPECT_EQ(err.find("no repository advertises"), std::string::npos);
+}
+
+// A version pin that matches nothing names what the catalog does offer.
+TEST(DownloadErrors, VersionPinMismatchListsTheOfferedVersions) {
+    auto f = repoWith(new PathCapturingFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    std::string err;
+    EXPECT_TRUE(lib.downloadPackage("", "stage_module", err, "0.2.4").empty());
+    EXPECT_NE(err.find("0.2.4"), std::string::npos);
+    EXPECT_NE(err.find("offers: 1.0.0"), std::string::npos);
+}
+
+// refreshCatalogs() promises to re-fetch every enabled repo's index.json. It
+// used to resolve only logos-repo.json, so `catalog refresh` reported success
+// against a catalog it had never managed to read.
+TEST(RefreshCatalogs, ReportsAnIndexItCannotRead) {
+    auto f = repoWith(new IndexlessFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const std::string errs = lib.refreshCatalogs();
+    EXPECT_NE(errs.find("index fetch failed"), std::string::npos);
+    EXPECT_NE(errs.find("connection refused"), std::string::npos);
+}
