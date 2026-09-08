@@ -195,6 +195,11 @@ public:
     /// Returns the local path to the downloaded `.lgx`, or empty on error
     /// with the reason in `errorMessage`.
     ///
+    /// An empty `outputDir` stages into a private per-user directory under
+    /// the system temp dir, NOT the shared temp root: the published filename
+    /// is derived from the package and version, so two accounts on one host
+    /// would otherwise collide on a path neither can take from the other.
+    ///
     /// `onProgress` runs on the calling thread, already rate-limited. `total`
     /// is the transport's Content-Length, else the catalog's advertised size,
     /// else 0. It covers the TRANSFER ONLY — index-binding verification runs

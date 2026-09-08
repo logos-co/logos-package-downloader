@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -32,6 +33,14 @@
 #include <sstream>
 #include <unordered_map>
 #include <utility>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -677,8 +686,14 @@ struct PackageDownloaderLib::Impl {
         return true;
     }
 
-    std::string fetchIndex(const Repository& r) {
-        if (r.indexUrl.empty()) return {};
+    // `err` receives the transport's reason when the index cannot be read.
+    // Without it an unreachable catalog is indistinguishable from one that
+    // simply does not carry the package.
+    std::string fetchIndex(const Repository& r, std::string* err = nullptr) {
+        if (r.indexUrl.empty()) {
+            if (err) *err = "repository metadata declares no indexUrl";
+            return {};
+        }
 
         {
             std::lock_guard<std::mutex> lock(mu);
@@ -689,6 +704,9 @@ struct PackageDownloaderLib::Impl {
         FetchResult result = fetcher->get(r.indexUrl, body);
 
         if (!result.ok) {
+            if (err)
+                *err = "index fetch failed: " + r.indexUrl +
+                       (result.error.empty() ? "" : " - " + result.error);
             return {};
         }
 
@@ -822,9 +840,22 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     // so the next ensureMetadata() doesn't redundantly refresh again.
     std::string out = impl_->registry.refresh();
 
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    impl_->clearCaches();
-    impl_->metadataResolved = true;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        impl_->clearCaches();
+        impl_->metadataResolved = true;
+    }
+
+    // Then re-fetch the indexes themselves. refresh() above resolves only
+    // logos-repo.json, so a catalog whose index.json was unreachable still
+    // reported success here while every later browse quietly returned
+    // nothing. Not holding mu: fetchIndex takes it.
+    for (const auto& r : impl_->registry.list()) {
+        if (!r.enabled || !r.resolveError.empty()) continue;
+        std::string err;
+        if (impl_->fetchIndex(r, &err).empty())
+            out += r.url + ": " + (err.empty() ? "index unavailable" : err) + "\n";
+    }
     return out;
 }
 
@@ -1044,6 +1075,75 @@ bool verifyDownloadAgainstIndex(const std::string& lgxPath,
     return true;
 }
 
+// Private staging directory used when the caller names no outputDir.
+//
+// The published filename is derived from the package and version, so in the
+// shared temp root two accounts on one host race for a single path. The
+// loser cannot overwrite a 0644 file it does not own and, because the temp
+// root is sticky, cannot rename over or unlink it either -- wedging that
+// package for that user permanently. A per-uid directory removes the shared
+// name entirely; it is created 0700 and rejected unless we own it, so it
+// cannot be squatted by another account either.
+std::string stagingDir(std::string& err) {
+    std::error_code ec;
+    const fs::path tmp = fs::temp_directory_path(ec);
+    if (ec || tmp.empty()) {
+        err = "no usable temporary directory" +
+              (ec ? ": " + ec.message() : std::string());
+        return {};
+    }
+#ifdef _WIN32
+    // Each account already gets its own %TEMP%, so there is nothing to key on.
+    const fs::path dir = tmp / "lgpd";
+    fs::create_directories(dir, ec);
+    if (ec) {
+        err = "cannot create " + dir.string() + ": " + ec.message();
+        return {};
+    }
+#else
+    const fs::path dir =
+        tmp / ("lgpd-" + std::to_string(static_cast<unsigned long>(::geteuid())));
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        err = "cannot create " + dir.string() + ": " + std::strerror(errno);
+        return {};
+    }
+    // lstat, not stat: a symlink planted at this path must not be followed.
+    struct stat st {};
+    if (::lstat(dir.c_str(), &st) != 0) {
+        err = "cannot stat " + dir.string() + ": " + std::strerror(errno);
+        return {};
+    }
+    if (!S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() ||
+        (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        err = dir.string() + " is not a private directory owned by this user; "
+              "remove it or set TMPDIR";
+        return {};
+    }
+#endif
+    return dir.string();
+}
+
+// Versions a package actually offers, for the "you asked for X" message.
+std::string offeredVersions(const json& pkg) {
+    std::vector<std::string> vs;
+    if (pkg.contains("versions") && pkg["versions"].is_array()) {
+        for (const auto& v : pkg["versions"]) {
+            if (!v.is_object()) continue;
+            const std::string s = objOrEmpty(v, "manifest").value("version", "");
+            if (!s.empty() && std::find(vs.begin(), vs.end(), s) == vs.end())
+                vs.push_back(s);
+        }
+    }
+    if (vs.empty()) return "none";
+    std::string out;
+    for (size_t i = 0; i < vs.size() && i < 12; ++i) {
+        if (i) out += ", ";
+        out += vs[i];
+    }
+    if (vs.size() > 12) out += ", ...";
+    return out;
+}
+
 } // namespace
 
 std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrName,
@@ -1065,6 +1165,11 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         for (const auto& r : impl_->registry.list()) {
             if (r.enabled && r.resolveError.empty()) candidates.push_back(r);
         }
+        if (candidates.empty()) {
+            errorMessage = "no enabled repository resolved successfully; "
+                           "see `catalog ls` for per-repository errors";
+            return {};
+        }
     } else {
         auto r = impl_->registry.findByUrlOrName(repoUrlOrName);
 
@@ -1076,34 +1181,60 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         candidates.push_back(*r);
     }
 
+    // Why each candidate could not serve the package. Collected rather than
+    // overwritten so a readable-but-empty repo cannot hide an unreachable one.
+    std::vector<std::string> notes;
+    bool sawPackage = false;
+    bool readAnyIndex = false;
+
     for (const auto& repo : candidates) {
-        std::string body = impl_->fetchIndex(repo);
-        if (body.empty()) continue;
-        json idx;
-        try { idx = json::parse(body); } catch (...) { continue; }
-        if (!idx.is_object() || !idx.contains("packages") || !idx["packages"].is_array())
+        std::string fetchErr;
+        std::string body = impl_->fetchIndex(repo, &fetchErr);
+        if (body.empty()) {
+            notes.push_back(repo.url + ": " +
+                            (fetchErr.empty() ? "index unavailable" : fetchErr));
             continue;
+        }
+        json idx;
+        try { idx = json::parse(body); }
+        catch (const json::exception& e) {
+            notes.push_back(repo.url + ": index is not valid JSON: " + e.what());
+            continue;
+        }
+        if (!idx.is_object() || !idx.contains("packages") || !idx["packages"].is_array()) {
+            notes.push_back(repo.url + ": index has no 'packages' array");
+            continue;
+        }
+        readAnyIndex = true;
         for (const auto& pkg : idx["packages"]) {
             if (!pkg.is_object() || pkg.value("name", "") != packageName) continue;
+            sawPackage = true;
             const json* v = pickVersion(pkg, version, rootHash);
-            if (!v || !v->is_object()) continue;
+            if (!v || !v->is_object()) {
+                notes.push_back(repo.url + ": no release of " + packageName +
+                                " matches" +
+                                (version.empty() ? "" : " version " + version) +
+                                (rootHash.empty() ? "" : " rootHash " + rootHash) +
+                                " (offers: " + offeredVersions(pkg) + ")");
+                continue;
+            }
             std::string url = v->value("url", "");
-            if (url.empty()) continue;
+            if (url.empty()) {
+                notes.push_back(repo.url + ": " + packageName +
+                                " has no download url for the selected release");
+                continue;
+            }
             // Derive destination path.
             std::string destDir = outputDir;
             if (destDir.empty()) {
-                // temp_directory_path() is the portable form of what this used
-                // to hand-roll. The old code read TMPDIR and fell back to
-                // "/tmp", neither of which exists on Windows -- downloads would
-                // have gone to a non-existent directory. The standard function
-                // consults TMPDIR/TMP/TEMP/TEMPDIR then /tmp on POSIX, and
-                // TMP/TEMP/USERPROFILE then the Windows directory on Windows.
-                // Uses the error_code overload so a missing temp dir surfaces
-                // as a failed download rather than an exception escaping here.
-                std::error_code ec;
-                const fs::path tmp = fs::temp_directory_path(ec);
-                if (ec || tmp.empty()) return {};   // caller reports the failure
-                destDir = tmp.string();
+                // stagingDir() honours TMPDIR/TMP/TEMP via
+                // temp_directory_path(), then isolates us inside it.
+                std::string dirErr;
+                destDir = stagingDir(dirErr);
+                if (destDir.empty()) {
+                    errorMessage = dirErr;
+                    return {};
+                }
             }
             std::string filename = fs::path(url).filename().string();
             if (filename.empty()) filename = packageName + ".lgx";
@@ -1194,9 +1325,20 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             return dest;
         }
     }
-    if (errorMessage.empty())
-        errorMessage = "no repository advertises " + packageName
-                     + (version.empty() ? "" : " " + version);
+    if (errorMessage.empty()) {
+        if (sawPackage)
+            errorMessage = "no release of " + packageName +
+                           " matched the requested pin";
+        else if (!readAnyIndex)
+            // Saying "nobody advertises it" when we never read an index sends
+            // the reader after the wrong problem.
+            errorMessage = "could not read any repository index while looking "
+                           "for " + packageName;
+        else
+            errorMessage = "no repository advertises " + packageName +
+                           (version.empty() ? "" : " " + version);
+        for (const auto& n : notes) errorMessage += "\n  " + n;
+    }
     return {};
 }
 
