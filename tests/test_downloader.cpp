@@ -980,6 +980,77 @@ TEST(Catalog, IconAbsentWhenNoTopLevelIcon) {
     EXPECT_FALSE(catalog[0].contains("icon"));
 }
 
+TEST(Catalog, ArrayValuedProvidesKeepsTheWholeRepo) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    const json provides = json::array({ json{{"intent", "evm.rpc.configure"}} });
+    json withIntents = makeVersion("0.1.0", "h_010", json::array());
+    withIntents["manifest"]["name"] = "widget";
+    withIntents["manifest"]["provides"] = provides;
+    json plain = makeVersion("0.1.0", "h_020", json::array());
+    plain["manifest"]["name"] = "gadget";
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({withIntents})}},
+            json{{"name", "gadget"}, {"versions", json::array({plain})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto catalog = json::parse(lib.getCatalogJson());
+    // `provides` is an array; reading it as a string threw and the catch
+    // around the loop swallowed every package in the repo, not just this one.
+    ASSERT_EQ(catalog.size(), 2u);
+    EXPECT_EQ(catalog[0]["provides"], provides);
+    EXPECT_EQ(catalog[1]["provides"], json::array());
+}
+
+TEST(Catalog, AMalformedFieldCostsOnlyItsOwnPackage) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json bad = makeVersion("0.1.0", "h_010", json::array());
+    bad["manifest"]["name"] = "widget";
+    bad["manifest"]["display_name"] = json::array({"not", "a", "string"});
+    json good = makeVersion("0.1.0", "h_020", json::array());
+    good["manifest"]["name"] = "gadget";
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({bad})}},
+            json{{"name", "gadget"}, {"versions", json::array({good})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto catalog = json::parse(lib.getCatalogJson());
+    ASSERT_EQ(catalog.size(), 1u);
+    EXPECT_EQ(catalog[0].value("name", ""), "gadget");
+}
+
+TEST(Catalog, ScopedByNameWorksBeforeAnExplicitRefresh) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json v = makeVersion("0.1.0", "h_010", json::array());
+    v["manifest"]["name"] = "widget";
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({v})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    // Both the name and the indexUrl come from logos-repo.json, so a lookup
+    // that runs before metadata resolution matches nothing / fetches nothing.
+    auto byName = json::parse(lib.getCatalogForRepoJson("test"));
+    ASSERT_EQ(byName.size(), 1u);
+    EXPECT_EQ(byName[0].value("name", ""), "widget");
+}
+
 // ─── Dependency signer pin ────────────────────────────────────────────────────
 //
 // A dependency's `signer` field DISAMBIGUATES among same-named candidates:

@@ -728,12 +728,20 @@ struct PackageDownloaderLib::Impl {
     // and the date-sorted versions that callers (CLI/UI/C API) expect.
     void appendCatalogEntries(const Repository& r, const std::string& body, json& out) {
         if (body.empty()) return;
+        json idx;
         try {
-            auto idx = json::parse(body);
-            if (!idx.is_object() || !idx.contains("packages")
-                || !idx["packages"].is_array()) return;
-            for (auto& pkg : idx["packages"]) {
-                if (!pkg.is_object() || !pkg.contains("name")) continue;
+            idx = json::parse(body);
+        } catch (...) {
+            return;
+        }
+        if (!idx.is_object() || !idx.contains("packages")
+            || !idx["packages"].is_array()) return;
+        for (auto& pkg : idx["packages"]) {
+            if (!pkg.is_object() || !pkg.contains("name")) continue;
+            // Per package, not per repo: a field of an unexpected type throws
+            // out of the entry build, and the cost must stay with the package
+            // that carries it.
+            try {
                 json entry;
                 entry["repositoryUrl"]  = r.url;
                 entry["repositoryName"] = r.name.empty() ? r.url : r.name;
@@ -751,7 +759,11 @@ struct PackageDownloaderLib::Impl {
                     entry["category"]    = firstManifest.value("category", "");
                     entry["author"]      = firstManifest.value("author", "");
                     entry["manifestVersion"] = firstManifest.value("manifestVersion", "");
-                    entry["provides"] = firstManifest.value("provides", "");
+                    // `provides` is an array of intent objects; value(key, "")
+                    // would throw converting it to the string default.
+                    entry["provides"] = firstManifest.contains("provides")
+                                            ? firstManifest["provides"]
+                                            : json::array();
                     const std::string iconPath =
                         objOrEmpty(firstVersion, "icon").value("path", "");
                     const auto slash = r.indexUrl.find_last_of('/');
@@ -763,9 +775,9 @@ struct PackageDownloaderLib::Impl {
                 std::stable_sort(versions.begin(), versions.end(), VersionPrecedenceDesc{});
                 entry["versions"] = std::move(versions);
                 out.push_back(std::move(entry));
+            } catch (...) {
+                continue;
             }
-        } catch (...) {
-            // Unparseable index; surfaced via resolveError in listRepositoriesJson.
         }
     }
 };
@@ -823,9 +835,12 @@ std::string PackageDownloaderLib::getCatalogJson() {
 }
 
 std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOrName) {
+    // Resolve metadata first: name and indexUrl both come from the repo's
+    // logos-repo.json, so a lookup before this can't match by name and
+    // hands back a copy with no indexUrl to fetch.
+    impl_->ensureMetadata();
     auto repo = impl_->registry.findByUrlOrName(urlOrName);
     if (!repo) return "[]";
-    impl_->ensureMetadata();
     // Same synthesised shape as getCatalogJson, scoped to one repo —
     // callers (CLI `--repo`, the UI, the C API) get repositoryUrl,
     // date-sorted versions, and the package-level header fields, not the
