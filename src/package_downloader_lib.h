@@ -169,8 +169,9 @@ public:
     const RepositoryRegistry& registry() const;
 
     /// JSON array of repositories. Each element:
-    /// `{ url, enabled, isDefault, name, displayName, description,
-    ///    homepage, indexUrl, trustedSignerDids[], resolveError }`.
+    /// `{ url, sourceOwner, sourceRepo, sourceHost, enabled, isDefault,
+    ///    name, displayName, description, homepage, indexUrl,
+    ///    trustedSignerDids[], resolveError }`.
     std::string listRepositoriesJson();
 
     /// JSON array of all packages across all enabled repos. Each element:

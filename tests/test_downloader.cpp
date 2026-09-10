@@ -25,7 +25,18 @@ class MockFetcher : public lgpd::Fetcher {
 public:
     std::string repoJson;   // served for the default repo URL
     std::string indexJson;  // served for kIndexUrl
+    // Extra per-URL responses, consulted first. Lets a test stand up a
+    // SECOND repository with its own logos-repo.json, which the two canned
+    // slots above can't express.
+    std::map<std::string, std::string> byUrl;
+
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        auto it = byUrl.find(url);
+        if (it != byUrl.end()) {
+            out = it->second;
+            return {true, {}};
+        }
+
         if (url == lgpd::kDefaultRepositoryUrl) {
             out = repoJson;
             return {true, {}};
@@ -79,6 +90,21 @@ std::shared_ptr<MockFetcher> catalogFetcher(const json& uiDepRange) {
         })},
     }.dump();
     return f;
+}
+
+// A logos-repo.json body. `name`/`displayName` are exactly what the remote
+// says they are — which is the whole point of the qualification tests below.
+std::string repoManifest(const char* name, const char* displayName) {
+    return json{{"schemaVersion", 1}, {"name", name},
+                {"displayName", displayName}, {"indexUrl", kIndexUrl},
+                {"trustedSigners", json::array()}}.dump();
+}
+
+// One repository entry out of listRepositoriesJson, by URL.
+json repoByUrl(lgpd::PackageDownloaderLib& lib, const std::string& url) {
+    for (const auto& e : json::parse(lib.listRepositoriesJson()))
+        if (e.value("url", "") == url) return e;
+    return json::object();
 }
 
 // Collect resolved entries by name -> list of versions.
@@ -920,6 +946,82 @@ TEST(Registry, RefreshHydratesDisabledDefaultOnStartup) {
     ASSERT_EQ(enabled.size(), 1u);
     EXPECT_TRUE(enabled.front().enabled);
     EXPECT_EQ(enabled.front().displayName, "Logos Official");
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// ─── Repository source ───────────────────────────────────────────────────────
+//
+// `displayName` is remote-supplied and not unique, so UIs disambiguate with
+// the source parsed out of the URL. The lib reports those as facts; deciding
+// when to surface them is the UI's call and is tested there.
+
+TEST(Registry, SourceFieldsSplitAGitHubUrl) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_src_gh_" + std::to_string(std::rand()) + ".json");
+    auto mock = std::make_shared<MockFetcher>();
+    mock->repoJson = repoManifest("logos-modules-official", "Logos Official");
+    mock->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "x"},
+                           {"packages", json::array()}}.dump();
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(mock);
+
+    const auto r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_EQ(r.value("sourceOwner", ""), "logos-co");
+    EXPECT_EQ(r.value("sourceRepo",  ""), "logos-modules-release");
+    EXPECT_EQ(r.value("sourceHost",  ""), "raw.githubusercontent.com");
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// The real-world case: a fork whose logos-repo.json is byte-identical to the
+// official one, so `name`, `displayName` AND `indexUrl` all collide. Only the
+// URL separates them, which is why the source fields exist.
+TEST(Registry, SourceOwnerSeparatesAForkClaimingTheSameName) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_src_fork_" + std::to_string(std::rand()) + ".json");
+    const std::string forkUrl =
+        "https://raw.githubusercontent.com/0x-r4bbit/logos-modules-release-upstream/main/logos-repo.json";
+
+    auto mock = std::make_shared<MockFetcher>();
+    mock->repoJson = repoManifest("logos-modules-official", "Logos Official");
+    mock->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "x"},
+                           {"packages", json::array()}}.dump();
+    mock->byUrl[forkUrl] = repoManifest("logos-modules-official", "Logos Official");
+
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(mock);
+    const auto err = lib.registry().addRepository(forkUrl);
+    ASSERT_TRUE(err.empty()) << err;
+
+    const auto def  = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    const auto fork = repoByUrl(lib, forkUrl);
+    // Every name field collides...
+    EXPECT_EQ(def.value("displayName", ""), fork.value("displayName", ""));
+    EXPECT_EQ(def.value("name", ""),        fork.value("name", ""));
+    // ...and the source is what still tells them apart.
+    EXPECT_EQ(def.value("sourceOwner", ""),  "logos-co");
+    EXPECT_EQ(fork.value("sourceOwner", ""), "0x-r4bbit");
+    EXPECT_EQ(fork.value("sourceRepo", ""),  "logos-modules-release-upstream");
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// Off GitHub there is no owner/repo to parse. Both come back empty and the
+// host carries the identification — UIs fall back to it.
+TEST(Registry, SourceOwnerIsEmptyOffGitHubAndHostCarriesIt) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_src_host_" + std::to_string(std::rand()) + ".json");
+    const std::string url = "https://packages.acme.dev/logos/logos-repo.json";
+
+    auto mock = std::make_shared<MockFetcher>();
+    mock->repoJson = repoManifest("logos-modules-official", "Logos Official");
+    mock->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "x"},
+                           {"packages", json::array()}}.dump();
+    mock->byUrl[url] = repoManifest("acme-internal", "Internal Tools");
+
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(mock);
+    ASSERT_TRUE(lib.registry().addRepository(url).empty());
+
+    const auto r = repoByUrl(lib, url);
+    EXPECT_EQ(r.value("sourceOwner", ""), "");
+    EXPECT_EQ(r.value("sourceRepo",  ""), "");
+    EXPECT_EQ(r.value("sourceHost",  ""), "packages.acme.dev");
     std::error_code ec; fs::remove(cfg, ec);
 }
 
