@@ -1157,8 +1157,15 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // Example: 3f9a2c1b.
             suffix << std::hex << rd();
 
-            const std::string pendingFile =
+            const std::string pendingBase =
                 (fs::path(destDir) / (filename + "." + suffix.str())).string();
+
+            // Define a pending file for each transport for potential
+            // concurrent downloads.
+            const std::string storagePending = pendingBase + ".logos";
+            const std::string httpsPending   = pendingBase + ".https";
+
+            std::string pendingFile = httpsPending;
 
             // Known before any byte moves, and still right for a chunked
             // response where curl reports dltotal == 0 throughout. It is also
@@ -1209,23 +1216,26 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
 
             if (!cid.empty() && storageFetcher && impl_->network == repo.network) {
                 const FetchResult storageFetched =
-                    storageFetcher->getToFile(cid, pendingFile, progressSink);
+                    storageFetcher->getToFile(cid, storagePending, progressSink);
                 downloaded = storageFetched.ok;
 
                 if (!downloaded) {
                     storageError = storageFetched.error;
+                    std::error_code rmEc;
+                    fs::remove(storagePending, rmEc);
                 } else {
                     source = "logos:" + cid;
+                    pendingFile = storagePending;
                 }
             }
 
             if (!downloaded) {
                 const FetchResult fetched =
-                    impl_->fetcher->getToFile(httpsUrl, pendingFile, progressSink);
+                    impl_->fetcher->getToFile(httpsUrl, httpsPending, progressSink);
 
                 if (!fetched.ok) {
                     std::error_code rmEc;
-                    fs::remove(pendingFile, rmEc);
+                    fs::remove(httpsPending, rmEc);
                     errorMessage = "https download of " + packageName + " from "
                                  + httpsUrl + " failed: " + fetched.error;
 
