@@ -1210,10 +1210,12 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // Copy once: the host detaches the storage fetcher from another
             // thread when storage_module goes down.
             std::shared_ptr<Fetcher> storageFetcher;
+            std::shared_ptr<Fetcher> httpsFetcher;
             std::string network;
             {
                 std::lock_guard<std::mutex> lock(impl_->mu);
                 storageFetcher = impl_->storageFetcher;
+                httpsFetcher = impl_->fetcher;
                 network = impl_->network;
             }
 
@@ -1236,7 +1238,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 throttle.reset();
 
                 const FetchResult fetched =
-                    impl_->fetcher->getToFile(httpsUrl, httpsPending, progressSink);
+                    httpsFetcher->getToFile(httpsUrl, httpsPending, progressSink);
 
                 if (!fetched.ok) {
                     std::error_code rmEc;
