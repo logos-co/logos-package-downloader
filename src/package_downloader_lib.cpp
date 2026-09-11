@@ -84,6 +84,63 @@ const json& objOrEmpty(const json& parent, const char* key) {
     return *it;
 }
 
+// ─── Repository source ───────────────────────────────────────────────────────
+//
+// Where a repository came from, parsed out of its logos-repo.json URL — the
+// one field the user supplied and no remote controls. Reported as plain
+// facts (`sourceOwner` / `sourceRepo` / `sourceHost`), NOT as a display
+// string: how and when to show them is a UI decision, and formatting them
+// here would freeze the wording in a library with no translation and put a
+// QML-level tweak behind a module rebuild.
+//
+// A repo's `displayName` is whatever its manifest says, so two repos can
+// claim the same one — a fork of the official repo in the wild does. These
+// fields are what a UI disambiguates with.
+
+struct UrlParts {
+    std::string host;
+    std::vector<std::string> segments;
+};
+
+UrlParts splitUrl(const std::string& url) {
+    UrlParts out;
+    std::string rest = url;
+    const auto scheme = rest.find("://");
+    if (scheme != std::string::npos) rest = rest.substr(scheme + 3);
+    const auto slash = rest.find('/');
+    if (slash == std::string::npos) { out.host = rest; return out; }
+    out.host = rest.substr(0, slash);
+    std::string path = rest.substr(slash + 1);
+    const auto q = path.find_first_of("?#");
+    if (q != std::string::npos) path = path.substr(0, q);
+    for (size_t pos = 0; pos <= path.size(); ) {
+        const auto next = path.find('/', pos);
+        const auto len = (next == std::string::npos) ? std::string::npos : next - pos;
+        std::string seg = path.substr(pos, len);
+        if (!seg.empty()) out.segments.push_back(std::move(seg));
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    return out;
+}
+
+struct RepoSource {
+    std::string owner;
+    std::string repo;
+    std::string host;
+};
+
+RepoSource repoSource(const std::string& url) {
+    const UrlParts p = splitUrl(url);
+    RepoSource s;
+    s.host = p.host.empty() ? url : p.host;
+    if (p.host == "raw.githubusercontent.com" || p.host == "github.com") {
+        if (p.segments.size() >= 1) s.owner = p.segments[0];
+        if (p.segments.size() >= 2) s.repo  = p.segments[1];
+    }
+    return s;
+}
+
 // ─── Semver ───────────────────────────────────────────────────────────────────
 //
 // Parsing, precedence and range matching all come from the shared
@@ -809,6 +866,10 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
     for (const auto& r : impl_->registry.list()) {
         json e;
         e["url"] = r.url;
+        const RepoSource src = repoSource(r.url);
+        e["sourceOwner"] = src.owner;
+        e["sourceRepo"]  = src.repo;
+        e["sourceHost"]  = src.host;
         e["enabled"] = r.enabled;
         e["isDefault"] = r.isDefault;
         e["name"] = r.name;
