@@ -16,6 +16,12 @@ public:
     /// limit says; drops samples carrying no new bytes.
     bool shouldEmit(std::uint64_t received, std::uint64_t total, std::uint64_t nowMs);
 
+    void reset() {
+        m_emittedAny   = false;
+        m_lastEmitMs   = 0;
+        m_lastReceived = 0;
+    }
+
 private:
     std::uint64_t m_minIntervalMs;
     bool          m_emittedAny    = false;

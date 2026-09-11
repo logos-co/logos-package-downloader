@@ -780,6 +780,7 @@ void PackageDownloaderLib::setStorageFetcher(std::shared_ptr<Fetcher> fetcher) {
 }
 
 void PackageDownloaderLib::setNetwork(const std::string& network) {
+    std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->network = network;
 }
 
@@ -1209,12 +1210,14 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             // Copy once: the host detaches the storage fetcher from another
             // thread when storage_module goes down.
             std::shared_ptr<Fetcher> storageFetcher;
+            std::string network;
             {
                 std::lock_guard<std::mutex> lock(impl_->mu);
                 storageFetcher = impl_->storageFetcher;
+                network = impl_->network;
             }
 
-            if (!cid.empty() && storageFetcher && impl_->network == repo.network) {
+            if (!cid.empty() && storageFetcher && network == repo.network) {
                 const FetchResult storageFetched =
                     storageFetcher->getToFile(cid, storagePending, progressSink);
                 downloaded = storageFetched.ok;
@@ -1230,6 +1233,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             }
 
             if (!downloaded) {
+                throttle.reset();
+
                 const FetchResult fetched =
                     impl_->fetcher->getToFile(httpsUrl, httpsPending, progressSink);
 

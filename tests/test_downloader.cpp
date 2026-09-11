@@ -323,6 +323,15 @@ TEST(ProgressThrottle, UnknownTotalStillRateLimitsAndNeverFakesCompletion) {
     EXPECT_TRUE(t.shouldEmit(200, 0, 300));
 }
 
+TEST(ProgressThrottle, ResetLetsASecondTransportStartOverFromZero) {
+    lgpd::ProgressThrottle t(200);
+    ASSERT_TRUE(t.shouldEmit(0, 1000, 0));
+    ASSERT_TRUE(t.shouldEmit(900, 1000, 300));
+    t.reset();
+    EXPECT_TRUE(t.shouldEmit(10, 1000, 400));
+    EXPECT_TRUE(t.shouldEmit(200, 1000, 700));
+}
+
 // ─── downloadPackage progress plumbing ───────────────────────────────────────
 
 namespace {
