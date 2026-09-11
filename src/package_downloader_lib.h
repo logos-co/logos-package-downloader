@@ -175,7 +175,7 @@ public:
 
     /// JSON array of repositories. Each element:
     /// `{ url, enabled, isDefault, name, displayName, description,
-    ///    homepage, indexUrl, trustedSignerDids[], resolveError }`.
+    ///    homepage, indexUrl, network, trustedSignerDids[], resolveError }`.
     std::string listRepositoriesJson();
 
     /// JSON array of all packages across all enabled repos. Each element:
