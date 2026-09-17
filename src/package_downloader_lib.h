@@ -209,13 +209,16 @@ public:
     /// index contains a CID and the repository declares the network set with
     /// setNetwork(), otherwise will fallback on `urls` if it exists, if not,
     /// will use the `url` entry.
+    ///
+    /// `source` reports the source URL used to fetch the package.
     std::string downloadPackage(const std::string& repoUrlOrName,
                                 const std::string& packageName,
                                 std::string& errorMessage,
                                 const std::string& version = "",
                                 const std::string& rootHash = "",
                                 const std::string& outputDir = "",
-                                const ProgressFn& onProgress = {});
+                                const ProgressFn& onProgress = {},
+                                std::string* source = nullptr);
 
     /// Cross-repo dependency resolution.
     ///

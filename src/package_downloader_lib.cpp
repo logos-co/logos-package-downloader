@@ -1067,7 +1067,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                                                   const std::string& version,
                                                   const std::string& rootHash,
                                                   const std::string& outputDir,
-                                                  const ProgressFn& onProgress) {
+                                                  const ProgressFn& onProgress,
+                                                  std::string* source) {
 
     // Clear any previous error message before starting a new download attempt.
     errorMessage.clear();
@@ -1200,8 +1201,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                            : ProgressFn{};
 
             bool downloaded = false;
-            // Define the source URL for logging purposes.
-            std::string source = httpsUrl;
+            std::string sourceUrl = httpsUrl;
 
             // Keep Storage error for error reporting when
             // https fails.
@@ -1229,7 +1229,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                     std::error_code rmEc;
                     fs::remove(storagePending, rmEc);
                 } else {
-                    source = "logos:" + cid;
+                    sourceUrl = "logos:" + cid;
                     pendingFile = storagePending;
                 }
             }
@@ -1254,9 +1254,13 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 }
             }
 
+            if (source) {
+                *source = sourceUrl;
+            }
+
             // Super defensive here: check destination file existence
             if (!fs::exists(pendingFile)) {
-                errorMessage = "download of " + packageName + " from " + source
+                errorMessage = "download of " + packageName + " from " + sourceUrl
                              + " failed: file not found after download";
                 return {};
             }
@@ -1274,7 +1278,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
                     std::error_code rmEc;
                     fs::remove(pendingFile, rmEc);
-                    errorMessage = "rejected " + packageName + " from " + source
+                    errorMessage = "rejected " + packageName + " from " + sourceUrl
                                  + ": " + verr;
                     return {};
                 }

@@ -27,6 +27,7 @@ public:
     std::string indexJson;  // served for kIndexUrl
     std::vector<std::string> fileGets;  // URLs passed to getToFile
     std::string lastDest;               // path passed to the last getToFile
+    bool fileGetSucceeds = false;       // result returned by getToFile
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
         if (url == lgpd::kDefaultRepositoryUrl) {
             out = repoJson;
@@ -43,7 +44,12 @@ public:
     lgpd::FetchResult getToFile(const std::string& url, const std::string& dest) override {
         fileGets.push_back(url);
         lastDest = dest;
-        return {false, "not served"};
+
+        if (!fileGetSucceeds) {
+            return {false, "not served"};
+        }
+
+        return {true, {}};
     }
 };
 
@@ -1410,6 +1416,39 @@ TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
     EXPECT_EQ(storage->attempts, std::vector<std::string>{cid});
     EXPECT_TRUE(storage->fileGets.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(FetchSelection, StorageReportsTheCidAsTheSource) {
+    auto http = storageCatalogFetcher();
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.setNetwork(network);
+    std::string err;
+    std::string source;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir, {}, &source);
+
+    EXPECT_EQ(source, std::string("logos:") + cid);
+}
+
+TEST(FetchSelection, TheHttpsMirrorReportsItsUrlAsTheSource) {
+    auto http = storageCatalogFetcher();
+    http->fileGetSucceeds = true;
+    bool success = false;
+    auto storage = std::make_shared<StorageFetcher>(success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.setNetwork(network);
+    std::string err;
+    std::string source;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir, {}, &source);
+
+    EXPECT_EQ(source, std::string(lgxStorageUrl));
 }
 
 TEST(FetchSelection, HttpsIsUsedWhenNoStorageFetcherIsDefined) {
