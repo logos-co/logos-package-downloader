@@ -17,6 +17,15 @@ catalog**. Packages are downloaded by their per-version `url` and
 **verified against the catalog entry** before they're handed off for
 install (content `rootHash` + manifest fields + signer DID).
 
+A catalog can also draw packages from **other catalogs**. Its
+`logos-repo.json` names them in `includes[]`, optionally narrowed to
+particular packages or version ranges; the client resolves that graph when it
+fetches, so a curated bundle or an umbrella catalog is one entry for the user
+and stays current without republishing. Included packages are listed under the
+repository the user added, keep the download URL of the catalog that published
+them, and carry `origin*` fields naming it. Pass `--no-includes` to read only
+the catalogs configured here.
+
 > 📖 The `logos-repo.json` and `index.json` formats this library consumes
 > are fully specified in
 > [logos-modules-release-tool/docs/catalog-format.md](https://github.com/logos-co/logos-modules-release-tool/blob/main/docs/catalog-format.md).
@@ -117,6 +126,8 @@ Config:
 Global options:
   --config <path>               Path to repositories.json (required for repo mutations)
   --repo <url-or-name>          Restrict a catalog/download command to one repo
+                                (a configured repo covers what it includes)
+  --no-includes                 Do not follow includes[]
   --version <ver>               Pin a specific package version (download/info)
   --root-hash <hex>             Disambiguate two releases sharing a version
   --category <cat>              Filter by category (list)
@@ -141,7 +152,44 @@ lgpd --config ~/.config/logos/repositories.json repo refresh
 
 # Download — pin a version, scope to one repo, choose an output dir
 lgpd download wallet_module --version 1.0.0 --repo my-catalog -o ./packages/
+
+# Inspect the catalogs a repository draws from, and any complaints about them
+lgpd --config ~/.config/logos/repositories.json repo list
+lgpd --config ~/.config/logos/repositories.json --json repo list
+
+# Read only what is configured here, ignoring includes[]
+lgpd --no-includes list
 ```
+
+### Drawing from another catalog
+
+`includes[]` lives in the including catalog's `logos-repo.json`. `index.json`
+is untouched, so nothing in the publishing pipeline changes:
+
+```json
+{
+  "schemaVersion": 1,
+  "name": "my-distro",
+  "displayName": "My Distro",
+  "indexUrl": "https://example.com/my-distro/index.json",
+  "includes": [
+    { "repo": "https://raw.githubusercontent.com/logos-co/logos-modules-release/refs/heads/main/logos-repo.json" },
+    { "repo": "https://example.org/team-a/logos-repo.json",
+      "packages": ["chat_module", "waku_module"] },
+    { "repo": "https://example.org/team-b/logos-repo.json",
+      "packages": [{ "name": "storage_module", "version": "2.1.0" },
+                   { "name": "blockchain_module", "version": "^0.2.0" }] }
+  ]
+}
+```
+
+No `packages` takes the whole catalog; a bare name takes every version of that
+package; an object pins a version range (npm dialect — a bare `"2.1.0"` is
+exact) or a `rootHash`. Where two catalogs offer the same package the versions
+union, and the including catalog wins a same-version collision.
+
+> ⚠️ A client that predates `includes[]` ignores the field, so a catalog that
+> only aggregates looks **empty** to it and a curated one looks partial.
 
 ## How to Build
 

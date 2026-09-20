@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -32,6 +33,7 @@
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #ifdef _WIN32
@@ -410,6 +412,74 @@ public:
 
 // ─── logos-repo.json + index.json parsers ─────────────────────────────────────
 
+// ─── includes[] ───────────────────────────────────────────────────────────────
+//
+// A malformed include entry is a warning, never a parse failure. The rest of
+// logos-repo.json is still good, and refusing the whole file would take a
+// working catalog offline over a typo in a field that is purely additive.
+// The complaints land in `includeWarnings` and are reported; they are not
+// swallowed.
+void parseIncludes(const json& arr, Repository& dst) {
+    for (const auto& inc : arr) {
+        if (!inc.is_object()) {
+            dst.includeWarnings.push_back("includes[]: entry is not an object — skipped");
+            continue;
+        }
+        if (!inc.contains("repo") || !inc["repo"].is_string()) {
+            dst.includeWarnings.push_back("includes[]: entry has no string 'repo' — skipped");
+            continue;
+        }
+        IncludeSpec spec;
+        spec.repoUrl = inc["repo"].get<std::string>();
+        if (spec.repoUrl.rfind("https://", 0) != 0) {
+            dst.includeWarnings.push_back("includes[]: '" + spec.repoUrl +
+                                          "' is not an https URL — skipped");
+            continue;
+        }
+        if (!inc.contains("packages")) {
+            // No filter: take the whole catalog.
+            dst.includes.push_back(std::move(spec));
+            continue;
+        }
+        if (!inc["packages"].is_array()) {
+            dst.includeWarnings.push_back("includes[]: '" + spec.repoUrl +
+                                          "' has a non-array 'packages' — skipped");
+            continue;
+        }
+        spec.allPackages = false;
+        for (const auto& sel : inc["packages"]) {
+            PackageSelector ps;
+            if (sel.is_string()) {
+                // Shorthand: a bare name means every version of that package.
+                ps.name = sel.get<std::string>();
+            } else if (sel.is_object() && sel.contains("name") && sel["name"].is_string()) {
+                ps.name         = sel["name"].get<std::string>();
+                ps.versionRange = sel.value("version", "");
+                ps.rootHash     = sel.value("rootHash", "");
+            } else {
+                dst.includeWarnings.push_back("includes[] for '" + spec.repoUrl +
+                                              "': selector is neither a name nor "
+                                              "an object with a string 'name' — skipped");
+                continue;
+            }
+            if (ps.name.empty()) {
+                dst.includeWarnings.push_back("includes[] for '" + spec.repoUrl +
+                                              "': selector has an empty name — skipped");
+                continue;
+            }
+            spec.packages.push_back(std::move(ps));
+        }
+        if (spec.packages.empty()) {
+            // An explicit `"packages": []` selects nothing. Following the
+            // include would cost two round-trips to contribute zero entries.
+            dst.includeWarnings.push_back("includes[]: '" + spec.repoUrl +
+                                          "' selects no package — skipped");
+            continue;
+        }
+        dst.includes.push_back(std::move(spec));
+    }
+}
+
 bool parseLogosRepoJson(const std::string& body, Repository& dst, std::string& err) {
     try {
         auto j = json::parse(body);
@@ -434,6 +504,13 @@ bool parseLogosRepoJson(const std::string& body, Repository& dst, std::string& e
                     dst.trustedSignerDids.push_back(s["did"].get<std::string>());
                 }
             }
+        }
+        dst.includes.clear();
+        dst.includeWarnings.clear();
+        if (j.contains("includes") && j["includes"].is_array()) {
+            parseIncludes(j["includes"], dst);
+        } else if (j.contains("includes")) {
+            dst.includeWarnings.push_back("'includes' is not an array — ignored");
         }
         return true;
     } catch (const json::exception& e) {
@@ -492,8 +569,19 @@ struct RepositoryRegistry::Impl {
     bool defaultRemoved  = false;
     std::vector<Repository> userRepos;        // persisted (url + enabled only)
     Repository defaultRepo;                   // always present
+    // Repositories reached by following includes[]. Rebuilt from scratch by
+    // every refresh(); never persisted, never offered to add/remove/setEnabled.
+    std::vector<Repository> derivedRepos;
+    bool followIncludes = true;
     std::shared_ptr<Fetcher> fetcher;
     mutable std::mutex mu;
+
+    // Bounds on the include walk. A catalog is third-party input, so the graph
+    // it describes has to be assumed hostile or simply wrong: without a cap, a
+    // deep chain turns one `repo add` into an unbounded fan-out of round-trips
+    // behind a caller that has its own deadline.
+    static constexpr int kMaxIncludeDepth = 4;
+    static constexpr size_t kMaxIncludeNodesPerRoot = 32;
 
     Impl() {
         defaultRepo.url = kDefaultRepositoryUrl;
@@ -510,6 +598,7 @@ struct RepositoryRegistry::Impl {
             json j; f >> j;
             defaultDisabled = j.value("defaultDisabled", false);
             defaultRemoved  = j.value("defaultRemoved",  false);
+            followIncludes  = j.value("followIncludes",  true);
             userRepos.clear();
             if (j.contains("repositories") && j["repositories"].is_array()) {
                 for (const auto& r : j["repositories"]) {
@@ -531,6 +620,7 @@ struct RepositoryRegistry::Impl {
         j["schemaVersion"] = 1;
         j["defaultDisabled"] = defaultDisabled;
         j["defaultRemoved"]  = defaultRemoved;
+        j["followIncludes"]  = followIncludes;
         json arr = json::array();
         for (const auto& r : userRepos) {
             json e;
@@ -549,6 +639,11 @@ struct RepositoryRegistry::Impl {
 
     void refreshOne(Repository& r) {
         r.resolveError.clear();
+        // Stale includes from a previous resolve must not survive a failed
+        // one, or an unreachable catalog keeps pulling in the catalogs it
+        // named the last time it answered.
+        r.includes.clear();
+        r.includeWarnings.clear();
         if (!isHttpsUrl(r.url)) {
             r.resolveError = "unsupported URL scheme (https required in v1)";
             return;
@@ -577,6 +672,114 @@ struct RepositoryRegistry::Impl {
         }
         r = std::move(parsed);
     }
+
+    // The configured set, without taking `mu` — both list() and listAll()
+    // need it and the mutex is not recursive.
+    std::vector<Repository> listLocked() const {
+        std::vector<Repository> out;
+        if (!defaultRemoved) {
+            Repository defCopy = defaultRepo;
+            defCopy.enabled = !defaultDisabled;
+            out.push_back(std::move(defCopy));
+        }
+        for (const auto& r : userRepos) out.push_back(r);
+        return out;
+    }
+
+    // Walk includes[] from every configured repository and rebuild
+    // `derivedRepos`. Breadth-first per root, so the resulting order is
+    // exactly the merge precedence the catalog wants: includes[] in declared
+    // order, shallower before deeper.
+    //
+    // Best-effort throughout. A derived node that fails to resolve is KEPT,
+    // carrying its resolveError, so `repo list` can show why a catalog the
+    // user expected is missing — dropping it here is what makes an include
+    // look like it was never declared.
+    void rebuildDerived() {
+        derivedRepos.clear();
+        if (!followIncludes) return;
+
+        struct Pending {
+            IncludeSpec spec;
+            std::string viaUrl;
+            int depth;
+            std::vector<std::string> ancestors;  // repo URLs on the path here
+        };
+
+        for (auto& root : listLocked()) {
+            if (!root.enabled || !root.resolveError.empty()) continue;
+            if (root.includes.empty()) continue;
+
+            std::deque<Pending> queue;
+            for (const auto& spec : root.includes)
+                queue.push_back(Pending{spec, root.url, 1, {root.url}});
+
+            size_t nodes = 0;
+            bool cappedNodes = false;
+            while (!queue.empty()) {
+                Pending p = std::move(queue.front());
+                queue.pop_front();
+
+                if (nodes >= kMaxIncludeNodesPerRoot) { cappedNodes = true; break; }
+                if (p.depth > kMaxIncludeDepth) {
+                    noteIncludeWarning(root.url, p.viaUrl,
+                                       "include '" + p.spec.repoUrl + "' is deeper than " +
+                                       std::to_string(kMaxIncludeDepth) + " levels — not followed");
+                    continue;
+                }
+                // Cycle check is per-PATH, not global: a diamond (two includes
+                // that both reach the same catalog) is legitimate and must
+                // still resolve, while A -> B -> A must stop.
+                if (std::find(p.ancestors.begin(), p.ancestors.end(), p.spec.repoUrl)
+                        != p.ancestors.end()) {
+                    noteIncludeWarning(root.url, p.viaUrl,
+                                       "include '" + p.spec.repoUrl +
+                                       "' would cycle back on itself — not followed");
+                    continue;
+                }
+
+                Repository d;
+                d.url         = p.spec.repoUrl;
+                d.enabled     = true;
+                d.isDerived   = true;
+                d.viaUrl      = p.viaUrl;
+                d.rootUrl     = root.url;
+                d.depth       = p.depth;
+                d.allPackages = p.spec.allPackages;
+                d.selectors   = p.spec.packages;
+                refreshOne(d);
+                ++nodes;
+
+                if (d.resolveError.empty()) {
+                    std::vector<std::string> ancestors = p.ancestors;
+                    ancestors.push_back(d.url);
+                    for (const auto& spec : d.includes)
+                        queue.push_back(Pending{spec, d.url, p.depth + 1, ancestors});
+                }
+                derivedRepos.push_back(std::move(d));
+            }
+            if (cappedNodes) {
+                noteIncludeWarning(root.url, root.url,
+                                   "include graph exceeds " +
+                                   std::to_string(kMaxIncludeNodesPerRoot) +
+                                   " catalogs — the rest was not followed");
+            }
+        }
+    }
+
+    // Warnings are raised while walking, but the Repository they belong to is
+    // a copy by then. Record them against the live configured entry so
+    // listRepositoriesJson() reports them.
+    void noteIncludeWarning(const std::string& rootUrl,
+                            const std::string& viaUrl,
+                            const std::string& text) {
+        const std::string msg =
+            (viaUrl.empty() || viaUrl == rootUrl) ? text : (viaUrl + ": " + text);
+        if (rootUrl == defaultRepo.url) { defaultRepo.includeWarnings.push_back(msg); return; }
+        for (auto& r : userRepos) {
+            if (r.url == rootUrl) { r.includeWarnings.push_back(msg); return; }
+        }
+    }
 };
 
 RepositoryRegistry::RepositoryRegistry() : impl_(std::make_unique<Impl>()) {}
@@ -597,14 +800,34 @@ void RepositoryRegistry::setFetcher(std::shared_ptr<Fetcher> fetcher) {
 
 std::vector<Repository> RepositoryRegistry::list() const {
     std::lock_guard<std::mutex> lock(impl_->mu);
+    return impl_->listLocked();
+}
+
+std::vector<Repository> RepositoryRegistry::listAll() const {
+    std::lock_guard<std::mutex> lock(impl_->mu);
     std::vector<Repository> out;
-    if (!impl_->defaultRemoved) {
-        Repository defCopy = impl_->defaultRepo;
-        defCopy.enabled = !impl_->defaultDisabled;
-        out.push_back(std::move(defCopy));
+    for (auto& root : impl_->listLocked()) {
+        const std::string rootUrl = root.url;
+        out.push_back(std::move(root));
+        // Derived entries follow their root immediately, in walk order, so a
+        // caller that concatenates gets the merge precedence for free.
+        for (const auto& d : impl_->derivedRepos) {
+            if (d.rootUrl == rootUrl) out.push_back(d);
+        }
     }
-    for (const auto& r : impl_->userRepos) out.push_back(r);
     return out;
+}
+
+void RepositoryRegistry::setFollowIncludes(bool follow) {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    if (impl_->followIncludes == follow) return;
+    impl_->followIncludes = follow;
+    impl_->derivedRepos.clear();
+}
+
+bool RepositoryRegistry::followIncludes() const {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    return impl_->followIncludes;
 }
 
 std::string RepositoryRegistry::addRepository(const std::string& url) {
@@ -683,6 +906,16 @@ std::string RepositoryRegistry::refresh() {
         impl_->refreshOne(r);
         if (!r.resolveError.empty()) errs.push_back(r.url + ": " + r.resolveError);
     }
+    // Only now: the walk starts from repositories that have just resolved,
+    // and refreshOne() is what populates their includes[].
+    impl_->rebuildDerived();
+    for (const auto& d : impl_->derivedRepos) {
+        if (!d.resolveError.empty())
+            errs.push_back(d.url + " (included via " + d.viaUrl + "): " + d.resolveError);
+    }
+    for (const auto& r : impl_->listLocked()) {
+        for (const auto& w : r.includeWarnings) errs.push_back(r.url + ": " + w);
+    }
     if (errs.empty()) return {};
     std::string out;
     for (auto& e : errs) { out += e; out += '\n'; }
@@ -702,6 +935,11 @@ std::optional<Repository> RepositoryRegistry::findByUrlOrName(const std::string&
     }
     for (const auto& r : impl_->userRepos) {
         if (match(r)) return r;
+    }
+    // Then included catalogs, so `--repo <origin>` can scope to one of them.
+    // Configured repositories win a name clash: those are the user's own.
+    for (const auto& d : impl_->derivedRepos) {
+        if (match(d)) return d;
     }
     return std::nullopt;
 }
@@ -776,6 +1014,64 @@ struct PackageDownloaderLib::Impl {
         indexJsonByRepoUrl.clear();
     }
 
+    // Does `source`'s include filter admit this package at all? Returns the
+    // selectors that name it — empty means "not selected". A source with no
+    // filter (a configured repo, or an include that took the whole catalog)
+    // admits everything and never reaches here.
+    static std::vector<const PackageSelector*> selectorsFor(const Repository& source,
+                                                            const std::string& name) {
+        std::vector<const PackageSelector*> out;
+        for (const auto& sel : source.selectors) {
+            if (sel.name == name) out.push_back(&sel);
+        }
+        return out;
+    }
+
+    // A version passes if ANY selector naming its package accepts it, so two
+    // selectors for one package union rather than intersect. Within one
+    // selector, `version` and `rootHash` both have to hold.
+    static bool versionAccepted(const std::vector<const PackageSelector*>& sels,
+                                const json& versionEntry) {
+        const std::string ver =
+            objOrEmpty(versionEntry, "manifest").value("version", "");
+        const std::string hash = versionEntry.value("rootHash", "");
+        for (const auto* sel : sels) {
+            if (!sel->versionRange.empty() && !semverRangeMatches(sel->versionRange, ver))
+                continue;
+            if (!sel->rootHash.empty() && sel->rootHash != hash) continue;
+            return true;
+        }
+        return false;
+    }
+
+    // Package-level fields the catalog lifts out of a version's embedded
+    // manifest. Recomputed from whichever version ends up at [0] AFTER the
+    // merge and sort: with several catalogs contributing versions of one
+    // package, "the first entry in the file" is no longer a meaningful
+    // source for the package's own description or icon.
+    static void applyHeaderFields(json& entry, const json& versionEntry) {
+        const json& manifest = objOrEmpty(versionEntry, "manifest");
+        entry["displayName"] = manifest.value("display_name", "");
+        entry["description"] = manifest.value("description", "");
+        entry["type"]        = manifest.value("type", "");
+        entry["category"]    = manifest.value("category", "");
+        entry["author"]      = manifest.value("author", "");
+        entry["manifestVersion"] = manifest.value("manifestVersion", "");
+        // `provides` is an array of intent objects; value(key, "")
+        // would throw converting it to the string default.
+        entry["provides"] = manifest.contains("provides") ? manifest["provides"]
+                                                          : json::array();
+        // Resolved against the ORIGIN's indexUrl when the entry was built —
+        // an included package's icon sits next to the index that published
+        // it, not next to the one the user configured.
+        if (versionEntry.contains("iconUrl")) entry["icon"] = versionEntry["iconUrl"];
+        else entry.erase("icon");
+        entry["originRepositoryUrl"]  = versionEntry.value("originRepositoryUrl", "");
+        entry["originRepositoryName"] = versionEntry.value("originRepositoryName", "");
+        entry["originRepositoryDisplayName"] =
+            versionEntry.value("originRepositoryDisplayName", "");
+    }
+
     // Synthesise the catalog entries for one repo from its index.json
     // body and append them to `out`. Single source of truth for the
     // entry shape so getCatalogJson (all repos) and getCatalogForRepoJson
@@ -783,7 +1079,16 @@ struct PackageDownloaderLib::Impl {
     // index `packages[]`, missing the synthesised repositoryUrl /
     // repository{Name,DisplayName} / package-level type/category/etc.
     // and the date-sorted versions that callers (CLI/UI/C API) expect.
-    void appendCatalogEntries(const Repository& r, const std::string& body, json& out) {
+    //
+    // `source` is the catalog the packages actually live in; `root` is the
+    // repository the USER configured, which for an included catalog is the
+    // one that pulled it in. `repositoryUrl` names the root — the UI groups
+    // its sections by that field, so stamping the origin there would make an
+    // aggregate catalog render as nothing at all. The origin travels in the
+    // `origin*` fields instead, and on every version entry, because after a
+    // merge one package's versions can come from several catalogs.
+    void appendCatalogEntries(const Repository& source, const Repository& root,
+                              const std::string& body, json& out) {
         if (body.empty()) return;
         json idx;
         try {
@@ -793,49 +1098,129 @@ struct PackageDownloaderLib::Impl {
         }
         if (!idx.is_object() || !idx.contains("packages")
             || !idx["packages"].is_array()) return;
+        const std::string originName =
+            source.name.empty() ? source.url : source.name;
+        const auto slash = source.indexUrl.find_last_of('/');
         for (auto& pkg : idx["packages"]) {
             if (!pkg.is_object() || !pkg.contains("name")) continue;
             // Per package, not per repo: a field of an unexpected type throws
             // out of the entry build, and the cost must stay with the package
             // that carries it.
             try {
-                json entry;
-                entry["repositoryUrl"]  = r.url;
-                entry["repositoryName"] = r.name.empty() ? r.url : r.name;
-                entry["repositoryDisplayName"] = r.displayName;
-                entry["name"] = pkg["name"];
-                // Package "header" fields lifted from the first version's
-                // embedded manifest (constant across a package's versions).
-                if (pkg.contains("versions") && pkg["versions"].is_array()
-                    && !pkg["versions"].empty()) {
-                    const json& firstVersion = pkg["versions"][0];
-                    const json& firstManifest = objOrEmpty(firstVersion, "manifest");
-                    entry["displayName"] = firstManifest.value("display_name", "");
-                    entry["description"] = firstManifest.value("description", "");
-                    entry["type"]        = firstManifest.value("type", "");
-                    entry["category"]    = firstManifest.value("category", "");
-                    entry["author"]      = firstManifest.value("author", "");
-                    entry["manifestVersion"] = firstManifest.value("manifestVersion", "");
-                    // `provides` is an array of intent objects; value(key, "")
-                    // would throw converting it to the string default.
-                    entry["provides"] = firstManifest.contains("provides")
-                                            ? firstManifest["provides"]
-                                            : json::array();
-                    const std::string iconPath =
-                        objOrEmpty(firstVersion, "icon").value("path", "");
-                    const auto slash = r.indexUrl.find_last_of('/');
-                    if (!iconPath.empty() && slash != std::string::npos) {
-                        entry["icon"] = r.indexUrl.substr(0, slash) + "/" + iconPath;
-                    }
+                const std::string pkgName = pkg["name"].get<std::string>();
+                std::vector<const PackageSelector*> sels;
+                if (!source.allPackages) {
+                    sels = selectorsFor(source, pkgName);
+                    if (sels.empty()) continue;  // not selected by this include
                 }
-                auto versions = pkg.value("versions", json::array());
+
+                json entry;
+                entry["repositoryUrl"]  = root.url;
+                entry["repositoryName"] = root.name.empty() ? root.url : root.name;
+                entry["repositoryDisplayName"] = root.displayName;
+                entry["name"] = pkg["name"];
+
+                json versions = json::array();
+                for (auto& v : pkg.value("versions", json::array())) {
+                    if (!source.allPackages && (!v.is_object() || !versionAccepted(sels, v)))
+                        continue;
+                    if (v.is_object()) {
+                        v["originRepositoryUrl"]  = source.url;
+                        v["originRepositoryName"] = originName;
+                        v["originRepositoryDisplayName"] = source.displayName;
+                        const std::string iconPath = objOrEmpty(v, "icon").value("path", "");
+                        if (!iconPath.empty() && slash != std::string::npos)
+                            v["iconUrl"] = source.indexUrl.substr(0, slash) + "/" + iconPath;
+                    }
+                    versions.push_back(v);
+                }
+                // A filter that matched the name but no version contributes
+                // nothing — surfacing an empty package would read as "this
+                // catalog has it but it is broken".
+                if (!source.allPackages && versions.empty()) continue;
+
                 std::stable_sort(versions.begin(), versions.end(), VersionPrecedenceDesc{});
+                if (!versions.empty()) applyHeaderFields(entry, versions[0]);
                 entry["versions"] = std::move(versions);
                 out.push_back(std::move(entry));
             } catch (...) {
                 continue;
             }
         }
+    }
+
+    // Reduce entries that name the same package into one, for a single
+    // configured repository. `entries` must already be in precedence order:
+    // the root's own index first, then its includes in declared order,
+    // shallower before deeper.
+    //
+    // Versions are unioned, because two catalogs publishing different
+    // versions of one package is the whole point of an include. A version
+    // present in both is the actual collision, and the earlier contributor —
+    // the local one — keeps it. The loser is reported, not dropped silently.
+    json mergeCatalogEntries(const json& entries, std::vector<std::string>* warnings) {
+        json out = json::array();
+        std::unordered_map<std::string, size_t> slotByName;
+        std::vector<std::unordered_set<std::string>> seenVersions;
+        const auto versionOf = [](const json& v) {
+            return v.is_object() ? objOrEmpty(v, "manifest").value("version", "")
+                                 : std::string();
+        };
+
+        for (const auto& e : entries) {
+            const std::string name = e.value("name", "");
+            auto it = slotByName.find(name);
+            if (it == slotByName.end()) {
+                slotByName[name] = out.size();
+                out.push_back(e);
+                std::unordered_set<std::string> have;
+                for (const auto& v : e.value("versions", json::array()))
+                    have.insert(versionOf(v));
+                seenVersions.push_back(std::move(have));
+                continue;
+            }
+            json& acc = out[it->second];
+            auto& have = seenVersions[it->second];
+            for (const auto& v : e.value("versions", json::array())) {
+                const std::string ver = versionOf(v);
+                if (have.count(ver)) {
+                    if (warnings) {
+                        warnings->push_back(
+                            name + " " + ver + " from " +
+                            v.value("originRepositoryName", "an included catalog") +
+                            " is shadowed by the copy already in " +
+                            acc.value("repositoryName", "this catalog"));
+                    }
+                    continue;
+                }
+                have.insert(ver);
+                acc["versions"].push_back(v);
+            }
+        }
+
+        for (auto& e : out) {
+            if (!e.contains("versions") || !e["versions"].is_array()
+                || e["versions"].empty()) continue;
+            std::stable_sort(e["versions"].begin(), e["versions"].end(),
+                             VersionPrecedenceDesc{});
+            applyHeaderFields(e, e["versions"][0]);
+        }
+        return out;
+    }
+
+    // Everything one configured repository contributes: its own packages plus
+    // those of every catalog it includes, merged.
+    json catalogForRoot(const Repository& root,
+                        const std::vector<Repository>& all,
+                        std::vector<std::string>* warnings) {
+        json entries = json::array();
+        appendCatalogEntries(root, root, fetchIndex(root), entries);
+        for (const auto& d : all) {
+            if (!d.isDerived || d.rootUrl != root.url) continue;
+            if (!d.resolveError.empty()) continue;
+            appendCatalogEntries(d, root, fetchIndex(d), entries);
+        }
+        return mergeCatalogEntries(entries, warnings);
     }
 };
 
@@ -862,6 +1247,7 @@ const RepositoryRegistry& PackageDownloaderLib::registry() const { return impl_-
 
 std::string PackageDownloaderLib::listRepositoriesJson() {
     impl_->ensureMetadata();
+    const auto all = impl_->registry.listAll();
     json arr = json::array();
     for (const auto& r : impl_->registry.list()) {
         json e;
@@ -879,6 +1265,33 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
         e["indexUrl"] = r.indexUrl;
         e["trustedSignerDids"] = r.trustedSignerDids;
         e["resolveError"] = r.resolveError;
+        // The catalogs this one pulls in, as resolved — not as declared. A
+        // declared include that could not be fetched appears here with its
+        // own resolveError, which is the only place that failure is visible:
+        // the merged catalog just has fewer packages in it.
+        json includes = json::array();
+        for (const auto& d : all) {
+            if (!d.isDerived || d.rootUrl != r.url) continue;
+            json inc;
+            inc["url"] = d.url;
+            inc["viaUrl"] = d.viaUrl;
+            inc["depth"] = d.depth;
+            inc["name"] = d.name;
+            inc["displayName"] = d.displayName;
+            inc["indexUrl"] = d.indexUrl;
+            inc["allPackages"] = d.allPackages;
+            json sels = json::array();
+            for (const auto& sel : d.selectors) {
+                sels.push_back(json{{"name", sel.name},
+                                    {"version", sel.versionRange},
+                                    {"rootHash", sel.rootHash}});
+            }
+            inc["packages"] = std::move(sels);
+            inc["resolveError"] = d.resolveError;
+            includes.push_back(std::move(inc));
+        }
+        e["includes"] = std::move(includes);
+        e["includeWarnings"] = r.includeWarnings;
         arr.push_back(std::move(e));
     }
     return arr.dump();
@@ -886,11 +1299,18 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
 
 std::string PackageDownloaderLib::getCatalogJson() {
     impl_->ensureMetadata();
+    const auto all = impl_->registry.listAll();
     json out = json::array();
-    for (const auto& r : impl_->registry.list()) {
+    // Merge per configured repository, not across all of them: two repos
+    // publishing the same package name are two separate offerings the user
+    // chose to trust separately, and the UI already renders them as separate
+    // sections. Only a repository and the catalogs IT includes merge.
+    for (const auto& r : all) {
+        if (r.isDerived) continue;
         if (!r.enabled) continue;
         if (!r.resolveError.empty()) continue;
-        impl_->appendCatalogEntries(r, impl_->fetchIndex(r), out);
+        for (auto& e : impl_->catalogForRoot(r, all, nullptr))
+            out.push_back(std::move(e));
     }
     return out.dump();
 }
@@ -906,9 +1326,18 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
     // callers (CLI `--repo`, the UI, the C API) get repositoryUrl,
     // date-sorted versions, and the package-level header fields, not the
     // raw index `packages[]`.
+    //
+    // Naming a CONFIGURED repository scopes to everything it offers, its
+    // includes among them: that is what the user added. Naming an INCLUDED
+    // catalog scopes to that catalog's own slice, which is how you ask where
+    // a package actually came from.
+    if (!repo->isDerived) {
+        const auto all = impl_->registry.listAll();
+        return impl_->catalogForRoot(*repo, all, nullptr).dump();
+    }
     json out = json::array();
-    impl_->appendCatalogEntries(*repo, impl_->fetchIndex(*repo), out);
-    return out.dump();
+    impl_->appendCatalogEntries(*repo, *repo, impl_->fetchIndex(*repo), out);
+    return impl_->mergeCatalogEntries(out, nullptr).dump();
 }
 
 std::string PackageDownloaderLib::refreshCatalogs() {
@@ -926,12 +1355,28 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     // logos-repo.json, so a catalog whose index.json was unreachable still
     // reported success here while every later browse quietly returned
     // nothing. Not holding mu: fetchIndex takes it.
-    for (const auto& r : impl_->registry.list()) {
+    const auto all = impl_->registry.listAll();
+    for (const auto& r : all) {
         if (!r.enabled || !r.resolveError.empty()) continue;
         std::string err;
-        if (impl_->fetchIndex(r, &err).empty())
-            out += r.url + ": " + (err.empty() ? "index unavailable" : err) + "\n";
+        if (impl_->fetchIndex(r, &err).empty()) {
+            out += r.url;
+            if (r.isDerived) out += " (included via " + r.viaUrl + ")";
+            out += ": " + (err.empty() ? "index unavailable" : err) + "\n";
+        }
     }
+
+    // Collision warnings only exist once the merge has actually run, so do
+    // one pass over the built catalog. The indexes are cached by now, so this
+    // costs no network. Reporting them here is the point: a shadowed version
+    // is invisible in the catalog itself, and "this include contributed
+    // nothing" must not look the same as "this include worked".
+    std::vector<std::string> warnings;
+    for (const auto& r : all) {
+        if (r.isDerived || !r.enabled || !r.resolveError.empty()) continue;
+        impl_->catalogForRoot(r, all, &warnings);
+    }
+    for (const auto& w : warnings) out += w + "\n";
     return out;
 }
 
@@ -1235,10 +1680,13 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
 
     impl_->ensureMetadata();
 
-    // Build the list of repos to consider.
+    // Build the list of repos to consider. Included catalogs are candidates
+    // too — a package the catalog LISTS has to be a package it can serve, or
+    // browse and install disagree.
+    const auto allRepos = impl_->registry.listAll();
     std::vector<Repository> candidates;
     if (repoUrlOrName.empty()) {
-        for (const auto& r : impl_->registry.list()) {
+        for (const auto& r : allRepos) {
             if (r.enabled && r.resolveError.empty()) candidates.push_back(r);
         }
         if (candidates.empty()) {
@@ -1255,6 +1703,15 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         }
 
         candidates.push_back(*r);
+        // Scoping to a configured repository scopes to what it OFFERS, which
+        // includes the catalogs it draws from. Scoping to an included catalog
+        // by its own name stays on that one.
+        if (!r->isDerived) {
+            for (const auto& d : allRepos) {
+                if (d.isDerived && d.rootUrl == r->url && d.resolveError.empty())
+                    candidates.push_back(d);
+            }
+        }
     }
 
     // Why each candidate could not serve the package. Collected rather than
@@ -1284,14 +1741,36 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         readAnyIndex = true;
         for (const auto& pkg : idx["packages"]) {
             if (!pkg.is_object() || pkg.value("name", "") != packageName) continue;
+            // An include narrows what its catalog offers. Without this, a
+            // version the filter excluded is invisible in `list` yet still
+            // installable by name — the pin would be advice, not a rule.
+            json filtered;
+            const json* candidate = &pkg;
+            if (!repo.allPackages) {
+                const auto sels = Impl::selectorsFor(repo, packageName);
+                if (sels.empty()) continue;
+                filtered = pkg;
+                json keep = json::array();
+                for (const auto& v : pkg.value("versions", json::array())) {
+                    if (v.is_object() && Impl::versionAccepted(sels, v)) keep.push_back(v);
+                }
+                if (keep.empty()) {
+                    notes.push_back(repo.url + ": " + packageName +
+                                    " is included here, but no version it offers"
+                                    " passes the include's filter");
+                    continue;
+                }
+                filtered["versions"] = std::move(keep);
+                candidate = &filtered;
+            }
             sawPackage = true;
-            const json* v = pickVersion(pkg, version, rootHash);
+            const json* v = pickVersion(*candidate, version, rootHash);
             if (!v || !v->is_object()) {
                 notes.push_back(repo.url + ": no release of " + packageName +
                                 " matches" +
                                 (version.empty() ? "" : " version " + version) +
                                 (rootHash.empty() ? "" : " rootHash " + rootHash) +
-                                " (offers: " + offeredVersions(pkg) + ")");
+                                " (offers: " + offeredVersions(*candidate) + ")");
                 continue;
             }
             std::string url = v->value("url", "");
