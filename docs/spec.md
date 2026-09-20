@@ -205,6 +205,26 @@ The filter binds **downloads as well as listings**. A version an include
 excluded is not installable by name from that repository either — otherwise the
 pin would be advice rather than a rule.
 
+Naming an included catalog with `--repo` matches the first node in the walk
+carrying that name. A catalog reached twice by different paths — and therefore
+under different filters — is scoped to the first of them; scope by URL and the
+including catalog instead when the distinction matters.
+
+### Choosing what a download fetches
+
+Selecting a release is a pass of its own, ranked across every candidate
+repository rather than stopping at the first that can serve the name. A
+repository's listing merges versions contributed by the catalogs it includes,
+and `versions[0]` there is the release the user was shown, so a
+first-match-wins scan would hand them a different one — an older copy in the
+including catalog beating a newer one in an included catalog. Browse and
+install name the same release.
+
+The comparator is the one §6 describes, the same one the catalog sort and the
+dependency resolver use. Candidate order breaks an exact tie, which preserves
+the merge's local-wins rule: the configured repository is ranked before the
+catalogs it includes.
+
 ---
 
 ## Verified Download

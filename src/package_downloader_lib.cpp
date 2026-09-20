@@ -1720,6 +1720,25 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
     bool sawPackage = false;
     bool readAnyIndex = false;
 
+    // Choosing is a pass of its own, ranked across EVERY candidate rather than
+    // stopping at the first one that can serve the name.
+    //
+    // A repository's listing now merges versions contributed by the catalogs it
+    // includes, and `versions[0]` there is the release the user was shown. A
+    // first-match-wins scan handed them a different one: with an older copy in
+    // the including catalog and a newer one in an included catalog, `list` said
+    // 1.2.0 and `download` fetched 1.0.0. Browse and install have to name the
+    // same release.
+    //
+    // `outranks` is the comparator the catalog sort and the dependency resolver
+    // already use, so all three agree. Candidate order breaks an exact tie,
+    // which preserves the merge's "the local copy wins" rule — the configured
+    // repository is first in `candidates`.
+    const Repository* pickedRepo = nullptr;
+    json pickedVersion;
+    std::string pickedVersionStr;
+    std::string pickedDate;
+
     for (const auto& repo : candidates) {
         std::string fetchErr;
         std::string body = impl_->fetchIndex(repo, &fetchErr);
@@ -1773,113 +1792,134 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                                 " (offers: " + offeredVersions(*candidate) + ")");
                 continue;
             }
-            std::string url = v->value("url", "");
-            if (url.empty()) {
-                notes.push_back(repo.url + ": " + packageName +
-                                " has no download url for the selected release");
-                continue;
+            const std::string candVersion =
+                objOrEmpty(*v, "manifest").value("version", "");
+            const std::string candDate = v->value("releasedAt", "");
+            if (!pickedRepo || outranks(candVersion, candDate,
+                                        pickedVersionStr, pickedDate)) {
+                pickedRepo = &repo;
+                // Copied, not aliased. `idx` is local to this iteration and
+                // `candidate` may point into the `filtered` copy, which dies
+                // with it — the same lifetime bug findBest documents below.
+                pickedVersion    = *v;
+                pickedVersionStr = candVersion;
+                pickedDate       = candDate;
             }
-            // Derive destination path.
-            std::string destDir = outputDir;
-            if (destDir.empty()) {
-                // stagingDir() honours TMPDIR/TMP/TEMP via
-                // temp_directory_path(), then isolates us inside it.
-                std::string dirErr;
-                destDir = stagingDir(dirErr);
-                if (destDir.empty()) {
-                    errorMessage = dirErr;
-                    return {};
-                }
-            }
-            std::string filename = fs::path(url).filename().string();
-            if (filename.empty()) filename = packageName + ".lgx";
-            std::string dest = (fs::path(destDir) / filename).string();
-
-            // Use a random suffix to avoid collisions.
-            // This is rare: the filename contains the version.
-            // Download the same version twice in parallel is not common.
-            std::random_device rd;
-            std::ostringstream suffix;
-
-            // Example: 3f9a2c1b.
-            suffix << std::hex << rd();
-
-            const std::string pendingFile =
-                (fs::path(destDir) / (filename + "." + suffix.str())).string();
-
-            // Known before any byte moves, and still right for a chunked
-            // response where curl reports dltotal == 0 throughout. It is also
-            // the ONLY denominator a transport with no Content-Length can
-            // offer, so it is resolved once here rather than per transport.
-            const std::uint64_t advertisedSize = v->value("size", std::uint64_t{0});
-            // Rate-limit at the source, not in each caller.
-            ProgressThrottle throttle;
-
-            // Built once and shared by every transport that may fetch this
-            // package. PASS THIS TO EACH ONE: the two-argument getToFile
-            // reports nothing (see Fetcher's progress overload), so a
-            // transport wired up with it goes silently progress-less — the
-            // bar simply never moves, with no error to notice.
-            const ProgressFn progressSink =
-                onProgress ? ProgressFn([&](std::uint64_t received,
-                                            std::uint64_t total) {
-                                 const std::uint64_t denom =
-                                     total ? total : advertisedSize;
-                                 if (!throttle.shouldEmit(received, denom, monotonicNowMs()))
-                                     return;
-                                 // Guarded here too, so the "a bad sink never
-                                 // fails a good download" guarantee holds for
-                                 // any Fetcher, not just the libcurl one whose
-                                 // trampoline also catches.
-                                 try {
-                                     onProgress(received, denom);
-                                 } catch (...) {
-                                 }
-                             })
-                           : ProgressFn{};
-
-            const FetchResult fetched =
-                impl_->fetcher->getToFile(url, pendingFile, progressSink);
-
-            if (!fetched.ok) {
-                std::error_code rmEc;
-                fs::remove(pendingFile, rmEc);
-                errorMessage = "download of " + packageName + " from " + url
-                             + " failed: " + fetched.error;
-                return {};
-            }
-            // Bind the downloaded artifact to what the index advertised
-            // — manifest fields + signer DID. The .lgx `url` and the
-            // `index.json` come from independent hosts; without this a
-            // swapped file (downgrade attack, sibling package) would
-            // sail through to install. Deep integrity + Ed25519 trust
-            // stay package_manager's job at install time; this is only
-            // the index→file binding. On mismatch we delete the bad
-            // artifact and fail the download.
-            {
-                std::string verr;
-                if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
-                    std::error_code rmEc;
-                    fs::remove(pendingFile, rmEc);
-                    errorMessage = "rejected " + packageName + " from " + url
-                                 + ": " + verr;
-                    return {};
-                }
-            }
-
-            std::error_code mvEc;
-            fs::rename(pendingFile, dest, mvEc);
-
-            if (mvEc) {
-                std::error_code rmEc;
-                fs::remove(pendingFile, rmEc);
-                errorMessage = "cannot publish " + packageName + " to " + dest
-                             + ": " + mvEc.message();
-                return {};
-            }
-            return dest;
         }
     }
+
+    if (pickedRepo) {
+        const Repository& repo = *pickedRepo;
+        const json* v = &pickedVersion;
+        const std::string url = v->value("url", "");
+        if (url.empty()) {
+            // Ranking already considered every candidate; there is no next
+            // repository to fall through to.
+            errorMessage = packageName + " has no download url for the selected "
+                           "release in " + repo.url;
+            return {};
+        }
+        // Derive destination path.
+        std::string destDir = outputDir;
+        if (destDir.empty()) {
+            // stagingDir() honours TMPDIR/TMP/TEMP via
+            // temp_directory_path(), then isolates us inside it.
+            std::string dirErr;
+            destDir = stagingDir(dirErr);
+            if (destDir.empty()) {
+                errorMessage = dirErr;
+                return {};
+            }
+        }
+        std::string filename = fs::path(url).filename().string();
+        if (filename.empty()) filename = packageName + ".lgx";
+        std::string dest = (fs::path(destDir) / filename).string();
+
+        // Use a random suffix to avoid collisions.
+        // This is rare: the filename contains the version.
+        // Download the same version twice in parallel is not common.
+        std::random_device rd;
+        std::ostringstream suffix;
+
+        // Example: 3f9a2c1b.
+        suffix << std::hex << rd();
+
+        const std::string pendingFile =
+            (fs::path(destDir) / (filename + "." + suffix.str())).string();
+
+        // Known before any byte moves, and still right for a chunked
+        // response where curl reports dltotal == 0 throughout. It is also
+        // the ONLY denominator a transport with no Content-Length can
+        // offer, so it is resolved once here rather than per transport.
+        const std::uint64_t advertisedSize = v->value("size", std::uint64_t{0});
+        // Rate-limit at the source, not in each caller.
+        ProgressThrottle throttle;
+
+        // Built once and shared by every transport that may fetch this
+        // package. PASS THIS TO EACH ONE: the two-argument getToFile
+        // reports nothing (see Fetcher's progress overload), so a
+        // transport wired up with it goes silently progress-less — the
+        // bar simply never moves, with no error to notice.
+        const ProgressFn progressSink =
+            onProgress ? ProgressFn([&](std::uint64_t received,
+                                        std::uint64_t total) {
+                             const std::uint64_t denom =
+                                 total ? total : advertisedSize;
+                             if (!throttle.shouldEmit(received, denom, monotonicNowMs()))
+                                 return;
+                             // Guarded here too, so the "a bad sink never
+                             // fails a good download" guarantee holds for
+                             // any Fetcher, not just the libcurl one whose
+                             // trampoline also catches.
+                             try {
+                                 onProgress(received, denom);
+                             } catch (...) {
+                             }
+                         })
+                       : ProgressFn{};
+
+        const FetchResult fetched =
+            impl_->fetcher->getToFile(url, pendingFile, progressSink);
+
+        if (!fetched.ok) {
+            std::error_code rmEc;
+            fs::remove(pendingFile, rmEc);
+            errorMessage = "download of " + packageName + " from " + url
+                         + " failed: " + fetched.error;
+            return {};
+        }
+        // Bind the downloaded artifact to what the index advertised
+        // — manifest fields + signer DID. The .lgx `url` and the
+        // `index.json` come from independent hosts; without this a
+        // swapped file (downgrade attack, sibling package) would
+        // sail through to install. Deep integrity + Ed25519 trust
+        // stay package_manager's job at install time; this is only
+        // the index→file binding. On mismatch we delete the bad
+        // artifact and fail the download.
+        {
+            std::string verr;
+            if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
+                std::error_code rmEc;
+                fs::remove(pendingFile, rmEc);
+                errorMessage = "rejected " + packageName + " from " + url
+                             + ": " + verr;
+                return {};
+            }
+        }
+
+        std::error_code mvEc;
+        fs::rename(pendingFile, dest, mvEc);
+
+        if (mvEc) {
+            std::error_code rmEc;
+            fs::remove(pendingFile, rmEc);
+            errorMessage = "cannot publish " + packageName + " to " + dest
+                         + ": " + mvEc.message();
+            return {};
+        }
+        return dest;
+    }
+
     if (errorMessage.empty()) {
         if (sawPackage)
             errorMessage = "no release of " + packageName +

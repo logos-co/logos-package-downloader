@@ -2064,3 +2064,53 @@ TEST(CatalogIncludes, DepthIsCapped) {
         if (w.get<std::string>().find("deeper than") != std::string::npos) sawDepthWarning = true;
     EXPECT_TRUE(sawDepthWarning);
 }
+
+// `list` and `download` have to name the same release. Selection used to stop
+// at the first candidate that could serve the name, so an older copy in the
+// including catalog beat a newer one in an included catalog: the catalog
+// advertised 1.2.0 and the download fetched 1.0.0.
+TEST(CatalogIncludes, DownloadPicksTheVersionTheCatalogAdvertises) {
+    auto seed = new UrlCapturingFetcher;
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}}}),
+        json::array({packageOf("shared",
+            json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}),
+        seed);
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("shared", json::array({versionFrom("b", "shared", "1.2.0", "h_b")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    // What the catalog advertises as latest.
+    const json e = catalogEntry(lib, "shared");
+    ASSERT_FALSE(e["versions"].empty());
+    EXPECT_EQ(e["versions"][0]["manifest"].value("version", ""), "1.2.0");
+
+    // What an unpinned download actually fetches.
+    std::string err;
+    lib.downloadPackage("", "shared", err);
+    EXPECT_EQ(seed->seenUrl, "https://b.local/shared-1.2.0.lgx");
+}
+
+// Ranking must not undo the merge's precedence. Same version in both catalogs
+// means the including one keeps it, and the download has to agree.
+TEST(CatalogIncludes, DownloadPrefersTheLocalCopyOnAnExactTie) {
+    auto seed = new UrlCapturingFetcher;
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}}}),
+        json::array({packageOf("shared",
+            json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}),
+        seed);
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("shared", json::array({versionFrom("b", "shared", "1.0.0", "h_b")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    std::string err;
+    lib.downloadPackage("", "shared", err);
+    EXPECT_EQ(seed->seenUrl, "https://root.local/shared-1.0.0.lgx");
+}

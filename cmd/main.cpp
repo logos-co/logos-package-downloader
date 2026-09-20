@@ -256,8 +256,20 @@ int cmdRepoList(const CliOpts& o) {
             std::string incTag;
             if (!inc.value("resolveError", "").empty())
                 incTag = "  [error: " + inc.value("resolveError", "") + "]";
-            std::cout << "    includes: " << inc.value("name", "<unresolved>")
-                      << "  (" << inc.value("url", "") << ")" << incTag << "\n";
+            // An unresolved repo reports an EMPTY name, not a missing one, so
+            // a value() default never fires and the line loses its label.
+            std::string incName = inc.value("name", "");
+            if (incName.empty()) incName = "<unresolved>";
+            // Depth 1 came from this repository; anything deeper arrived
+            // through another catalog, and saying which is the difference
+            // between "I asked for this" and "something I trusted did".
+            const std::string via =
+                inc.value("depth", 1) > 1
+                    ? "  via " + inc.value("viaUrl", std::string{})
+                    : std::string{};
+            std::cout << "    includes: " << incName
+                      << "  (" << inc.value("url", "") << ")"
+                      << via << incTag << "\n";
             if (inc.value("allPackages", true)) {
                 std::cout << "      packages: (all)\n";
             } else {
