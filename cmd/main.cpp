@@ -29,6 +29,7 @@ namespace {
 struct CliOpts {
     std::string configPath;     // --config
     std::string repo;           // --repo (URL or name)
+    bool noIncludes = false;    // --no-includes
     std::string version;        // --version
     std::string rootHash;       // --root-hash
     std::string category;       // --category
@@ -65,6 +66,10 @@ Global options:
   --config <path>               Path to repositories.json (required for any
                                 mutating repo command).
   --repo <url-or-name>          Restrict a catalog/download command to one repo.
+                                Naming a configured repo covers the catalogs it
+                                includes; naming an included catalog scopes to it.
+  --no-includes                 Do not follow `includes[]`. Only the catalogs
+                                configured here are read.
   --version <ver>               Pin a specific package version (download/info).
   --root-hash <hex>             Disambiguate two releases sharing a version.
   --category <cat>              Filter by category (list).
@@ -99,9 +104,13 @@ void printPackageTable(const json& packages) {
 }
 
 std::unique_ptr<lgpd::PackageDownloaderLib> makeLib(const CliOpts& o) {
-    if (o.configPath.empty())
-        return std::make_unique<lgpd::PackageDownloaderLib>();
-    return std::make_unique<lgpd::PackageDownloaderLib>(o.configPath);
+    auto lib = o.configPath.empty()
+                   ? std::make_unique<lgpd::PackageDownloaderLib>()
+                   : std::make_unique<lgpd::PackageDownloaderLib>(o.configPath);
+    // Must be set before the first call: metadata resolution is lazy and
+    // once-per-process, so a later flip would not be seen.
+    if (o.noIncludes) lib->registry().setFollowIncludes(false);
+    return lib;
 }
 
 int cmdList(const CliOpts& o) {
@@ -243,6 +252,44 @@ int cmdRepoList(const CliOpts& o) {
                   << "    url:      " << r.value("url", "") << "\n";
         if (!r.value("indexUrl", "").empty())
             std::cout << "    indexUrl: " << r.value("indexUrl", "") << "\n";
+        // Printed whenever it is declared, even when nothing resolved from it:
+        // an includes document that failed to load leaves no `includes` rows,
+        // and without this line there is nothing to say one was expected.
+        if (!r.value("includesUrl", "").empty())
+            std::cout << "    includes: " << r.value("includesUrl", "") << "\n";
+        for (const auto& inc : r.value("includes", json::array())) {
+            std::string incTag;
+            if (!inc.value("resolveError", "").empty())
+                incTag = "  [error: " + inc.value("resolveError", "") + "]";
+            // An unresolved repo reports an EMPTY name, not a missing one, so
+            // a value() default never fires and the line loses its label.
+            std::string incName = inc.value("name", "");
+            if (incName.empty()) incName = "<unresolved>";
+            // Depth 1 came from this repository; anything deeper arrived
+            // through another catalog, and saying which is the difference
+            // between "I asked for this" and "something I trusted did".
+            const std::string via =
+                inc.value("depth", 1) > 1
+                    ? "  via " + inc.value("viaUrl", std::string{})
+                    : std::string{};
+            std::cout << "      <- " << incName
+                      << "  (" << inc.value("url", "") << ")"
+                      << via << incTag << "\n";
+            if (inc.value("allPackages", true)) {
+                std::cout << "         packages: (all)\n";
+            } else {
+                for (const auto& sel : inc.value("packages", json::array())) {
+                    std::cout << "         packages: " << sel.value("name", "");
+                    if (!sel.value("version", "").empty())
+                        std::cout << " @ " << sel.value("version", "");
+                    if (!sel.value("rootHash", "").empty())
+                        std::cout << " rootHash " << sel.value("rootHash", "");
+                    std::cout << "\n";
+                }
+            }
+        }
+        for (const auto& w : r.value("includeWarnings", json::array()))
+            std::cout << "    warning:  " << w.get<std::string>() << "\n";
     }
     return 0;
 }
@@ -283,7 +330,7 @@ int cmdConfigInit(const std::string& path) {
         std::cerr << "Error: cannot write " << path << "\n";
         return 1;
     }
-    f << "{\n  \"schemaVersion\": 1,\n  \"repositories\": [],\n  \"defaultDisabled\": false,\n  \"defaultRemoved\": false\n}\n";
+    f << "{\n  \"schemaVersion\": 1,\n  \"repositories\": [],\n  \"defaultDisabled\": false,\n  \"defaultRemoved\": false,\n  \"followIncludes\": true\n}\n";
     if (!f.good()) { std::cerr << "Error: write failed: " << path << "\n"; return 1; }
     std::cout << "Created " << path << "\n";
     return 0;
@@ -317,6 +364,7 @@ int dispatch(int argc, char** argv) {
         if (a == "-V") return printVersion();
         if (a == "--config" && i + 1 < args.size()) { o.configPath = args[++i]; continue; }
         if (a == "--repo" && i + 1 < args.size())   { o.repo = args[++i]; continue; }
+        if (a == "--no-includes") { o.noIncludes = true; continue; }
         if (a == "--version") {
             // `--version <ver>` pins a package version (download/info); a bare
             // `--version` with no value following is treated like `-V` and prints

@@ -47,6 +47,27 @@ public:
     }
 };
 
+/// One package a catalog pulls in from another catalog, and how much of it.
+///
+/// `versionRange` and `rootHash` are independent narrowings; empty means "every
+/// version" / "any build". A bare version (`"2.1.0"`) is an exact pin, because
+/// that is what the npm range dialect already means by it — so the same
+/// `semverRangeMatches` the dependency resolver uses covers both cases.
+struct PackageSelector {
+    std::string name;
+    std::string versionRange;
+    std::string rootHash;
+};
+
+/// One entry of the includes document's `includes[]`: another catalog this one
+/// draws packages from. `allPackages` is true when the entry carries no
+/// `packages` filter, i.e. "take the whole catalog".
+struct IncludeSpec {
+    std::string repoUrl;
+    bool allPackages = true;
+    std::vector<PackageSelector> packages;
+};
+
 /// One repository entry in the in-memory registry. The persisted form is
 /// just `{ url, enabled }`; everything else is fetched at runtime from
 /// `logos-repo.json`.
@@ -80,6 +101,44 @@ struct Repository {
     /// for nobody in any case.)
     std::vector<std::string> trustedSignerDids;
     std::string resolveError; ///< non-empty when the fetch / parse failed
+
+    /// `includesUrl` from this repository's logos-repo.json: where its list of
+    /// drawn-from catalogs is published. Empty when it declares none.
+    ///
+    /// A separate document for the same reason `indexUrl` is one: the identity
+    /// card is hand-edited and changes almost never, while what a catalog
+    /// composes from changes on its own cadence and may be generated.
+    std::string includesUrl;
+
+    /// The includes document's `includes[]`, as fetched from `includesUrl`.
+    /// Empty for a catalog that draws in nothing, and also when the document
+    /// could not be read — see `includeWarnings`.
+    std::vector<IncludeSpec> includes;
+
+    /// Non-fatal complaints about this repository's includes — an unreadable
+    /// includes document, a malformed entry, a non-https URL, a cycle, a hit
+    /// cap. Kept separate
+    /// from `resolveError`, which means "drop this repository": one bad
+    /// include must not blackout a catalog that is otherwise fine. Reported
+    /// by listRepositoriesJson() and refreshCatalogs().
+    std::vector<std::string> includeWarnings;
+
+    // ─── Derived entries only ────────────────────────────────────────────────
+    //
+    // Set on an entry the registry reached by following an include. A
+    // CONFIGURED repository leaves every field below at its default. Derived
+    // entries are rebuilt from scratch on each refresh() and are never
+    // persisted — the user's config must not grow a repository they did not
+    // add. They are returned by listAll(), not by list().
+    bool isDerived = false;
+    std::string viaUrl;   ///< the repository whose includes[] named this one
+    std::string rootUrl;  ///< the CONFIGURED repository this was reached from
+    int depth = 0;        ///< 1 for a direct include, 2 for an include of one
+
+    /// The filter from the IncludeSpec that named this node. `allPackages`
+    /// true means take everything the included catalog publishes.
+    bool allPackages = true;
+    std::vector<PackageSelector> selectors;
 };
 
 /// Registry of repositories. Persists `{ url, enabled }` plus a
@@ -108,6 +167,23 @@ public:
     /// its resolved metadata (if `refresh()` has been called and the fetch
     /// succeeded).
     std::vector<Repository> list() const;
+
+    /// `list()` plus every repository reached by following `includes[]`, each
+    /// root immediately followed by its derived entries in resolution order.
+    /// Derived entries carry `isDerived`, `rootUrl`, `viaUrl`, `depth` and the
+    /// package filter that applies to them.
+    ///
+    /// This is what a catalog read should enumerate; `list()` remains the
+    /// user's configured set, which is what Settings renders and what the
+    /// config file holds.
+    std::vector<Repository> listAll() const;
+
+    /// Whether refresh() follows `includesUrl`. Default true. Turning it off
+    /// confines the client to the catalogs the user configured themselves —
+    /// an include is a real delegation, since the included catalog's operator
+    /// chooses what appears under the including one.
+    void setFollowIncludes(bool follow);
+    bool followIncludes() const;
 
     /// Add a user repo by URL, or re-enable the default repo when `url` is
     /// `kDefaultRepositoryUrl`. The URL must point to a `logos-repo.json`
@@ -168,17 +244,38 @@ public:
     RepositoryRegistry& registry();
     const RepositoryRegistry& registry() const;
 
-    /// JSON array of repositories. Each element:
+    /// JSON array of the CONFIGURED repositories. Each element:
     /// `{ url, sourceOwner, sourceRepo, sourceHost, enabled, isDefault,
     ///    name, displayName, description, homepage, indexUrl,
-    ///    trustedSignerDids[], resolveError }`.
+    ///    trustedSignerDids[], resolveError, includesUrl, includes[],
+    ///    includeWarnings[] }`.
+    ///
+    /// `includes[]` lists the catalogs this one draws from AS RESOLVED, each
+    /// `{ url, viaUrl, depth, name, displayName, indexUrl, allPackages,
+    ///    packages[], resolveError }`. A declared include that could not be
+    /// fetched appears here carrying its own `resolveError` — the merged
+    /// catalog just has fewer packages in it, so this is the only place that
+    /// failure is visible.
     std::string listRepositoriesJson();
 
-    /// JSON array of all packages across all enabled repos. Each element:
-    /// `{ repositoryUrl, repositoryName, name, versions: [...] }`.
-    /// `versions[]` is sorted newest-first by `releasedAt` and contains
+    /// JSON array of all packages across all enabled repos, each repository's
+    /// own packages merged with those of the catalogs it includes. Each
+    /// element:
+    /// `{ repositoryUrl, repositoryName, repositoryDisplayName,
+    ///    originRepositoryUrl, originRepositoryName,
+    ///    originRepositoryDisplayName, name, displayName, description, type,
+    ///    category, author, manifestVersion, provides[], icon?,
+    ///    versions: [...] }`.
+    ///
+    /// `repository*` names the repository the USER configured; `origin*` names
+    /// the catalog that actually publishes the package, which differs only
+    /// when the package arrived through an include.
+    ///
+    /// `versions[]` is sorted newest-first by SemVer precedence (`releasedAt`
+    /// breaks ties between entries sharing a version) and contains
     /// `releasedAt, publisherRef, url, size, sha256, rootHash, manifest,
-    /// signature?` exactly as in `index.json`.
+    /// signature?` exactly as in `index.json`, plus the synthesised
+    /// `originRepository{Url,Name,DisplayName}` and `iconUrl?`.
     std::string getCatalogJson();
 
     /// JSON array of all packages for one repo (URL or canonical name).

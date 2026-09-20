@@ -61,8 +61,11 @@ source of truth — it federates several and presents them as one.
 
 | Concept | Meaning |
 |---------|---------|
-| **Repository** | A package source, identified by the URL of its `logos-repo.json`. That document is the repository's identity card: canonical `name`, human `displayName`, `description`, `homepage`, the `indexUrl` where its package index lives, and a list of `trustedSigners` (each with a `did`). |
+| **Repository** | A package source, identified by the URL of its `logos-repo.json`. That document is the repository's identity card: canonical `name`, human `displayName`, `description`, `homepage`, the `indexUrl` where its package index lives, a list of `trustedSigners` (each with a `did`), and an optional `includesUrl` pointing at the catalogs it draws from. |
 | **Registry** | The set of repositories the client knows about: one hardcoded **default repository** plus any number of **user repositories**. The registry is what `add`/`remove`/`enable`/`disable` operate on. |
+| **Includes document** | The document a repository's `includesUrl` points at: `{ schemaVersion, includes[] }`. Separate from the identity card for the same reason `indexUrl` is — the card is near-static, what a catalog composes from is not. |
+| **Include** | One entry of that document: another catalog this one draws packages from, optionally narrowed to named packages or version ranges. Includes are resolved at fetch time and contribute to the including repository's own listing. |
+| **Derived repository** | A repository the client reached by following an include, rather than one the user configured. Derived repositories are rebuilt on every refresh and are never written to the config. |
 | **Index** | A repository's package index (`index.json`): a list of packages, each with one or more **versions**. Each version carries a `releasedAt` date, the download `url` of its `.lgx`, size/checksum fields, a `rootHash`, an embedded `manifest`, and an optional `signature`. |
 | **Catalog** | The merged, synthesised view across all *enabled* repositories. This is the unit the browse/search/info/resolve operations work against. |
 | **Package** | A named module available in one or more repositories, with a version history. |
@@ -93,8 +96,15 @@ User repositories are persisted to a JSON config file with a stable schema:
 { "schemaVersion": 1,
   "defaultDisabled": false,
   "defaultRemoved":  false,
+  "followIncludes":  true,
   "repositories": [ { "url": "...", "enabled": true }, ... ] }
 ```
+
+`followIncludes` (default `true`) is the client's opt-out from the include
+mechanism as a whole: with it off, `includesUrl` is not even fetched. An include is a real delegation — the included catalog's
+operator decides what appears under the including one — so a user who wants
+only the sources they added themselves can set it to `false`, or pass
+`--no-includes`.
 
 Only the **bare facts** — each repository's URL and whether it is enabled, plus
 the default-disabled flag — are stored. All resolved metadata (name,
@@ -112,34 +122,145 @@ by an **index merge**:
 
 ```
    for each repository in the registry:
-       fetch logos-repo.json       ──► resolve name, indexUrl, signers
+       fetch logos-repo.json       ──► resolve name, indexUrl, signers,
+                                        includesUrl
                                         (failure recorded per-repo, not fatal)
+       fetch includesUrl, if any   ──► includes[]
+                                        (failure recorded as a WARNING; the
+                                         repository's own packages survive it)
+       follow includes[] breadth-first  ──► derived repositories
+                                        (bounded; cycles and caps recorded)
 
    for each ENABLED repository that resolved cleanly:
-       fetch index.json
+       fetch its index.json, and the index of every catalog it includes
        synthesise one catalog entry per package:
            + repositoryUrl / repositoryName / repositoryDisplayName
-           + header fields (description, type, category, author, icon)
-             lifted from the first version's manifest
-           + versions[]  sorted newest-first by releasedAt
+             naming the CONFIGURED repository
+           + originRepository{Url,Name,DisplayName} naming the catalog that
+             actually publishes it (equal to the above when not included)
+           + versions[] filtered by the include's selector, sorted
+             newest-first by SemVer precedence
+       merge entries that name the same package  ──► one entry per package
 
-   concatenate all entries  ──► the merged catalog
+   concatenate each repository's merged entries  ──► the catalog
 ```
 
-Two properties matter:
+Merging happens **within** a configured repository, never across two of them:
+two repositories publishing the same package name are two offerings the user
+chose to trust separately, and the UI renders them as separate sections.
+
+Three properties matter:
 
 1. **Best-effort federation.** A repository that fails to fetch or parse is
    recorded with a per-repository `resolveError` and **skipped** — it does not
    abort the whole catalog. One unreachable repository never blackouts the
    others.
-2. **Lazy, cached metadata.** Metadata resolution happens **once per process**
+2. **Includes are bounded.** A catalog is third-party input, so the graph it
+   describes is followed with a depth cap (4), a per-root catalog cap (32), and
+   a per-path cycle check. The per-path check is what lets a diamond — two
+   includes that both reach the same catalog — resolve, while `A → B → A`
+   stops. A hit cap or a refused cycle is recorded as an `includeWarning` on
+   the repository that declared it, not swallowed.
+3. **Lazy, cached metadata.** Metadata resolution happens **once per process**
    on first use. A long-lived caller sees a stable view until it explicitly
    asks for a refresh; a stale view is corrected by `repo refresh` / the
    refresh operation, which clears caches and re-fetches everything.
 
 A single-repository view (the same synthesised shape, scoped to one repository
 by URL or canonical name) is available for callers that want to browse one
-source in isolation.
+source in isolation. Naming a **configured** repository scopes to everything it
+offers, the catalogs it includes among them — that is what the user added.
+Naming an **included** catalog scopes to that catalog's own slice, which is how
+a caller asks where a package actually came from.
+
+### Merging an included catalog
+
+Within one configured repository, entries that name the same package are
+reduced to one. Precedence is: the repository's own `index.json` first, then
+its `includes[]` in declared order, shallower before deeper.
+
+- **Versions union.** Two catalogs offering different versions of one package
+  is the point of an include, so the merged entry lists both, re-sorted by
+  SemVer precedence.
+- **Local wins a true collision.** The same package at the same *version* from
+  two catalogs is the real conflict; the earlier contributor keeps it, and the
+  loser is reported by the refresh operation. It is not dropped silently — a
+  shadowed version is invisible in the catalog itself, and "this include
+  contributed nothing" must not read the same as "this include worked".
+- **Header fields follow `versions[0]` after the merge.** With several catalogs
+  contributing, "the first entry in the file" is no longer a meaningful source
+  for a package's description or icon. An icon URL is resolved against the
+  index that published that version, not against the including one.
+
+A package's `origin*` fields, and the same fields on every version entry, name
+the catalog the bytes come from. The download `url`, `rootHash` and `signature`
+are untouched by an include: an included package is fetched from, and verified
+against, the catalog that published it.
+
+### The includes document
+
+`logos-repo.json` does not carry the list; it carries `includesUrl`, and the
+document there holds it:
+
+```json
+{
+  "schemaVersion": 1,
+  "includes": [
+    { "repo": "https://example.org/team-a/logos-repo.json" },
+    { "repo": "https://example.org/team-b/logos-repo.json",
+      "packages": [{ "name": "storage_module", "version": "2.1.0" }] }
+  ]
+}
+```
+
+The split is the one `indexUrl` already makes. The identity card is hand-edited
+and changes almost never; what a catalog composes from moves on its own cadence,
+may be generated rather than written, and can be served from somewhere else
+entirely. `schemaVersion` is advisory, as it is in the other two documents — no
+client in this format gates on one.
+
+**Every failure to read it is a warning, never a `resolveError`.** An
+unreadable composition list says nothing about what the catalog itself
+publishes, and dropping the repository would turn one missing file into a
+blackout of everything it serves. That covers an absent document, a non-https
+`includesUrl`, unparseable JSON, a bare array where the object belongs, and an
+object with no `includes` key. The declared `includesUrl` is reported by the
+repository listing whether or not anything resolved from it — otherwise a
+catalog that meant to draw from others is indistinguishable from one that never
+tried.
+
+### Filtering an include
+
+An include with no `packages` list takes the whole catalog. With one, each
+element is either a bare package name (every version of it) or an object
+`{ name, version?, rootHash? }`. `version` is an npm-style range evaluated by
+the same SemVer implementation the dependency resolver uses, so a bare
+`"2.1.0"` is an exact pin. Two selectors naming one package union rather than
+intersect.
+
+The filter binds **downloads as well as listings**. A version an include
+excluded is not installable by name from that repository either — otherwise the
+pin would be advice rather than a rule.
+
+Naming an included catalog with `--repo` matches the first node in the walk
+carrying that name. A catalog reached twice by different paths — and therefore
+under different filters — is scoped to the first of them; scope by URL and the
+including catalog instead when the distinction matters.
+
+### Choosing what a download fetches
+
+Selecting a release is a pass of its own, ranked across every candidate
+repository rather than stopping at the first that can serve the name. A
+repository's listing merges versions contributed by the catalogs it includes,
+and `versions[0]` there is the release the user was shown, so a
+first-match-wins scan would hand them a different one — an older copy in the
+including catalog beating a newer one in an included catalog. Browse and
+install name the same release.
+
+The comparator is the one §6 describes, the same one the catalog sort and the
+dependency resolver use. Candidate order breaks an exact tie, which preserves
+the merge's local-wins rule: the configured repository is ranked before the
+catalogs it includes.
 
 ---
 
@@ -227,9 +348,11 @@ Key behaviors:
   entries are never short-circuited: the caller picked them explicitly, so they
   always resolve to a fresh catalog pick.
 - **Cross-repository tie-breaking.** When the same package name is published by
-  more than one repository, the newest version (by `releasedAt`) across all of
-  them wins — unless a dependency pins a `repositoryUrl`, which scopes the
-  search to that one source.
+  more than one repository, the highest version by **SemVer precedence** across
+  all of them wins; `releasedAt` only breaks a tie between entries sharing a
+  version. A dependency may pin a `repositoryUrl`, which scopes the search to
+  that one source — and because an included package carries the *configured*
+  repository's url, pinning covers the catalogs that repository includes.
 - **Unsatisfiable constraints.** If a dependency cannot be satisfied, the output
   contains an `{ error, name }` entry at the unsatisfied position and
   resolution stops. Callers must check for `error`.
