@@ -1617,8 +1617,13 @@ namespace {
 
 constexpr const char* kBRepo  = "https://b.local/logos-repo.json";
 constexpr const char* kBIndex = "https://b.local/index.json";
+constexpr const char* kBIncludes = "https://b.local/includes.json";
 constexpr const char* kCRepo  = "https://c.local/logos-repo.json";
 constexpr const char* kCIndex = "https://c.local/index.json";
+constexpr const char* kCIncludes = "https://c.local/includes.json";
+// The root here is the built-in default repository, so a test needs no config
+// file on disk to get a configured repo that draws from other catalogs.
+constexpr const char* kRootIncludes = "https://test.local/includes.json";
 
 // A version whose download URL and description both name the catalog serving
 // it, so a merged entry can be traced back to where each part came from.
@@ -1641,11 +1646,18 @@ json packageOf(const char* name, const json& versions) {
     return json{{"name", name}, {"versions", versions}};
 }
 
-std::string repoDoc(const char* name, const char* indexUrl, const json& includes) {
+// The identity card points at the includes document; it never carries the list
+// itself. `includesUrl` empty means the catalog draws from nothing.
+std::string repoDoc(const char* name, const char* indexUrl,
+                    const std::string& includesUrl = {}) {
     json j{{"schemaVersion", 1}, {"name", name}, {"displayName", name},
            {"indexUrl", indexUrl}, {"trustedSigners", json::array()}};
-    if (!includes.empty()) j["includes"] = includes;
+    if (!includesUrl.empty()) j["includesUrl"] = includesUrl;
     return j.dump();
+}
+
+std::string includesDoc(const json& includes) {
+    return json{{"schemaVersion", 1}, {"includes", includes}}.dump();
 }
 
 std::string indexDoc(const char* name, const json& packages) {
@@ -1653,14 +1665,14 @@ std::string indexDoc(const char* name, const json& packages) {
                 {"packages", packages}}.dump();
 }
 
-// The default repository is the root: it is always present, so a test needs no
-// config file on disk to get a configured repo with includes.
+// Stand up the root catalog with an includes document served beside it.
 std::shared_ptr<MockFetcher> rootIncluding(const json& includes,
                                            const json& rootPackages,
                                            MockFetcher* seed = nullptr) {
     std::shared_ptr<MockFetcher> f(seed ? seed : new MockFetcher);
-    f->repoJson  = repoDoc("root", kIndexUrl, includes);
+    f->repoJson  = repoDoc("root", kIndexUrl, kRootIncludes);
     f->indexJson = indexDoc("root", rootPackages);
+    f->byUrl[kRootIncludes] = includesDoc(includes);
     return f;
 }
 
@@ -1698,7 +1710,7 @@ TEST(CatalogIncludes, WholeCatalogIsDrawnIn) {
     auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
                            json::array({packageOf("root_module",
                                json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")})),
         packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2")})),
@@ -1719,7 +1731,7 @@ TEST(CatalogIncludes, WholeCatalogIsDrawnIn) {
 // as nothing at all. Provenance travels in the origin* fields instead.
 TEST(CatalogIncludes, EntriesAreStampedWithRootAndOrigin) {
     auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}), json::array());
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
 
@@ -1741,7 +1753,7 @@ TEST(CatalogIncludes, NameFilterSelectsOnePackage) {
     auto f = rootIncluding(
         json::array({json{{"repo", kBRepo}, {"packages", json::array({"b_two"})}}}),
         json::array());
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")})),
         packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2"),
@@ -1764,7 +1776,7 @@ TEST(CatalogIncludes, ExactVersionPinSelectsOneRelease) {
                           {"packages", json::array({json{{"name", "b_two"},
                                                          {"version", "1.0.0"}}})}}}),
         json::array());
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2"),
                                         versionFrom("b", "b_two", "1.0.0", "h_b1")}))}));
@@ -1783,7 +1795,7 @@ TEST(CatalogIncludes, VersionRangeSelectsASubset) {
                           {"packages", json::array({json{{"name", "b_two"},
                                                          {"version", "^1.0.0"}}})}}}),
         json::array());
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_c"),
                                         versionFrom("b", "b_two", "1.2.0", "h_b"),
@@ -1803,7 +1815,7 @@ TEST(CatalogIncludes, RootHashPinSelectsOneBuild) {
                           {"packages", json::array({json{{"name", "b_two"},
                                                          {"rootHash", "h_second"}}})}}}),
         json::array());
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_two", json::array({versionFrom("b", "b_two", "1.0.0", "h_first"),
                                         versionFrom("b", "b_two", "1.0.0", "h_second")}))}));
@@ -1823,7 +1835,7 @@ TEST(CatalogIncludes, VersionsFromTwoCatalogsAreUnioned) {
         json::array({json{{"repo", kBRepo}}}),
         json::array({packageOf("shared",
             json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}));
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("shared", json::array({versionFrom("b", "shared", "1.1.0", "h_b")}))}));
 
@@ -1847,7 +1859,7 @@ TEST(CatalogIncludes, LocalCopyWinsACollisionAndTheLossIsReported) {
         json::array({json{{"repo", kBRepo}}}),
         json::array({packageOf("shared",
             json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}));
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("shared", json::array({versionFrom("b", "shared", "1.0.0", "h_b")}))}));
 
@@ -1869,8 +1881,9 @@ TEST(CatalogIncludes, CycleTerminates) {
     auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
                            json::array({packageOf("root_module",
                                json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex,
-                                json::array({json{{"repo", lgpd::kDefaultRepositoryUrl}}}));
+    f->byUrl[kBRepo]     = repoDoc("b", kBIndex, kBIncludes);
+    f->byUrl[kBIncludes] =
+        includesDoc(json::array({json{{"repo", lgpd::kDefaultRepositoryUrl}}}));
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
 
@@ -1897,11 +1910,13 @@ TEST(CatalogIncludes, DiamondStillResolves) {
     // Both B and C include D; D is served at b.local's sibling URL.
     const char* kDRepo  = "https://d.local/logos-repo.json";
     const char* kDIndex = "https://d.local/index.json";
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array({json{{"repo", kDRepo}}}));
-    f->byUrl[kBIndex] = indexDoc("b", json::array());
-    f->byUrl[kCRepo]  = repoDoc("c", kCIndex, json::array({json{{"repo", kDRepo}}}));
-    f->byUrl[kCIndex] = indexDoc("c", json::array());
-    f->byUrl[kDRepo]  = repoDoc("d", kDIndex, json::array());
+    f->byUrl[kBRepo]     = repoDoc("b", kBIndex, kBIncludes);
+    f->byUrl[kBIncludes] = includesDoc(json::array({json{{"repo", kDRepo}}}));
+    f->byUrl[kBIndex]    = indexDoc("b", json::array());
+    f->byUrl[kCRepo]     = repoDoc("c", kCIndex, kCIncludes);
+    f->byUrl[kCIncludes] = includesDoc(json::array({json{{"repo", kDRepo}}}));
+    f->byUrl[kCIndex]    = indexDoc("c", json::array());
+    f->byUrl[kDRepo]  = repoDoc("d", kDIndex);
     f->byUrl[kDIndex] = indexDoc("d", json::array({
         packageOf("d_one", json::array({versionFrom("d", "d_one", "1.0.0", "h_d")}))}));
 
@@ -1940,7 +1955,7 @@ TEST(CatalogIncludes, FollowIncludesOffKeepsOnlyConfiguredCatalogs) {
     auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
                            json::array({packageOf("root_module",
                                json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
 
@@ -1966,7 +1981,7 @@ TEST(CatalogIncludes, MalformedEntriesWarnWithoutBreakingTheCatalog) {
         }),
         json::array({packageOf("root_module",
             json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
 
@@ -1991,7 +2006,7 @@ TEST(CatalogIncludes, DownloadHonoursTheIncludeFilter) {
                           {"packages", json::array({json{{"name", "b_two"},
                                                          {"version", "1.0.0"}}})}}}),
         json::array(), seed);
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2"),
                                         versionFrom("b", "b_two", "1.0.0", "h_b1")}))}));
@@ -2017,7 +2032,7 @@ TEST(CatalogIncludes, RepoScopeResolvesRootAndOriginDifferently) {
     auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
                            json::array({packageOf("root_module",
                                json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
 
@@ -2043,9 +2058,11 @@ TEST(CatalogIncludes, DepthIsCapped) {
         const std::string next  = "https://lvl" + std::to_string(i + 1) + ".local/logos-repo.json";
         const std::string name  = "lvl" + std::to_string(i);
         const std::string index = base + "/index.json";
+        const std::string incUrl = base + "/includes.json";
         f->byUrl[base + "/logos-repo.json"] =
-            repoDoc(name.c_str(), index.c_str(),
-                    i < 6 ? json::array({json{{"repo", next}}}) : json::array());
+            repoDoc(name.c_str(), index.c_str(), i < 6 ? incUrl : std::string{});
+        if (i < 6)
+            f->byUrl[incUrl] = includesDoc(json::array({json{{"repo", next}}}));
         f->byUrl[index] = indexDoc(name.c_str(), json::array({
             packageOf(name.c_str(),
                       json::array({versionFrom(name, name.c_str(), "1.0.0", "h")}))}));
@@ -2076,7 +2093,7 @@ TEST(CatalogIncludes, DownloadPicksTheVersionTheCatalogAdvertises) {
         json::array({packageOf("shared",
             json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}),
         seed);
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("shared", json::array({versionFrom("b", "shared", "1.2.0", "h_b")}))}));
 
@@ -2103,7 +2120,7 @@ TEST(CatalogIncludes, DownloadPrefersTheLocalCopyOnAnExactTie) {
         json::array({packageOf("shared",
             json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}),
         seed);
-    f->byUrl[kBRepo]  = repoDoc("b", kBIndex, json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
     f->byUrl[kBIndex] = indexDoc("b", json::array({
         packageOf("shared", json::array({versionFrom("b", "shared", "1.0.0", "h_b")}))}));
 
@@ -2113,4 +2130,137 @@ TEST(CatalogIncludes, DownloadPrefersTheLocalCopyOnAnExactTie) {
     std::string err;
     lib.downloadPackage("", "shared", err);
     EXPECT_EQ(seed->seenUrl, "https://root.local/shared-1.0.0.lgx");
+}
+
+// ─── the includes document ────────────────────────────────────────────────────
+//
+// `includesUrl` is a second fetch, so it is a second thing that can fail. None
+// of these may cost the catalog its own packages: an unreadable composition
+// list says nothing about what the catalog itself publishes.
+
+TEST(IncludesDocument, UnreachableDocumentIsAWarningNotAnError) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl.erase(kRootIncludes);  // declared, not served
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("root_module"), 1u);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    EXPECT_EQ(r.value("includes", json::array()).size(), 0u);
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("unavailable"),
+              std::string::npos);
+}
+
+TEST(IncludesDocument, MalformedDocumentIsAWarningNotAnError) {
+    auto f = rootIncluding(json::array(),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kRootIncludes] = "{ not json";
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("root_module"), 1u);
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    EXPECT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+}
+
+// The wrapper is what makes the document versionable. A bare array — the shape
+// the list had while it lived inline — is not it.
+TEST(IncludesDocument, DocumentWithoutAnIncludesArrayWarns) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->byUrl[kRootIncludes] = json::array({json{{"repo", kBRepo}}}).dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("bare array"),
+              std::string::npos);
+}
+
+// The other shape of the same mistake: an object that simply forgot the key.
+TEST(IncludesDocument, ObjectWithoutAnIncludesKeyWarns) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->byUrl[kRootIncludes] = json{{"schemaVersion", 1}}.dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("'includes' array"),
+              std::string::npos);
+}
+
+// schemaVersion is advisory here, as it is everywhere else in this format. A
+// document that omits it still resolves rather than silently contributing
+// nothing.
+TEST(IncludesDocument, SchemaVersionIsAdvisory) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->byUrl[kRootIncludes] =
+        json{{"includes", json::array({json{{"repo", kBRepo}}})}}.dump();
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("b_one"), 1u);
+}
+
+TEST(IncludesDocument, NonHttpsUrlIsRefusedWithAWarning) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->repoJson = repoDoc("root", kIndexUrl, "http://insecure.local/includes.json");
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("https"),
+              std::string::npos);
+}
+
+// A non-string here used to throw out of the whole logos-repo.json parse and
+// drop a repository that was otherwise fine — the same shape as the bug where
+// one array-valued manifest field discarded an entire catalog.
+TEST(IncludesDocument, NonStringIncludesUrlDoesNotDropTheRepository) {
+    auto f = rootIncluding(json::array(),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    json repo = json::parse(f->repoJson);
+    repo["includesUrl"] = json::array({"https://b.local/includes.json"});
+    f->repoJson = repo.dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("root_module"), 1u);
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    EXPECT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+}
+
+// The declared URL is reported whether or not anything resolved from it —
+// otherwise a catalog that meant to draw from others looks like one that never
+// tried.
+TEST(IncludesDocument, DeclaredUrlIsReportedEvenWhenItResolvesToNothing) {
+    auto f = rootIncluding(json::array(), json::array());
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_EQ(r.value("includesUrl", ""), kRootIncludes);
+    EXPECT_EQ(r.value("includes", json::array()).size(), 0u);
 }

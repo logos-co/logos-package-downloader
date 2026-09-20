@@ -412,13 +412,17 @@ public:
 
 // ─── logos-repo.json + index.json parsers ─────────────────────────────────────
 
-// ─── includes[] ───────────────────────────────────────────────────────────────
+// ─── the includes document ────────────────────────────────────────────────────
 //
-// A malformed include entry is a warning, never a parse failure. The rest of
-// logos-repo.json is still good, and refusing the whole file would take a
-// working catalog offline over a typo in a field that is purely additive.
-// The complaints land in `includeWarnings` and are reported; they are not
-// swallowed.
+// `logos-repo.json` carries an `includesUrl`; the document it points at holds
+// the list. Split for the same reason `indexUrl` is separate: the identity card
+// is hand-edited and near-static, while what a catalog composes from moves on
+// its own cadence and can be generated and served from somewhere else entirely.
+//
+// A malformed entry is a warning, never a parse failure. The catalog's own
+// packages are still good, and refusing them over a typo in a purely additive
+// list would take a working catalog offline. The complaints land in
+// `includeWarnings` and are reported; they are not swallowed.
 void parseIncludes(const json& arr, Repository& dst) {
     for (const auto& inc : arr) {
         if (!inc.is_object()) {
@@ -480,6 +484,39 @@ void parseIncludes(const json& arr, Repository& dst) {
     }
 }
 
+// Parse the document `includesUrl` points at:
+//   { "schemaVersion": 1, "includes": [ { repo, packages? }, ... ] }
+//
+// `schemaVersion` is advisory here, exactly as it is in logos-repo.json and
+// index.json — no client in this format gates on one, and starting here would
+// make this document the odd one out.
+void parseIncludesDoc(const std::string& body, Repository& dst) {
+    json j;
+    try {
+        j = json::parse(body);
+    } catch (const json::exception& e) {
+        dst.includeWarnings.push_back(
+            std::string("includes document is not valid JSON: ") + e.what());
+        return;
+    }
+    if (!j.is_object()) {
+        // A bare array is the specific mistake worth naming: it is the shape
+        // the list has inside the document, so it is what a hand-written file
+        // ends up being when the wrapper is forgotten.
+        dst.includeWarnings.push_back(
+            j.is_array()
+                ? "includes document is a bare array; it must be an object "
+                  "carrying the 'includes' array"
+                : "includes document is not a JSON object");
+        return;
+    }
+    if (!j.contains("includes") || !j["includes"].is_array()) {
+        dst.includeWarnings.push_back("includes document has no 'includes' array");
+        return;
+    }
+    parseIncludes(j["includes"], dst);
+}
+
 bool parseLogosRepoJson(const std::string& body, Repository& dst, std::string& err) {
     try {
         auto j = json::parse(body);
@@ -507,10 +544,14 @@ bool parseLogosRepoJson(const std::string& body, Repository& dst, std::string& e
         }
         dst.includes.clear();
         dst.includeWarnings.clear();
-        if (j.contains("includes") && j["includes"].is_array()) {
-            parseIncludes(j["includes"], dst);
-        } else if (j.contains("includes")) {
-            dst.includeWarnings.push_back("'includes' is not an array — ignored");
+        dst.includesUrl.clear();
+        if (j.contains("includesUrl")) {
+            // Checked before value(): a non-string here would throw out of the
+            // whole parse and drop a repository that is otherwise fine.
+            if (j["includesUrl"].is_string())
+                dst.includesUrl = j["includesUrl"].get<std::string>();
+            else
+                dst.includeWarnings.push_back("'includesUrl' is not a string — ignored");
         }
         return true;
     } catch (const json::exception& e) {
@@ -642,6 +683,7 @@ struct RepositoryRegistry::Impl {
         // Stale includes from a previous resolve must not survive a failed
         // one, or an unreachable catalog keeps pulling in the catalogs it
         // named the last time it answered.
+        r.includesUrl.clear();
         r.includes.clear();
         r.includeWarnings.clear();
         if (!isHttpsUrl(r.url)) {
@@ -665,12 +707,36 @@ struct RepositoryRegistry::Impl {
         parsed.description.clear();
         parsed.homepage.clear();
         parsed.indexUrl.clear();
+        parsed.includesUrl.clear();
         parsed.trustedSignerDids.clear();
         if (!parseLogosRepoJson(body, parsed, err)) {
             r.resolveError = "logos-repo.json: " + err;
             return;
         }
+        fetchIncludesDoc(parsed);
         r = std::move(parsed);
+    }
+
+    // Resolve `includesUrl` into `includes`. Every failure here is a warning,
+    // never a resolveError: a catalog whose composition list is unreadable
+    // still publishes its own packages, and dropping it would turn one
+    // unreachable file into a blackout of everything it serves.
+    void fetchIncludesDoc(Repository& r) {
+        if (r.includesUrl.empty()) return;
+        if (!isHttpsUrl(r.includesUrl)) {
+            r.includeWarnings.push_back(
+                "'includesUrl' is not an https URL: " + r.includesUrl);
+            return;
+        }
+        std::string body;
+        const FetchResult result = fetcher->get(r.includesUrl, body);
+        if (!result.ok) {
+            r.includeWarnings.push_back(
+                "includes document unavailable: " + r.includesUrl +
+                (result.error.empty() ? "" : " — " + result.error));
+            return;
+        }
+        parseIncludesDoc(body, r);
     }
 
     // The configured set, without taking `mu` — both list() and listAll()
@@ -1265,6 +1331,7 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
         e["indexUrl"] = r.indexUrl;
         e["trustedSignerDids"] = r.trustedSignerDids;
         e["resolveError"] = r.resolveError;
+        e["includesUrl"] = r.includesUrl;
         // The catalogs this one pulls in, as resolved — not as declared. A
         // declared include that could not be fetched appears here with its
         // own resolveError, which is the only place that failure is visible:

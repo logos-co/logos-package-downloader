@@ -59,9 +59,9 @@ struct PackageSelector {
     std::string rootHash;
 };
 
-/// One entry of `logos-repo.json#includes[]`: another catalog this one draws
-/// packages from. `allPackages` is true when the entry carries no `packages`
-/// filter, i.e. "take the whole catalog".
+/// One entry of the includes document's `includes[]`: another catalog this one
+/// draws packages from. `allPackages` is true when the entry carries no
+/// `packages` filter, i.e. "take the whole catalog".
 struct IncludeSpec {
     std::string repoUrl;
     bool allPackages = true;
@@ -102,12 +102,22 @@ struct Repository {
     std::vector<std::string> trustedSignerDids;
     std::string resolveError; ///< non-empty when the fetch / parse failed
 
-    /// `includes[]` as advertised by this repository's own logos-repo.json.
-    /// Empty for a catalog that draws in nothing.
+    /// `includesUrl` from this repository's logos-repo.json: where its list of
+    /// drawn-from catalogs is published. Empty when it declares none.
+    ///
+    /// A separate document for the same reason `indexUrl` is one: the identity
+    /// card is hand-edited and changes almost never, while what a catalog
+    /// composes from changes on its own cadence and may be generated.
+    std::string includesUrl;
+
+    /// The includes document's `includes[]`, as fetched from `includesUrl`.
+    /// Empty for a catalog that draws in nothing, and also when the document
+    /// could not be read — see `includeWarnings`.
     std::vector<IncludeSpec> includes;
 
-    /// Non-fatal complaints about this repository's `includes[]` — a
-    /// malformed entry, a non-https URL, a cycle, a hit cap. Kept separate
+    /// Non-fatal complaints about this repository's includes — an unreadable
+    /// includes document, a malformed entry, a non-https URL, a cycle, a hit
+    /// cap. Kept separate
     /// from `resolveError`, which means "drop this repository": one bad
     /// include must not blackout a catalog that is otherwise fine. Reported
     /// by listRepositoriesJson() and refreshCatalogs().
@@ -168,7 +178,7 @@ public:
     /// config file holds.
     std::vector<Repository> listAll() const;
 
-    /// Whether refresh() follows `includes[]`. Default true. Turning it off
+    /// Whether refresh() follows `includesUrl`. Default true. Turning it off
     /// confines the client to the catalogs the user configured themselves —
     /// an include is a real delegation, since the included catalog's operator
     /// chooses what appears under the including one.
@@ -237,7 +247,8 @@ public:
     /// JSON array of the CONFIGURED repositories. Each element:
     /// `{ url, sourceOwner, sourceRepo, sourceHost, enabled, isDefault,
     ///    name, displayName, description, homepage, indexUrl,
-    ///    trustedSignerDids[], resolveError, includes[], includeWarnings[] }`.
+    ///    trustedSignerDids[], resolveError, includesUrl, includes[],
+    ///    includeWarnings[] }`.
     ///
     /// `includes[]` lists the catalogs this one draws from AS RESOLVED, each
     /// `{ url, viaUrl, depth, name, displayName, indexUrl, allPackages,

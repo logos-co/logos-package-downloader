@@ -61,9 +61,10 @@ source of truth — it federates several and presents them as one.
 
 | Concept | Meaning |
 |---------|---------|
-| **Repository** | A package source, identified by the URL of its `logos-repo.json`. That document is the repository's identity card: canonical `name`, human `displayName`, `description`, `homepage`, the `indexUrl` where its package index lives, a list of `trustedSigners` (each with a `did`), and an optional `includes` list naming other catalogs it draws from. |
+| **Repository** | A package source, identified by the URL of its `logos-repo.json`. That document is the repository's identity card: canonical `name`, human `displayName`, `description`, `homepage`, the `indexUrl` where its package index lives, a list of `trustedSigners` (each with a `did`), and an optional `includesUrl` pointing at the catalogs it draws from. |
 | **Registry** | The set of repositories the client knows about: one hardcoded **default repository** plus any number of **user repositories**. The registry is what `add`/`remove`/`enable`/`disable` operate on. |
-| **Include** | An entry of a repository's `logos-repo.json#includes[]`: another catalog it draws packages from, optionally narrowed to named packages or version ranges. Includes are resolved at fetch time and contribute to the including repository's own listing. |
+| **Includes document** | The document a repository's `includesUrl` points at: `{ schemaVersion, includes[] }`. Separate from the identity card for the same reason `indexUrl` is — the card is near-static, what a catalog composes from is not. |
+| **Include** | One entry of that document: another catalog this one draws packages from, optionally narrowed to named packages or version ranges. Includes are resolved at fetch time and contribute to the including repository's own listing. |
 | **Derived repository** | A repository the client reached by following an include, rather than one the user configured. Derived repositories are rebuilt on every refresh and are never written to the config. |
 | **Index** | A repository's package index (`index.json`): a list of packages, each with one or more **versions**. Each version carries a `releasedAt` date, the download `url` of its `.lgx`, size/checksum fields, a `rootHash`, an embedded `manifest`, and an optional `signature`. |
 | **Catalog** | The merged, synthesised view across all *enabled* repositories. This is the unit the browse/search/info/resolve operations work against. |
@@ -100,7 +101,7 @@ User repositories are persisted to a JSON config file with a stable schema:
 ```
 
 `followIncludes` (default `true`) is the client's opt-out from the include
-mechanism as a whole. An include is a real delegation — the included catalog's
+mechanism as a whole: with it off, `includesUrl` is not even fetched. An include is a real delegation — the included catalog's
 operator decides what appears under the including one — so a user who wants
 only the sources they added themselves can set it to `false`, or pass
 `--no-includes`.
@@ -121,8 +122,12 @@ by an **index merge**:
 
 ```
    for each repository in the registry:
-       fetch logos-repo.json       ──► resolve name, indexUrl, signers, includes
+       fetch logos-repo.json       ──► resolve name, indexUrl, signers,
+                                        includesUrl
                                         (failure recorded per-repo, not fatal)
+       fetch includesUrl, if any   ──► includes[]
+                                        (failure recorded as a WARNING; the
+                                         repository's own packages survive it)
        follow includes[] breadth-first  ──► derived repositories
                                         (bounded; cycles and caps recorded)
 
@@ -191,6 +196,38 @@ A package's `origin*` fields, and the same fields on every version entry, name
 the catalog the bytes come from. The download `url`, `rootHash` and `signature`
 are untouched by an include: an included package is fetched from, and verified
 against, the catalog that published it.
+
+### The includes document
+
+`logos-repo.json` does not carry the list; it carries `includesUrl`, and the
+document there holds it:
+
+```json
+{
+  "schemaVersion": 1,
+  "includes": [
+    { "repo": "https://example.org/team-a/logos-repo.json" },
+    { "repo": "https://example.org/team-b/logos-repo.json",
+      "packages": [{ "name": "storage_module", "version": "2.1.0" }] }
+  ]
+}
+```
+
+The split is the one `indexUrl` already makes. The identity card is hand-edited
+and changes almost never; what a catalog composes from moves on its own cadence,
+may be generated rather than written, and can be served from somewhere else
+entirely. `schemaVersion` is advisory, as it is in the other two documents — no
+client in this format gates on one.
+
+**Every failure to read it is a warning, never a `resolveError`.** An
+unreadable composition list says nothing about what the catalog itself
+publishes, and dropping the repository would turn one missing file into a
+blackout of everything it serves. That covers an absent document, a non-https
+`includesUrl`, unparseable JSON, a bare array where the object belongs, and an
+object with no `includes` key. The declared `includesUrl` is reported by the
+repository listing whether or not anything resolved from it — otherwise a
+catalog that meant to draw from others is indistinguishable from one that never
+tried.
 
 ### Filtering an include
 

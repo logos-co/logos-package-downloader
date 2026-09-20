@@ -252,6 +252,11 @@ int cmdRepoList(const CliOpts& o) {
                   << "    url:      " << r.value("url", "") << "\n";
         if (!r.value("indexUrl", "").empty())
             std::cout << "    indexUrl: " << r.value("indexUrl", "") << "\n";
+        // Printed whenever it is declared, even when nothing resolved from it:
+        // an includes document that failed to load leaves no `includes` rows,
+        // and without this line there is nothing to say one was expected.
+        if (!r.value("includesUrl", "").empty())
+            std::cout << "    includes: " << r.value("includesUrl", "") << "\n";
         for (const auto& inc : r.value("includes", json::array())) {
             std::string incTag;
             if (!inc.value("resolveError", "").empty())
@@ -267,14 +272,14 @@ int cmdRepoList(const CliOpts& o) {
                 inc.value("depth", 1) > 1
                     ? "  via " + inc.value("viaUrl", std::string{})
                     : std::string{};
-            std::cout << "    includes: " << incName
+            std::cout << "      <- " << incName
                       << "  (" << inc.value("url", "") << ")"
                       << via << incTag << "\n";
             if (inc.value("allPackages", true)) {
-                std::cout << "      packages: (all)\n";
+                std::cout << "         packages: (all)\n";
             } else {
                 for (const auto& sel : inc.value("packages", json::array())) {
-                    std::cout << "      packages: " << sel.value("name", "");
+                    std::cout << "         packages: " << sel.value("name", "");
                     if (!sel.value("version", "").empty())
                         std::cout << " @ " << sel.value("version", "");
                     if (!sel.value("rootHash", "").empty())
