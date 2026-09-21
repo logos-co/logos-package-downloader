@@ -1828,6 +1828,55 @@ TEST(CatalogIncludes, RootHashPinSelectsOneBuild) {
     EXPECT_EQ(e["versions"][0].value("rootHash", ""), "h_second");
 }
 
+// Two selectors naming ONE package union rather than intersect: a settled
+// release plus one build under test, without a range contrived to span both.
+// `rootHash` has no range form, so several builds can only be asked for that way.
+TEST(CatalogIncludes, TwoSelectorsForOnePackageUnion) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({
+                               json{{"name", "b_two"}, {"version", "1.0.0"}},
+                               json{{"name", "b_two"}, {"rootHash", "h_three"}}})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "3.0.0", "h_three"),
+                                        versionFrom("b", "b_two", "2.0.0", "h_two"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_one")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    // Neither selector names 2.0.0; intersecting the two would have kept nothing.
+    EXPECT_EQ(catalogVersions(lib).at("b_two"),
+              std::vector<std::string>({"3.0.0", "1.0.0"}));
+}
+
+// The other half of that rule: WITHIN one selector `version` and `rootHash`
+// both have to hold, so the pair names a build rather than either field alone.
+TEST(CatalogIncludes, VersionAndRootHashInOneSelectorIntersect) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({json{{"name", "b_two"},
+                                                         {"version", "1.0.0"},
+                                                         {"rootHash", "h_second"}}})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_second"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_second"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_first")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    // 2.0.0 shares the hash and 1.0.0/h_first the version; only the pair passes.
+    const json e = catalogEntry(lib, "b_two");
+    ASSERT_EQ(e["versions"].size(), 1u);
+    EXPECT_EQ(e["versions"][0]["manifest"].value("version", ""), "1.0.0");
+    EXPECT_EQ(e["versions"][0].value("rootHash", ""), "h_second");
+}
+
 // Two catalogs publishing DIFFERENT versions of one package is the point of an
 // include: the versions union rather than one entry replacing the other.
 TEST(CatalogIncludes, VersionsFromTwoCatalogsAreUnioned) {
