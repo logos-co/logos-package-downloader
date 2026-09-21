@@ -28,7 +28,18 @@ public:
     std::vector<std::string> fileGets;  // URLs passed to getToFile
     std::string lastDest;               // path passed to the last getToFile
     bool fileGetSucceeds = false;       // result returned by getToFile
+    // Extra per-URL responses, consulted first. Lets a test stand up a
+    // SECOND repository with its own logos-repo.json, which the two canned
+    // slots above can't express.
+    std::map<std::string, std::string> byUrl;
+
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        auto it = byUrl.find(url);
+        if (it != byUrl.end()) {
+            out = it->second;
+            return {true, {}};
+        }
+
         if (url == lgpd::kDefaultRepositoryUrl) {
             out = repoJson;
             return {true, {}};
@@ -103,6 +114,21 @@ std::shared_ptr<MockFetcher> catalogFetcher(const json& uiDepRange,
         })},
     }.dump();
     return f;
+}
+
+// A logos-repo.json body. `name`/`displayName` are exactly what the remote
+// says they are — which is the whole point of the qualification tests below.
+std::string repoManifest(const char* name, const char* displayName) {
+    return json{{"schemaVersion", 1}, {"name", name},
+                {"displayName", displayName}, {"indexUrl", kIndexUrl},
+                {"trustedSigners", json::array()}}.dump();
+}
+
+// One repository entry out of listRepositoriesJson, by URL.
+json repoByUrl(lgpd::PackageDownloaderLib& lib, const std::string& url) {
+    for (const auto& e : json::parse(lib.listRepositoriesJson()))
+        if (e.value("url", "") == url) return e;
+    return json::object();
 }
 
 // Collect resolved entries by name -> list of versions.
@@ -956,6 +982,82 @@ TEST(Registry, RefreshHydratesDisabledDefaultOnStartup) {
     std::error_code ec; fs::remove(cfg, ec);
 }
 
+// ─── Repository source ───────────────────────────────────────────────────────
+//
+// `displayName` is remote-supplied and not unique, so UIs disambiguate with
+// the source parsed out of the URL. The lib reports those as facts; deciding
+// when to surface them is the UI's call and is tested there.
+
+TEST(Registry, SourceFieldsSplitAGitHubUrl) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_src_gh_" + std::to_string(std::rand()) + ".json");
+    auto mock = std::make_shared<MockFetcher>();
+    mock->repoJson = repoManifest("logos-modules-official", "Logos Official");
+    mock->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "x"},
+                           {"packages", json::array()}}.dump();
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(mock);
+
+    const auto r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_EQ(r.value("sourceOwner", ""), "logos-co");
+    EXPECT_EQ(r.value("sourceRepo",  ""), "logos-modules-release");
+    EXPECT_EQ(r.value("sourceHost",  ""), "raw.githubusercontent.com");
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// The real-world case: a fork whose logos-repo.json is byte-identical to the
+// official one, so `name`, `displayName` AND `indexUrl` all collide. Only the
+// URL separates them, which is why the source fields exist.
+TEST(Registry, SourceOwnerSeparatesAForkClaimingTheSameName) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_src_fork_" + std::to_string(std::rand()) + ".json");
+    const std::string forkUrl =
+        "https://raw.githubusercontent.com/0x-r4bbit/logos-modules-release-upstream/main/logos-repo.json";
+
+    auto mock = std::make_shared<MockFetcher>();
+    mock->repoJson = repoManifest("logos-modules-official", "Logos Official");
+    mock->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "x"},
+                           {"packages", json::array()}}.dump();
+    mock->byUrl[forkUrl] = repoManifest("logos-modules-official", "Logos Official");
+
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(mock);
+    const auto err = lib.registry().addRepository(forkUrl);
+    ASSERT_TRUE(err.empty()) << err;
+
+    const auto def  = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    const auto fork = repoByUrl(lib, forkUrl);
+    // Every name field collides...
+    EXPECT_EQ(def.value("displayName", ""), fork.value("displayName", ""));
+    EXPECT_EQ(def.value("name", ""),        fork.value("name", ""));
+    // ...and the source is what still tells them apart.
+    EXPECT_EQ(def.value("sourceOwner", ""),  "logos-co");
+    EXPECT_EQ(fork.value("sourceOwner", ""), "0x-r4bbit");
+    EXPECT_EQ(fork.value("sourceRepo", ""),  "logos-modules-release-upstream");
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// Off GitHub there is no owner/repo to parse. Both come back empty and the
+// host carries the identification — UIs fall back to it.
+TEST(Registry, SourceOwnerIsEmptyOffGitHubAndHostCarriesIt) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_src_host_" + std::to_string(std::rand()) + ".json");
+    const std::string url = "https://packages.acme.dev/logos/logos-repo.json";
+
+    auto mock = std::make_shared<MockFetcher>();
+    mock->repoJson = repoManifest("logos-modules-official", "Logos Official");
+    mock->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "x"},
+                           {"packages", json::array()}}.dump();
+    mock->byUrl[url] = repoManifest("acme-internal", "Internal Tools");
+
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(mock);
+    ASSERT_TRUE(lib.registry().addRepository(url).empty());
+
+    const auto r = repoByUrl(lib, url);
+    EXPECT_EQ(r.value("sourceOwner", ""), "");
+    EXPECT_EQ(r.value("sourceRepo",  ""), "");
+    EXPECT_EQ(r.value("sourceHost",  ""), "packages.acme.dev");
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
 TEST(Catalog, ReturnsJsonArrayWhenNoNetwork) {
     // No real network is required because the lib lazy-fetches per repo
     // and degrades to empty results on failure.
@@ -1011,6 +1113,77 @@ TEST(Catalog, IconAbsentWhenNoTopLevelIcon) {
     auto catalog = json::parse(lib.getCatalogJson());
     ASSERT_EQ(catalog.size(), 1u);
     EXPECT_FALSE(catalog[0].contains("icon"));
+}
+
+TEST(Catalog, ArrayValuedProvidesKeepsTheWholeRepo) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    const json provides = json::array({ json{{"intent", "evm.rpc.configure"}} });
+    json withIntents = makeVersion("0.1.0", "h_010", json::array());
+    withIntents["manifest"]["name"] = "widget";
+    withIntents["manifest"]["provides"] = provides;
+    json plain = makeVersion("0.1.0", "h_020", json::array());
+    plain["manifest"]["name"] = "gadget";
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({withIntents})}},
+            json{{"name", "gadget"}, {"versions", json::array({plain})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto catalog = json::parse(lib.getCatalogJson());
+    // `provides` is an array; reading it as a string threw and the catch
+    // around the loop swallowed every package in the repo, not just this one.
+    ASSERT_EQ(catalog.size(), 2u);
+    EXPECT_EQ(catalog[0]["provides"], provides);
+    EXPECT_EQ(catalog[1]["provides"], json::array());
+}
+
+TEST(Catalog, AMalformedFieldCostsOnlyItsOwnPackage) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json bad = makeVersion("0.1.0", "h_010", json::array());
+    bad["manifest"]["name"] = "widget";
+    bad["manifest"]["display_name"] = json::array({"not", "a", "string"});
+    json good = makeVersion("0.1.0", "h_020", json::array());
+    good["manifest"]["name"] = "gadget";
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({bad})}},
+            json{{"name", "gadget"}, {"versions", json::array({good})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto catalog = json::parse(lib.getCatalogJson());
+    ASSERT_EQ(catalog.size(), 1u);
+    EXPECT_EQ(catalog[0].value("name", ""), "gadget");
+}
+
+TEST(Catalog, ScopedByNameWorksBeforeAnExplicitRefresh) {
+    auto f = std::make_shared<MockFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json v = makeVersion("0.1.0", "h_010", json::array());
+    v["manifest"]["name"] = "widget";
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({
+            json{{"name", "widget"}, {"versions", json::array({v})}},
+        })},
+    }.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    // Both the name and the indexUrl come from logos-repo.json, so a lookup
+    // that runs before metadata resolution matches nothing / fetches nothing.
+    auto byName = json::parse(lib.getCatalogForRepoJson("test"));
+    ASSERT_EQ(byName.size(), 1u);
+    EXPECT_EQ(byName[0].value("name", ""), "widget");
 }
 
 // ─── Dependency signer pin ────────────────────────────────────────────────────
@@ -1555,4 +1728,793 @@ TEST(FetchDestination, DestinationContainsPackageVersion) {
 
     // Check the filename starts with blockchain_module-0.2.0.lgx
     EXPECT_EQ(filename.substr(0, expected.size()), expected);
+}
+
+// ─── Download staging + failure attribution ──────────────────────────────────
+
+namespace {
+
+// Captures the path downloadPackage asked for and stops there: producing a
+// real .lgx is unnecessary to observe WHERE the transfer was staged.
+class PathCapturingFetcher : public MockFetcher {
+public:
+    std::string seenPath;
+    lgpd::FetchResult getToFile(const std::string&, const std::string& path) override {
+        seenPath = path;
+        return {false, "stopped by test"};
+    }
+};
+
+// Serves logos-repo.json but fails index.json, i.e. a resolved repository
+// whose catalog cannot be read.
+class IndexlessFetcher : public MockFetcher {
+public:
+    lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        if (url == lgpd::kDefaultRepositoryUrl) {
+            out = repoJson;
+            return {true, {}};
+        }
+        return {false, "connection refused"};
+    }
+};
+
+std::shared_ptr<MockFetcher> repoWith(MockFetcher* seed, const json& packages) {
+    std::shared_ptr<MockFetcher> f(seed);
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    f->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "test"},
+                        {"packages", packages}}.dump();
+    return f;
+}
+
+json onePackage(const char* name, const char* ver) {
+    json v = makeVersion(ver, "h_stage", json::array());
+    v["manifest"]["name"] = name;
+    return json::array({json{{"name", name}, {"versions", json::array({v})}}});
+}
+
+}  // namespace
+
+// The published name is package+version, so staging in the shared temp ROOT
+// let two accounts on one host collide on a single path: the loser cannot
+// overwrite a file it does not own, and cannot unlink it either because the
+// temp root is sticky. Staging must therefore happen somewhere private.
+TEST(DownloadStaging, StagesOutsideTheSharedTempRoot) {
+    auto f = repoWith(new PathCapturingFetcher, onePackage("stage_module", "1.0.0"));
+    auto* capture = static_cast<PathCapturingFetcher*>(f.get());
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    std::string err;
+    lib.downloadPackage("", "stage_module", err);
+
+    ASSERT_FALSE(capture->seenPath.empty());
+    const fs::path staged(capture->seenPath);
+    EXPECT_NE(staged.parent_path(), fs::temp_directory_path());
+    EXPECT_EQ(staged.parent_path().parent_path(), fs::temp_directory_path());
+#ifndef _WIN32
+    // Per-uid, and private: another account must not be able to plant a file
+    // at a path we are going to write.
+    EXPECT_EQ(staged.parent_path().filename().string().rfind("lgpd-", 0), 0u);
+    EXPECT_EQ(fs::status(staged.parent_path()).permissions() &
+                  (fs::perms::group_all | fs::perms::others_all),
+              fs::perms::none);
+#endif
+}
+
+// An explicit outputDir is still honoured verbatim.
+TEST(DownloadStaging, ExplicitOutputDirIsUnchanged) {
+    auto f = repoWith(new PathCapturingFetcher, onePackage("stage_module", "1.0.0"));
+    auto* capture = static_cast<PathCapturingFetcher*>(f.get());
+    const fs::path out =
+        fs::temp_directory_path() / ("lgpd_out_" + std::to_string(std::rand()));
+    fs::create_directories(out);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    std::string err;
+    lib.downloadPackage("", "stage_module", err, "", "", out.string());
+
+    ASSERT_FALSE(capture->seenPath.empty());
+    EXPECT_EQ(fs::path(capture->seenPath).parent_path(), out);
+    fs::remove_all(out);
+}
+
+// An unreachable catalog used to be indistinguishable from one that simply
+// does not carry the package — both produced an empty path and, later, the
+// same "no repository advertises it" verdict.
+TEST(DownloadErrors, UnreadableIndexIsNotReportedAsAMissingPackage) {
+    auto f = repoWith(new IndexlessFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    std::string err;
+    EXPECT_TRUE(lib.downloadPackage("", "stage_module", err).empty());
+    EXPECT_NE(err.find("could not read any repository index"), std::string::npos);
+    EXPECT_NE(err.find("connection refused"), std::string::npos);
+    EXPECT_EQ(err.find("no repository advertises"), std::string::npos);
+}
+
+// A version pin that matches nothing names what the catalog does offer.
+TEST(DownloadErrors, VersionPinMismatchListsTheOfferedVersions) {
+    auto f = repoWith(new PathCapturingFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    std::string err;
+    EXPECT_TRUE(lib.downloadPackage("", "stage_module", err, "0.2.4").empty());
+    EXPECT_NE(err.find("0.2.4"), std::string::npos);
+    EXPECT_NE(err.find("offers: 1.0.0"), std::string::npos);
+}
+
+// refreshCatalogs() promises to re-fetch every enabled repo's index.json. It
+// used to resolve only logos-repo.json, so `catalog refresh` reported success
+// against a catalog it had never managed to read.
+TEST(RefreshCatalogs, ReportsAnIndexItCannotRead) {
+    auto f = repoWith(new IndexlessFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const std::string errs = lib.refreshCatalogs();
+    EXPECT_NE(errs.find("index fetch failed"), std::string::npos);
+    EXPECT_NE(errs.find("connection refused"), std::string::npos);
+}
+
+// ─── Catalog includes ─────────────────────────────────────────────────────────
+//
+// A catalog can name other catalogs in `logos-repo.json#includes[]` and draw
+// packages from them. The client resolves that graph at fetch time; the index
+// format is untouched. These tests stand up several catalogs in one mock
+// fetcher and check what the merged catalog ends up containing.
+
+namespace {
+
+constexpr const char* kBRepo  = "https://b.local/logos-repo.json";
+constexpr const char* kBIndex = "https://b.local/index.json";
+constexpr const char* kBIncludes = "https://b.local/includes.json";
+constexpr const char* kCRepo  = "https://c.local/logos-repo.json";
+constexpr const char* kCIndex = "https://c.local/index.json";
+constexpr const char* kCIncludes = "https://c.local/includes.json";
+// The root here is the built-in default repository, so a test needs no config
+// file on disk to get a configured repo that draws from other catalogs.
+constexpr const char* kRootIncludes = "https://test.local/includes.json";
+
+// A version whose download URL and description both name the catalog serving
+// it, so a merged entry can be traced back to where each part came from.
+json versionFrom(const std::string& origin, const char* name,
+                 const char* ver, const char* hash) {
+    return json{
+        {"releasedAt", "2026-01-01T00:00:00Z"},
+        {"url", "https://" + origin + ".local/" + name + "-" + ver + ".lgx"},
+        {"rootHash", hash},
+        {"manifest", {
+            {"manifestVersion", "0.1.0"}, {"name", name}, {"version", ver},
+            {"type", "core"}, {"dependencies", json::array()},
+            {"description", "served by " + origin},
+            {"main", {{"linux-amd64", "lib/x.so"}}},
+        }},
+    };
+}
+
+json packageOf(const char* name, const json& versions) {
+    return json{{"name", name}, {"versions", versions}};
+}
+
+// The identity card points at the includes document; it never carries the list
+// itself. `includesUrl` empty means the catalog draws from nothing.
+std::string repoDoc(const char* name, const char* indexUrl,
+                    const std::string& includesUrl = {}) {
+    json j{{"schemaVersion", 1}, {"name", name}, {"displayName", name},
+           {"indexUrl", indexUrl}, {"trustedSigners", json::array()}};
+    if (!includesUrl.empty()) j["includesUrl"] = includesUrl;
+    return j.dump();
+}
+
+std::string includesDoc(const json& includes) {
+    return json{{"schemaVersion", 1}, {"includes", includes}}.dump();
+}
+
+std::string indexDoc(const char* name, const json& packages) {
+    return json{{"schemaVersion", 2}, {"repositoryName", name},
+                {"packages", packages}}.dump();
+}
+
+// Stand up the root catalog with an includes document served beside it.
+std::shared_ptr<MockFetcher> rootIncluding(const json& includes,
+                                           const json& rootPackages,
+                                           MockFetcher* seed = nullptr) {
+    std::shared_ptr<MockFetcher> f(seed ? seed : new MockFetcher);
+    f->repoJson  = repoDoc("root", kIndexUrl, kRootIncludes);
+    f->indexJson = indexDoc("root", rootPackages);
+    f->byUrl[kRootIncludes] = includesDoc(includes);
+    return f;
+}
+
+// Everything the merged catalog offers, as name -> versions (in catalog order).
+std::map<std::string, std::vector<std::string>> catalogVersions(
+        lgpd::PackageDownloaderLib& lib) {
+    std::map<std::string, std::vector<std::string>> out;
+    for (const auto& e : json::parse(lib.getCatalogJson())) {
+        auto& vers = out[e.value("name", "")];
+        for (const auto& v : e.value("versions", json::array()))
+            vers.push_back(v["manifest"].value("version", ""));
+    }
+    return out;
+}
+
+json catalogEntry(lgpd::PackageDownloaderLib& lib, const std::string& name) {
+    for (const auto& e : json::parse(lib.getCatalogJson()))
+        if (e.value("name", "") == name) return e;
+    return json::object();
+}
+
+class UrlCapturingFetcher : public MockFetcher {
+public:
+    std::string seenUrl;
+    lgpd::FetchResult getToFile(const std::string& url, const std::string&) override {
+        seenUrl = url;
+        return {false, "stopped by test"};
+    }
+};
+
+}  // namespace
+
+// An include with no `packages` filter takes the whole catalog.
+TEST(CatalogIncludes, WholeCatalogIsDrawnIn) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")})),
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2")})),
+    }));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const auto got = catalogVersions(lib);
+    EXPECT_EQ(got.size(), 3u);
+    EXPECT_EQ(got.at("root_module"), std::vector<std::string>({"1.0.0"}));
+    EXPECT_EQ(got.at("b_one"), std::vector<std::string>({"1.0.0"}));
+    EXPECT_EQ(got.at("b_two"), std::vector<std::string>({"2.0.0"}));
+}
+
+// The UI groups its sections by repositoryUrl. An included package must group
+// under the repository the user actually added, or an aggregate catalog renders
+// as nothing at all. Provenance travels in the origin* fields instead.
+TEST(CatalogIncludes, EntriesAreStampedWithRootAndOrigin) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}), json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json e = catalogEntry(lib, "b_one");
+    EXPECT_EQ(e.value("repositoryUrl", ""), lgpd::kDefaultRepositoryUrl);
+    EXPECT_EQ(e.value("repositoryName", ""), "root");
+    EXPECT_EQ(e.value("originRepositoryUrl", ""), kBRepo);
+    EXPECT_EQ(e.value("originRepositoryName", ""), "b");
+    // The download still points at the catalog that published it.
+    EXPECT_EQ(e["versions"][0].value("url", ""), "https://b.local/b_one-1.0.0.lgx");
+    EXPECT_EQ(e["versions"][0].value("originRepositoryUrl", ""), kBRepo);
+}
+
+// A bare name in `packages` takes every version of that package and nothing else.
+TEST(CatalogIncludes, NameFilterSelectsOnePackage) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}, {"packages", json::array({"b_two"})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")})),
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_b2a")})),
+    }));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const auto got = catalogVersions(lib);
+    EXPECT_EQ(got.count("b_one"), 0u);
+    EXPECT_EQ(got.at("b_two"), std::vector<std::string>({"2.0.0", "1.0.0"}));
+}
+
+// A bare version string is an exact pin, because that is what the npm range
+// dialect already means by it.
+TEST(CatalogIncludes, ExactVersionPinSelectsOneRelease) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({json{{"name", "b_two"},
+                                                         {"version", "1.0.0"}}})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).at("b_two"), std::vector<std::string>({"1.0.0"}));
+}
+
+// Ranges go through the same semver implementation the dependency resolver
+// uses, so the accepted dialect cannot drift between the two.
+TEST(CatalogIncludes, VersionRangeSelectsASubset) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({json{{"name", "b_two"},
+                                                         {"version", "^1.0.0"}}})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_c"),
+                                        versionFrom("b", "b_two", "1.2.0", "h_b"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_a")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).at("b_two"),
+              std::vector<std::string>({"1.2.0", "1.0.0"}));
+}
+
+// rootHash disambiguates two builds that share a version.
+TEST(CatalogIncludes, RootHashPinSelectsOneBuild) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({json{{"name", "b_two"},
+                                                         {"rootHash", "h_second"}}})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "1.0.0", "h_first"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_second")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json e = catalogEntry(lib, "b_two");
+    ASSERT_EQ(e["versions"].size(), 1u);
+    EXPECT_EQ(e["versions"][0].value("rootHash", ""), "h_second");
+}
+
+// Two catalogs publishing DIFFERENT versions of one package is the point of an
+// include: the versions union rather than one entry replacing the other.
+TEST(CatalogIncludes, VersionsFromTwoCatalogsAreUnioned) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}}}),
+        json::array({packageOf("shared",
+            json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}));
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("shared", json::array({versionFrom("b", "shared", "1.1.0", "h_b")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json e = catalogEntry(lib, "shared");
+    ASSERT_EQ(e["versions"].size(), 2u);
+    EXPECT_EQ(e["versions"][0]["manifest"].value("version", ""), "1.1.0");
+    EXPECT_EQ(e["versions"][1]["manifest"].value("version", ""), "1.0.0");
+    // Header fields follow versions[0] AFTER the merge — with several catalogs
+    // contributing, "first in the file" is no longer a meaningful source.
+    EXPECT_EQ(e.value("description", ""), "served by b");
+    EXPECT_EQ(e.value("originRepositoryName", ""), "b");
+}
+
+// The same name AND version from two catalogs is the real collision. The
+// local copy keeps it, and the loser is reported rather than dropped silently.
+TEST(CatalogIncludes, LocalCopyWinsACollisionAndTheLossIsReported) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}}}),
+        json::array({packageOf("shared",
+            json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}));
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("shared", json::array({versionFrom("b", "shared", "1.0.0", "h_b")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json e = catalogEntry(lib, "shared");
+    ASSERT_EQ(e["versions"].size(), 1u);
+    EXPECT_EQ(e["versions"][0].value("rootHash", ""), "h_root");
+
+    const std::string errs = lib.refreshCatalogs();
+    EXPECT_NE(errs.find("shared 1.0.0"), std::string::npos);
+    EXPECT_NE(errs.find("shadowed"), std::string::npos);
+}
+
+// A -> B -> A must terminate. A per-path check, not a global one, so a diamond
+// still resolves.
+TEST(CatalogIncludes, CycleTerminates) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kBRepo]     = repoDoc("b", kBIndex, kBIncludes);
+    f->byUrl[kBIncludes] =
+        includesDoc(json::array({json{{"repo", lgpd::kDefaultRepositoryUrl}}}));
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const auto got = catalogVersions(lib);
+    EXPECT_EQ(got.size(), 2u);
+    EXPECT_EQ(got.count("root_module"), 1u);
+    EXPECT_EQ(got.count("b_one"), 1u);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    bool sawCycleWarning = false;
+    for (const auto& w : r.value("includeWarnings", json::array()))
+        if (w.get<std::string>().find("cycle") != std::string::npos) sawCycleWarning = true;
+    EXPECT_TRUE(sawCycleWarning);
+}
+
+// Two includes that both reach the same catalog is legitimate: the packages
+// resolve once, not zero times.
+TEST(CatalogIncludes, DiamondStillResolves) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}}, json{{"repo", kCRepo}}}), json::array());
+    // Both B and C include D; D is served at b.local's sibling URL.
+    const char* kDRepo  = "https://d.local/logos-repo.json";
+    const char* kDIndex = "https://d.local/index.json";
+    f->byUrl[kBRepo]     = repoDoc("b", kBIndex, kBIncludes);
+    f->byUrl[kBIncludes] = includesDoc(json::array({json{{"repo", kDRepo}}}));
+    f->byUrl[kBIndex]    = indexDoc("b", json::array());
+    f->byUrl[kCRepo]     = repoDoc("c", kCIndex, kCIncludes);
+    f->byUrl[kCIncludes] = includesDoc(json::array({json{{"repo", kDRepo}}}));
+    f->byUrl[kCIndex]    = indexDoc("c", json::array());
+    f->byUrl[kDRepo]  = repoDoc("d", kDIndex);
+    f->byUrl[kDIndex] = indexDoc("d", json::array({
+        packageOf("d_one", json::array({versionFrom("d", "d_one", "1.0.0", "h_d")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    // Reached twice, listed once: the second copy collides on name+version and
+    // is merged away.
+    const json e = catalogEntry(lib, "d_one");
+    ASSERT_EQ(e["versions"].size(), 1u);
+}
+
+// A catalog the walk cannot read degrades to a recorded error. It must not take
+// the including catalog down with it.
+TEST(CatalogIncludes, UnreachableIncludeDoesNotBlackoutTheRoot) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    // kBRepo is deliberately not served.
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("root_module"), 1u);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    ASSERT_EQ(r.value("includes", json::array()).size(), 1u);
+    EXPECT_EQ(r["includes"][0].value("url", ""), kBRepo);
+    EXPECT_FALSE(r["includes"][0].value("resolveError", "").empty());
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+}
+
+// An include is a delegation. A user who does not want it can refuse the whole
+// mechanism and see only the catalogs they configured themselves.
+TEST(CatalogIncludes, FollowIncludesOffKeepsOnlyConfiguredCatalogs) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.registry().setFollowIncludes(false);
+    lib.setFetcher(f);
+
+    const auto got = catalogVersions(lib);
+    EXPECT_EQ(got.size(), 1u);
+    EXPECT_EQ(got.count("root_module"), 1u);
+}
+
+// A malformed include entry is a warning, not a parse failure: refusing the
+// whole logos-repo.json would take a working catalog offline over a typo in a
+// purely additive field.
+TEST(CatalogIncludes, MalformedEntriesWarnWithoutBreakingTheCatalog) {
+    auto f = rootIncluding(
+        json::array({
+            json{{"repo", "http://insecure.local/logos-repo.json"}},
+            json{{"packages", json::array({"x"})}},          // no `repo`
+            json{{"repo", kBRepo}, {"packages", json::array()}},  // selects nothing
+            json{{"repo", kBRepo}},                          // the good one
+        }),
+        json::array({packageOf("root_module",
+            json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const auto got = catalogVersions(lib);
+    EXPECT_EQ(got.count("root_module"), 1u);
+    EXPECT_EQ(got.count("b_one"), 1u);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    EXPECT_EQ(r.value("includeWarnings", json::array()).size(), 3u);
+}
+
+// Browse and install have to agree: a version the include's filter excluded is
+// not installable by name either, or the pin would be advice rather than a rule.
+TEST(CatalogIncludes, DownloadHonoursTheIncludeFilter) {
+    auto seed = new UrlCapturingFetcher;
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({json{{"name", "b_two"},
+                                                         {"version", "1.0.0"}}})}}}),
+        json::array(), seed);
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", "h_b2"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    std::string err;
+    EXPECT_TRUE(lib.downloadPackage("", "b_two", err, "2.0.0").empty());
+    EXPECT_NE(err.find("2.0.0"), std::string::npos);
+    EXPECT_TRUE(seed->seenUrl.empty());
+
+    // The pinned version still installs, straight from the catalog that
+    // published it.
+    err.clear();
+    lib.downloadPackage("", "b_two", err);
+    EXPECT_EQ(seed->seenUrl, "https://b.local/b_two-1.0.0.lgx");
+}
+
+// `--repo <configured>` covers what that repository offers, includes and all.
+// `--repo <included>` scopes to that catalog's own slice.
+TEST(CatalogIncludes, RepoScopeResolvesRootAndOriginDifferently) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json viaRoot = json::parse(lib.getCatalogForRepoJson("root"));
+    EXPECT_EQ(viaRoot.size(), 2u);
+
+    const json viaOrigin = json::parse(lib.getCatalogForRepoJson("b"));
+    ASSERT_EQ(viaOrigin.size(), 1u);
+    EXPECT_EQ(viaOrigin[0].value("name", ""), "b_one");
+}
+
+// The graph is third-party input, so it has to be bounded. A chain deeper than
+// the cap stops, and says so.
+TEST(CatalogIncludes, DepthIsCapped) {
+    auto f = rootIncluding(json::array({json{{"repo", "https://lvl1.local/logos-repo.json"}}}),
+                           json::array());
+    // Six levels, each including the next; the cap is four.
+    for (int i = 1; i <= 6; ++i) {
+        const std::string base  = "https://lvl" + std::to_string(i) + ".local";
+        const std::string next  = "https://lvl" + std::to_string(i + 1) + ".local/logos-repo.json";
+        const std::string name  = "lvl" + std::to_string(i);
+        const std::string index = base + "/index.json";
+        const std::string incUrl = base + "/includes.json";
+        f->byUrl[base + "/logos-repo.json"] =
+            repoDoc(name.c_str(), index.c_str(), i < 6 ? incUrl : std::string{});
+        if (i < 6)
+            f->byUrl[incUrl] = includesDoc(json::array({json{{"repo", next}}}));
+        f->byUrl[index] = indexDoc(name.c_str(), json::array({
+            packageOf(name.c_str(),
+                      json::array({versionFrom(name, name.c_str(), "1.0.0", "h")}))}));
+    }
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const auto got = catalogVersions(lib);
+    EXPECT_EQ(got.count("lvl4"), 1u);
+    EXPECT_EQ(got.count("lvl5"), 0u);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    bool sawDepthWarning = false;
+    for (const auto& w : r.value("includeWarnings", json::array()))
+        if (w.get<std::string>().find("deeper than") != std::string::npos) sawDepthWarning = true;
+    EXPECT_TRUE(sawDepthWarning);
+}
+
+// `list` and `download` have to name the same release. Selection used to stop
+// at the first candidate that could serve the name, so an older copy in the
+// including catalog beat a newer one in an included catalog: the catalog
+// advertised 1.2.0 and the download fetched 1.0.0.
+TEST(CatalogIncludes, DownloadPicksTheVersionTheCatalogAdvertises) {
+    auto seed = new UrlCapturingFetcher;
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}}}),
+        json::array({packageOf("shared",
+            json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}),
+        seed);
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("shared", json::array({versionFrom("b", "shared", "1.2.0", "h_b")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    // What the catalog advertises as latest.
+    const json e = catalogEntry(lib, "shared");
+    ASSERT_FALSE(e["versions"].empty());
+    EXPECT_EQ(e["versions"][0]["manifest"].value("version", ""), "1.2.0");
+
+    // What an unpinned download actually fetches.
+    std::string err;
+    lib.downloadPackage("", "shared", err);
+    EXPECT_EQ(seed->seenUrl, "https://b.local/shared-1.2.0.lgx");
+}
+
+// Ranking must not undo the merge's precedence. Same version in both catalogs
+// means the including one keeps it, and the download has to agree.
+TEST(CatalogIncludes, DownloadPrefersTheLocalCopyOnAnExactTie) {
+    auto seed = new UrlCapturingFetcher;
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo}}}),
+        json::array({packageOf("shared",
+            json::array({versionFrom("root", "shared", "1.0.0", "h_root")}))}),
+        seed);
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("shared", json::array({versionFrom("b", "shared", "1.0.0", "h_b")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    std::string err;
+    lib.downloadPackage("", "shared", err);
+    EXPECT_EQ(seed->seenUrl, "https://root.local/shared-1.0.0.lgx");
+}
+
+// ─── the includes document ────────────────────────────────────────────────────
+//
+// `includesUrl` is a second fetch, so it is a second thing that can fail. None
+// of these may cost the catalog its own packages: an unreadable composition
+// list says nothing about what the catalog itself publishes.
+
+TEST(IncludesDocument, UnreachableDocumentIsAWarningNotAnError) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl.erase(kRootIncludes);  // declared, not served
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("root_module"), 1u);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    EXPECT_EQ(r.value("includes", json::array()).size(), 0u);
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("unavailable"),
+              std::string::npos);
+}
+
+TEST(IncludesDocument, MalformedDocumentIsAWarningNotAnError) {
+    auto f = rootIncluding(json::array(),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kRootIncludes] = "{ not json";
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("root_module"), 1u);
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    EXPECT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+}
+
+// The wrapper is what makes the document versionable. A bare array — the shape
+// the list had while it lived inline — is not it.
+TEST(IncludesDocument, DocumentWithoutAnIncludesArrayWarns) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->byUrl[kRootIncludes] = json::array({json{{"repo", kBRepo}}}).dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("bare array"),
+              std::string::npos);
+}
+
+// The other shape of the same mistake: an object that simply forgot the key.
+TEST(IncludesDocument, ObjectWithoutAnIncludesKeyWarns) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->byUrl[kRootIncludes] = json{{"schemaVersion", 1}}.dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("'includes' array"),
+              std::string::npos);
+}
+
+// schemaVersion is advisory here, as it is everywhere else in this format. A
+// document that omits it still resolves rather than silently contributing
+// nothing.
+TEST(IncludesDocument, SchemaVersionIsAdvisory) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->byUrl[kRootIncludes] =
+        json{{"includes", json::array({json{{"repo", kBRepo}}})}}.dump();
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("b_one"), 1u);
+}
+
+TEST(IncludesDocument, NonHttpsUrlIsRefusedWithAWarning) {
+    auto f = rootIncluding(json::array(), json::array());
+    f->repoJson = repoDoc("root", kIndexUrl, "http://insecure.local/includes.json");
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    ASSERT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+    EXPECT_NE(r["includeWarnings"][0].get<std::string>().find("https"),
+              std::string::npos);
+}
+
+// A non-string here used to throw out of the whole logos-repo.json parse and
+// drop a repository that was otherwise fine — the same shape as the bug where
+// one array-valued manifest field discarded an entire catalog.
+TEST(IncludesDocument, NonStringIncludesUrlDoesNotDropTheRepository) {
+    auto f = rootIncluding(json::array(),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    json repo = json::parse(f->repoJson);
+    repo["includesUrl"] = json::array({"https://b.local/includes.json"});
+    f->repoJson = repo.dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).count("root_module"), 1u);
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_TRUE(r.value("resolveError", "x").empty());
+    EXPECT_EQ(r.value("includeWarnings", json::array()).size(), 1u);
+}
+
+// The declared URL is reported whether or not anything resolved from it —
+// otherwise a catalog that meant to draw from others looks like one that never
+// tried.
+TEST(IncludesDocument, DeclaredUrlIsReportedEvenWhenItResolvesToNothing) {
+    auto f = rootIncluding(json::array(), json::array());
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    const json r = repoByUrl(lib, lgpd::kDefaultRepositoryUrl);
+    EXPECT_EQ(r.value("includesUrl", ""), kRootIncludes);
+    EXPECT_EQ(r.value("includes", json::array()).size(), 0u);
 }
