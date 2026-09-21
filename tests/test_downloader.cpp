@@ -1808,6 +1808,27 @@ TEST(CatalogIncludes, VersionRangeSelectsASubset) {
               std::vector<std::string>({"1.2.0", "1.0.0"}));
 }
 
+// A range carries its own alternatives, so `||` is the other way to ask for
+// what two selectors would — same catalog, same outcome.
+TEST(CatalogIncludes, AlternativesInOneRangeSelectBoth) {
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({json{{"name", "b_two"},
+                                                {"version", "1.0.0 || 3.0.0"}}})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "3.0.0", "h_three"),
+                                        versionFrom("b", "b_two", "2.0.0", "h_two"),
+                                        versionFrom("b", "b_two", "1.0.0", "h_one")}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    EXPECT_EQ(catalogVersions(lib).at("b_two"),
+              std::vector<std::string>({"3.0.0", "1.0.0"}));
+}
+
 // rootHash disambiguates two builds that share a version.
 TEST(CatalogIncludes, RootHashPinSelectsOneBuild) {
     auto f = rootIncluding(
@@ -1826,6 +1847,32 @@ TEST(CatalogIncludes, RootHashPinSelectsOneBuild) {
     const json e = catalogEntry(lib, "b_two");
     ASSERT_EQ(e["versions"].size(), 1u);
     EXPECT_EQ(e["versions"][0].value("rootHash", ""), "h_second");
+}
+
+// A `rootHash` is compared for equality, never by prefix: an abbreviated hash
+// copied out of a doc selects nothing. The second selector is the control —
+// same catalog, same shape, a whole hash, and it lands.
+TEST(CatalogIncludes, RootHashPrefixSelectsNothing) {
+    constexpr const char* kHashOne =
+        "ccf6b318787e6ffc33ce38a3940c0cf29334c2787a777eb036d29a0c1214858b";
+    constexpr const char* kHashTwo =
+        "9f2c1d8a5b47e0c36ea91d4f7b208c5e3a6d90f1b4c827de5309a1fb6247cd80";
+    auto f = rootIncluding(
+        json::array({json{{"repo", kBRepo},
+                          {"packages", json::array({
+                               json{{"name", "b_two"}, {"rootHash", "ccf6b318"}},
+                               json{{"name", "b_two"}, {"rootHash", kHashTwo}}})}}}),
+        json::array());
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_two", json::array({versionFrom("b", "b_two", "2.0.0", kHashTwo),
+                                        versionFrom("b", "b_two", "1.0.0", kHashOne)}))}));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+
+    // 1.0.0 carries the hash that prefix came from, and still does not arrive.
+    EXPECT_EQ(catalogVersions(lib).at("b_two"), std::vector<std::string>({"2.0.0"}));
 }
 
 // Two selectors naming ONE package union rather than intersect: a settled
