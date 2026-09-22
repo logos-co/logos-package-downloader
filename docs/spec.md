@@ -66,7 +66,7 @@ source of truth — it federates several and presents them as one.
 | **Includes document** | The document a repository's `includesUrl` points at: `{ schemaVersion, includes[] }`. Separate from the identity card for the same reason `indexUrl` is — the card is near-static, what a catalog composes from is not. |
 | **Include** | One entry of that document: another catalog this one draws packages from, optionally narrowed to named packages or version ranges. Includes are resolved at fetch time and contribute to the including repository's own listing. |
 | **Derived repository** | A repository the client reached by following an include, rather than one the user configured. Derived repositories are rebuilt on every refresh and are never written to the config. |
-| **Index** | A repository's package index (`index.json`): a list of packages, each with one or more **versions**. Each version carries a `releasedAt` date, the download `url` of its `.lgx`, size/checksum fields, a `rootHash`, an embedded `manifest`, and an optional `signature`. |
+| **Index** | A repository's package index (`index.json`): a list of packages, each with one or more **versions**. Each version carries a `releasedAt` date, the download `url` of its `.lgx`, optional extra download `urls` (`https://...` or `logos:<network>:<CID>`), size/checksum fields, a `rootHash`, an embedded `manifest`, and an optional `signature`. |
 | **Catalog** | The merged, synthesised view across all *enabled* repositories. This is the unit the browse/search/info/resolve operations work against. |
 | **Package** | A named module available in one or more repositories, with a version history. |
 | **Version** | A concrete release of a package, pinned by its `version` string and its `rootHash`. |
@@ -274,7 +274,9 @@ A download is **pinned and verified** — never a blind fetch. The flow:
         version empty   → newest version of the package
         rootHash given  → must match exactly (disambiguates same-version builds)
 
-   2. FETCH   the .lgx by the version's own url
+   2. FETCH   the .lgx from the version's urls
+        first from Logos Storage (logos:<network>:<CID>)
+        then from https (https://...), else from the version's url
         output dir empty → system temp (TMPDIR, else /tmp)
         a failed transfer leaves no half-written file behind
 
@@ -430,6 +432,8 @@ Beyond the above, the library/C boundary additionally offers:
   without running the full resolver.
 - **A pluggable fetcher**, so tests and embedders can supply their own HTTP
   transport instead of the default network client.
+- **A storage fetcher**, to download packages from Logos Storage. It knows its
+  network and downloads `logos:<network>:<CID>` URLs.
 
 ---
 

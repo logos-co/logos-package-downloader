@@ -166,12 +166,13 @@ Logos module wrapper and existing CLI code use that name).
 | Method | Description |
 |--------|-------------|
 | `void setFetcher(std::shared_ptr<lgpd::Fetcher>)` | Inject a custom `Fetcher` (default libcurl `HttpsFetcher`); clears caches and forces metadata re-resolution. |
+| `void setStorageFetcher(std::shared_ptr<lgpd::Fetcher>)` | Set the Logos Storage fetcher. It is tried before https, on `logos:<network>:<CID>` URLs. |
 | `RepositoryRegistry& registry()` / `const RepositoryRegistry& registry() const` | Access the underlying registry (mutable / const). |
 | `std::string listRepositoriesJson()` | JSON array: `[{url, enabled, isDefault, name, displayName, description, homepage, indexUrl, trustedSignerDids[], resolveError}]`. |
-| `std::string getCatalogJson()` | Merged catalog JSON across enabled repos: `[{repositoryUrl, repositoryName, repositoryDisplayName, name, description, type, category, author, icon, versions:[...]}]`; `versions[]` newest-first by `releasedAt`. |
+| `std::string getCatalogJson()` | Merged catalog JSON across enabled repos: `[{repositoryUrl, repositoryName, repositoryDisplayName, name, description, type, category, author, icon, versions:[...]}]`; `versions[]` newest-first by SemVer, `releasedAt` breaks ties. |
 | `std::string getCatalogForRepoJson(const std::string& urlOrName)` | Same synthesised shape scoped to one repo (by URL or canonical name). Returns `"[]"` if the repo is not found. |
 | `std::string refreshCatalogs()` | Clear caches and force re-fetch of every enabled repo's metadata + `index.json`. Empty string on success, else an error summary. |
-| `std::string downloadPackage(repoUrlOrName, packageName, version="", rootHash="", outputDir="")` | Download + verify a `.lgx`; returns the local path or empty on error. `repo` empty = any enabled repo (registry order); `version` empty = newest; `rootHash` disambiguates same-version builds; `outputDir` empty = a private per-user staging directory under the system temp dir (`<temp>/lgpd-<uid>`), never the shared temp root. |
+| `std::string downloadPackage(repoUrlOrName, packageName, version="", rootHash="", outputDir="", onProgress={}, source=nullptr)` | Download + verify a `.lgx`; returns the local path or empty on error. `repo` empty = any enabled repo (registry order); `version` empty = newest; `rootHash` disambiguates same-version builds; `outputDir` empty = a private per-user staging directory under the system temp dir (`<temp>/lgpd-<uid>`), never the shared temp root. Tries Logos Storage first, then https, then `url`. `source` gives the URL used. |
 | `std::string resolveDependenciesJson(dependenciesJson, installedPackagesJson="")` | Cross-repo BFS resolver. Output is a JSON array in install order: `[{repositoryUrl, name, version, rootHash, url, topLevel}]`; on failure an `{error, name}` entry at the unsatisfied position. The installed-state snapshot (`[{name, version, rootHash}]`) short-circuits already-satisfied transitive deps. |
 | `static bool semverMatches(const std::string& range, const std::string& version)` | True if the semver range matches the concrete version. Empty range matches anything. Exposed for tests/filtering. |
 
@@ -211,12 +212,17 @@ repo URL
 
 ```cpp
 class Fetcher {
-    virtual bool get(const std::string& url, std::string& out) = 0;       // GET into a string
-    virtual bool getToFile(const std::string& url, const std::string& path) = 0;  // GET to a file
+    virtual bool canHandle(const std::string& url) const = 0;             // true if getToFile can download this url
+    virtual FetchResult get(const std::string& url, std::string& out) = 0;       // GET into a string
+    virtual FetchResult getToFile(const std::string& url, const std::string& path) = 0;  // GET to a file
+    virtual FetchResult getToFile(const std::string& url, const std::string& path,
+                                  const ProgressFn& onProgress);                  // same, with progress
 };
 ```
 
-The concrete `HttpsFetcher` in the `.cpp` uses libcurl; tests inject their own.
+The concrete `HttpsFetcher` in the `.cpp` uses libcurl and downloads `https://`
+URLs; tests inject their own. A storage fetcher knows its network and downloads
+`logos:<network>:<CID>` URLs.
 
 ### `lgpd::Repository` (struct)
 
@@ -412,6 +418,14 @@ The test suite (`tests/test_downloader.cpp`, GoogleTest via CTest) covers:
 | `Registry.AddDefaultWhileDisabledClearsDisabledFlag` | `addRepository(default)` while the default is disabled (but not removed) flips it back to `enabled=true`. |
 | `Registry.RefreshSkipsDisabledAndRemovedDefault` | `refresh()` does not fetch (or error on) a disabled or removed default. |
 | `Catalog.ReturnsJsonArrayWhenNoNetwork` | `getCatalogJson()` parses to a JSON array even with no network (lazy fetch degrades to empty). |
+| `FetchSelection.StorageCidIsPreferredOverTheHttpsMirror` | Logos Storage is used when it can download the package. |
+| `FetchSelection.StorageCidIsPreferredWhenListedAfterTheHttpsMirror` | Logos Storage is used first, whatever the order in `urls`. |
+| `FetchSelection.HttpsTakesOverWhenTheStorageDownloadFails` | https is used when Logos Storage fails. |
+| `FetchSelection.StorageReportsTheCidAsTheSource` | `source` is the `logos:` URL after a Logos Storage download. |
+| `FetchSelection.TheHttpsMirrorReportsItsUrlAsTheSource` | `source` is the https URL after an https download. |
+| `FetchSelection.HttpsIsUsedWhenNoStorageFetcherIsDefined` | https is used when no storage fetcher is set. |
+| `FetchSelection.LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls` | `url` is used when the index has no `urls`. |
+| `FetchSelection.HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork` | https is used when the storage fetcher is on another network. |
 
 ### Raw CMake (inside `nix develop`)
 

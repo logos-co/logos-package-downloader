@@ -320,6 +320,10 @@ std::string curlFailDetail(CURLcode res, long httpCode) {
 
 class HttpsFetcher : public Fetcher {
 public:
+    bool canHandle(const std::string& url) const override {
+        return url.rfind("https://", 0) == 0;
+    }
+
     FetchResult get(const std::string& url, std::string& out) override {
         curlInit();
         CURL* c = curl_easy_init();
@@ -534,7 +538,6 @@ bool parseLogosRepoJson(const std::string& body, Repository& dst, std::string& e
         dst.description = j.value("description", "");
         dst.homepage    = j.value("homepage", "");
         dst.indexUrl    = j["indexUrl"].get<std::string>();
-        dst.network     = j.value("network", "");
         dst.trustedSignerDids.clear();
         if (j.contains("trustedSigners") && j["trustedSigners"].is_array()) {
             for (const auto& s : j["trustedSigners"]) {
@@ -708,7 +711,6 @@ struct RepositoryRegistry::Impl {
         parsed.description.clear();
         parsed.homepage.clear();
         parsed.indexUrl.clear();
-        parsed.network.clear();
         parsed.includesUrl.clear();
         parsed.trustedSignerDids.clear();
         if (!parseLogosRepoJson(body, parsed, err)) {
@@ -1021,7 +1023,6 @@ struct PackageDownloaderLib::Impl {
     RepositoryRegistry registry;
     std::shared_ptr<Fetcher> fetcher = std::make_shared<HttpsFetcher>();
     std::shared_ptr<Fetcher> storageFetcher;
-    std::string network;
 
     // Caches: url -> body
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
@@ -1317,11 +1318,6 @@ void PackageDownloaderLib::setStorageFetcher(std::shared_ptr<Fetcher> fetcher) {
     impl_->storageFetcher = fetcher;
 }
 
-void PackageDownloaderLib::setNetwork(const std::string& network) {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    impl_->network = network;
-}
-
 RepositoryRegistry& PackageDownloaderLib::registry() { return impl_->registry; }
 const RepositoryRegistry& PackageDownloaderLib::registry() const { return impl_->registry; }
 
@@ -1343,7 +1339,6 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
         e["description"] = r.description;
         e["homepage"] = r.homepage;
         e["indexUrl"] = r.indexUrl;
-        e["network"] = r.network;
         e["trustedSignerDids"] = r.trustedSignerDids;
         e["resolveError"] = r.resolveError;
         e["includesUrl"] = r.includesUrl;
@@ -1895,7 +1890,16 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         const Repository& repo = *pickedRepo;
         const json* v = &pickedVersion;
         const std::string url = v->value("url", "");
-        std::string cid;
+
+        std::shared_ptr<Fetcher> storageFetcher;
+        std::shared_ptr<Fetcher> httpsFetcher;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mu);
+            storageFetcher = impl_->storageFetcher;
+            httpsFetcher = impl_->fetcher;
+        }
+
+        std::string storageUrl;
         // Fallback on `url` if `urls` doesn't exist or is empty.
         std::string httpsUrl = url;
         for (const auto& u : v->value("urls", json::array())) {
@@ -1906,17 +1910,17 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             }
 
             // urls is not guaranteed to be in any particular order,
-            // so we take logos and https protocols explicitly and ignore
-            // any others.
+            // so each fetcher takes the urls it can handle and the
+            // others are ignored.
             const std::string candidate = u.get<std::string>();
-            if (candidate.rfind("logos:", 0) == 0) {
-                cid = candidate.substr(std::string_view("logos:").size());
-            } else if (isHttpsUrl(candidate)) {
+            if (storageFetcher && storageFetcher->canHandle(candidate)) {
+                storageUrl = candidate;
+            } else if (httpsFetcher->canHandle(candidate)) {
                 httpsUrl = candidate;
             }
         }
 
-        if (cid.empty() && httpsUrl.empty()) {
+        if (storageUrl.empty() && httpsUrl.empty()) {
             // Ranking already considered every candidate; there is no next
             // repository to fall through to.
             errorMessage = packageName + " has no download url for the selected "
@@ -1996,19 +2000,9 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         // https fails.
         std::string storageError;
 
-        std::shared_ptr<Fetcher> storageFetcher;
-        std::shared_ptr<Fetcher> httpsFetcher;
-        std::string network;
-        {
-            std::lock_guard<std::mutex> lock(impl_->mu);
-            storageFetcher = impl_->storageFetcher;
-            httpsFetcher = impl_->fetcher;
-            network = impl_->network;
-        }
-
-        if (!cid.empty() && storageFetcher && network == repo.network) {
+        if (!storageUrl.empty()) {
             const FetchResult storageFetched =
-                storageFetcher->getToFile(cid, storagePending, progressSink);
+                storageFetcher->getToFile(storageUrl, storagePending, progressSink);
             downloaded = storageFetched.ok;
 
             if (!downloaded) {
@@ -2016,7 +2010,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 std::error_code rmEc;
                 fs::remove(storagePending, rmEc);
             } else {
-                sourceUrl = "logos:" + cid;
+                sourceUrl = storageUrl;
                 pendingFile = storagePending;
             }
         }
@@ -2034,7 +2028,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                              + httpsUrl + " failed: " + fetched.error;
 
                 if (!storageError.empty()) {
-                    errorMessage += "; storage " + cid + " failed: " + storageError;
+                    errorMessage += "; storage " + storageUrl + " failed: " + storageError;
                 }
 
                 return {};

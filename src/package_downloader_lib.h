@@ -30,6 +30,9 @@ class Fetcher {
 public:
     virtual ~Fetcher() = default;
 
+    /// Whether this fetcher can download `url` with getToFile.
+    virtual bool canHandle(const std::string& url) const = 0;
+
     /// HTTP GET. Succeeds on 2xx with the response body in `out`.
     virtual FetchResult get(const std::string& url, std::string& out) = 0;
 
@@ -82,7 +85,6 @@ struct Repository {
     std::string description;
     std::string homepage;
     std::string indexUrl;
-    std::string network;
     /// `trustedSigners[].did` as ADVERTISED by the repository's own
     /// logos-repo.json. ADVISORY ONLY — parsed, stored, and echoed back in
     /// listRepositoriesJson(); consulted by nothing, deliberately.
@@ -243,15 +245,13 @@ public:
 
     void setStorageFetcher(std::shared_ptr<Fetcher> fetcher);
 
-    void setNetwork(const std::string& network);
-
     /// Returns the registry (mutable).
     RepositoryRegistry& registry();
     const RepositoryRegistry& registry() const;
 
     /// JSON array of the CONFIGURED repositories. Each element:
     /// `{ url, sourceOwner, sourceRepo, sourceHost, enabled, isDefault,
-    ///    name, displayName, description, homepage, indexUrl, network,
+    ///    name, displayName, description, homepage, indexUrl,
     ///    trustedSignerDids[], resolveError, includesUrl, includes[],
     ///    includeWarnings[] }`.
     ///
@@ -308,10 +308,7 @@ public:
     /// else 0. It covers the TRANSFER ONLY — index-binding verification runs
     /// after the last callback, so 100% is not "done".
     ///
-    /// Best effort: will try Storage if the Storage Module is available, the
-    /// index contains a CID and the repository declares the network set with
-    /// setNetwork(), otherwise will fallback on `urls` if it exists, if not,
-    /// will use the `url` entry.
+    /// Tries Logos Storage first, then https, then the `url` entry.
     ///
     /// `source` reports the source URL used to fetch the package.
     std::string downloadPackage(const std::string& repoUrlOrName,
