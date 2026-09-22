@@ -1511,7 +1511,7 @@ TEST(DownloadedSignerBinding, AForgedSignatureNamingTheAdvertisedDidDoesNotBind)
 namespace {
 
 constexpr const char* storageUrl =
-    "logos:test:zDvZRwzm3g3mPcYu1NmDKV5jCccw4FZ83XKyu85AjSCg7gH7zQdL";
+    "logos:logos.test:zDvZRwzm3g3mPcYu1NmDKV5jCccw4FZ83XKyu85AjSCg7gH7zQdL";
 constexpr const char* uiDep = R"({"name":"blockchain_module","version":"*"})";
 constexpr const char* lgxStorageUrl = "https://mirror.local/bm-0.2.0.lgx";
 constexpr const char* legacyLgxStorageUrl = "https://test.local/0.2.0.lgx";
@@ -1520,7 +1520,7 @@ constexpr const char* packageName = "blockchain_module";
 constexpr const char* version = "0.2.0";
 constexpr const char* rootHash = "";
 constexpr const char* outputDir = "";
-constexpr const char* network = "test";
+constexpr const char* network = "logos.test";
 
 class StorageFetcher : public lgpd::Fetcher {
 public:
@@ -1671,7 +1671,7 @@ TEST(FetchSelection, LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls) {
 TEST(FetchSelection, HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork) {
     auto http = storageCatalogFetcher();
     bool success = true;
-    auto storage = std::make_shared<StorageFetcher>("dev", success);
+    auto storage = std::make_shared<StorageFetcher>("logos.dev", success);
 
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(http);
