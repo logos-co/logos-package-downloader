@@ -30,6 +30,9 @@ class Fetcher {
 public:
     virtual ~Fetcher() = default;
 
+    /// Whether this fetcher can download `url` with getToFile.
+    virtual bool canHandle(const std::string& url) const = 0;
+
     /// HTTP GET. Succeeds on 2xx with the response body in `out`.
     virtual FetchResult get(const std::string& url, std::string& out) = 0;
 
@@ -240,6 +243,8 @@ public:
 
     void setFetcher(std::shared_ptr<Fetcher> fetcher);
 
+    void setStorageFetcher(std::shared_ptr<Fetcher> fetcher);
+
     /// Returns the registry (mutable).
     RepositoryRegistry& registry();
     const RepositoryRegistry& registry() const;
@@ -302,13 +307,18 @@ public:
     /// is the transport's Content-Length, else the catalog's advertised size,
     /// else 0. It covers the TRANSFER ONLY — index-binding verification runs
     /// after the last callback, so 100% is not "done".
+    ///
+    /// Tries Logos Storage first, then https, then the `url` entry.
+    ///
+    /// `source` reports the source URL used to fetch the package.
     std::string downloadPackage(const std::string& repoUrlOrName,
                                 const std::string& packageName,
                                 std::string& errorMessage,
                                 const std::string& version = "",
                                 const std::string& rootHash = "",
                                 const std::string& outputDir = "",
-                                const ProgressFn& onProgress = {});
+                                const ProgressFn& onProgress = {},
+                                std::string* source = nullptr);
 
     /// Cross-repo dependency resolution.
     ///

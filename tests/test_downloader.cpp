@@ -25,10 +25,17 @@ class MockFetcher : public lgpd::Fetcher {
 public:
     std::string repoJson;   // served for the default repo URL
     std::string indexJson;  // served for kIndexUrl
+    std::vector<std::string> fileGets;  // URLs passed to getToFile
+    std::string lastDest;               // path passed to the last getToFile
+    bool fileGetSucceeds = false;       // result returned by getToFile
     // Extra per-URL responses, consulted first. Lets a test stand up a
     // SECOND repository with its own logos-repo.json, which the two canned
     // slots above can't express.
     std::map<std::string, std::string> byUrl;
+
+    bool canHandle(const std::string& url) const override {
+        return url.rfind("https://", 0) == 0;
+    }
 
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
         auto it = byUrl.find(url);
@@ -49,8 +56,15 @@ public:
 
         return {false, "no such url"};
     }
-    lgpd::FetchResult getToFile(const std::string&, const std::string&) override {
-        return {false, "not served"};
+    lgpd::FetchResult getToFile(const std::string& url, const std::string& dest) override {
+        fileGets.push_back(url);
+        lastDest = dest;
+
+        if (!fileGetSucceeds) {
+            return {false, "not served"};
+        }
+
+        return {true, {}};
     }
 };
 
@@ -71,7 +85,8 @@ json makeVersion(const char* ver, const char* hash, const json& deps) {
 
 // A two-package catalog: blockchain_module @ {0.1.0, 0.2.0} and blockchain_ui
 // @ 0.1.0 which depends on blockchain_module (range configurable).
-std::shared_ptr<MockFetcher> catalogFetcher(const json& uiDepRange) {
+std::shared_ptr<MockFetcher> catalogFetcher(const json& uiDepRange,
+                                            const json& urls = json()) {
     auto f = std::make_shared<MockFetcher>();
     f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
                        {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
@@ -82,6 +97,12 @@ std::shared_ptr<MockFetcher> catalogFetcher(const json& uiDepRange) {
     json ui  = makeVersion("0.1.0", "h_ui_010", json::array({ uiDepRange }));
     ui["manifest"]["name"] = "blockchain_ui";
     ui["manifest"]["type"] = "ui_qml";
+
+    // Define an optional `urls` array for 0.2.0 only.
+    if (!urls.is_null()) {
+        bmV2["urls"] = urls;
+    }
+
     f->indexJson = json{
         {"schemaVersion", 2}, {"repositoryName", "test"},
         {"packages", json::array({
@@ -329,6 +350,15 @@ TEST(ProgressThrottle, UnknownTotalStillRateLimitsAndNeverFakesCompletion) {
     // would let every sample bypass the rate limit.
     EXPECT_FALSE(t.shouldEmit(100, 0, 10));
     EXPECT_TRUE(t.shouldEmit(200, 0, 300));
+}
+
+TEST(ProgressThrottle, ResetLetsASecondTransportStartOverFromZero) {
+    lgpd::ProgressThrottle t(200);
+    ASSERT_TRUE(t.shouldEmit(0, 1000, 0));
+    ASSERT_TRUE(t.shouldEmit(900, 1000, 300));
+    t.reset();
+    EXPECT_TRUE(t.shouldEmit(10, 1000, 400));
+    EXPECT_TRUE(t.shouldEmit(200, 1000, 700));
 }
 
 // ─── downloadPackage progress plumbing ───────────────────────────────────────
@@ -636,6 +666,7 @@ TEST(Registry, UserRepoLifecycle) {
     public:
         std::string repoJson;
         std::string indexJson;
+        bool canHandle(const std::string&) const override { return false; }
         lgpd::FetchResult get(const std::string& u, std::string& out) override {
             if (u == kIndexUrl) {
                 out = indexJson;
@@ -788,6 +819,7 @@ TEST(Registry, AddDefaultAfterRemoveIsAtomicOnFetchFailure) {
     // "network unreachable".
     class NoNetworkFetcher : public lgpd::Fetcher {
     public:
+        bool canHandle(const std::string&) const override { return false; }
         lgpd::FetchResult get(const std::string&, std::string&) override {
             return {false, "network unreachable"};
         }
@@ -1474,6 +1506,196 @@ TEST(DownloadedSignerBinding, AForgedSignatureNamingTheAdvertisedDidDoesNotBind)
     // An empty advertised DID binds nothing — the same shape of hole B1 was.
     EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, true, kGoodDid, ""));
     EXPECT_FALSE(PackageDownloaderLib::downloadedSignerBinds(true, true, "", ""));
+}
+
+namespace {
+
+constexpr const char* storageUrl =
+    "logos:logos.test:zDvZRwzm3g3mPcYu1NmDKV5jCccw4FZ83XKyu85AjSCg7gH7zQdL";
+constexpr const char* uiDep = R"({"name":"blockchain_module","version":"*"})";
+constexpr const char* lgxStorageUrl = "https://mirror.local/bm-0.2.0.lgx";
+constexpr const char* legacyLgxStorageUrl = "https://test.local/0.2.0.lgx";
+constexpr const char* repoUrl = "";
+constexpr const char* packageName = "blockchain_module";
+constexpr const char* version = "0.2.0";
+constexpr const char* rootHash = "";
+constexpr const char* outputDir = "";
+constexpr const char* network = "logos.test";
+
+class StorageFetcher : public lgpd::Fetcher {
+public:
+    // Define the network handled and if the mock should be a success or not.
+    StorageFetcher(std::string network, bool succeed)
+        : network_(std::move(network)), succeed_(succeed) {}
+
+    // Keep track of the URLs that were requested to be fetched to file.
+    std::vector<std::string> attempts;
+    // Keep track of the URLs that were actually fetched to file.
+    std::vector<std::string> fileGets;
+
+    bool canHandle(const std::string& url) const override {
+        return url.rfind("logos:" + network_ + ":", 0) == 0;
+    }
+
+    lgpd::FetchResult get(const std::string&, std::string&) override {
+        return {false, "not served"};
+    }
+
+    lgpd::FetchResult getToFile(const std::string& url, const std::string&) override {
+        attempts.push_back(url);
+
+        if (!succeed_) {
+            return {false, "storage node unreachable"};
+        }
+
+        fileGets.push_back(url);
+        return {true, {}};
+    }
+private:
+    std::string network_;
+    bool succeed_;
+};
+
+std::shared_ptr<MockFetcher> storageCatalogFetcher() {
+    const json uiDepRangeJson = json::parse(uiDep);
+    const json urlsJson = json::array({storageUrl, lgxStorageUrl});
+    return catalogFetcher(uiDepRangeJson, urlsJson);
+}
+
+}
+
+TEST(FetchSelection, StorageCidIsPreferredOverTheHttpsMirror) {
+    auto http = storageCatalogFetcher();
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_EQ(storage->fileGets, std::vector<std::string>{storageUrl});
+    EXPECT_TRUE(http->fileGets.empty());
+}
+
+TEST(FetchSelection, StorageCidIsPreferredWhenListedAfterTheHttpsMirror) {
+    const json urlsJson = json::array({lgxStorageUrl, storageUrl});
+    auto http = catalogFetcher(json::parse(uiDep), urlsJson);
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_EQ(storage->fileGets, std::vector<std::string>{storageUrl});
+    EXPECT_TRUE(http->fileGets.empty());
+}
+
+TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
+    auto http = storageCatalogFetcher();
+    bool success = false;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_EQ(storage->attempts, std::vector<std::string>{storageUrl});
+    EXPECT_TRUE(storage->fileGets.empty());
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(FetchSelection, StorageReportsTheCidAsTheSource) {
+    auto http = storageCatalogFetcher();
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    std::string err;
+    std::string source;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir, {}, &source);
+
+    EXPECT_EQ(source, std::string(storageUrl));
+}
+
+TEST(FetchSelection, TheHttpsMirrorReportsItsUrlAsTheSource) {
+    auto http = storageCatalogFetcher();
+    http->fileGetSucceeds = true;
+    bool success = false;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    std::string err;
+    std::string source;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir, {}, &source);
+
+    EXPECT_EQ(source, std::string(lgxStorageUrl));
+}
+
+TEST(FetchSelection, HttpsIsUsedWhenNoStorageFetcherIsDefined) {
+    auto http = storageCatalogFetcher();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(FetchSelection, LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls) {
+    auto http = catalogFetcher(json::parse(uiDep));
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_TRUE(storage->attempts.empty());
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{legacyLgxStorageUrl});
+}
+
+TEST(FetchSelection, HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork) {
+    auto http = storageCatalogFetcher();
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>("logos.dev", success);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_TRUE(storage->attempts.empty());
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(FetchDestination, DestinationContainsPackageVersion) {
+    auto http = storageCatalogFetcher();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, "", rootHash, outputDir);
+
+    const std::string expected = "blockchain_module-0.2.0.lgx";
+    const std::string filename = fs::path(http->lastDest).filename().string();
+
+    // Check the filename starts with blockchain_module-0.2.0.lgx
+    EXPECT_EQ(filename.substr(0, expected.size()), expected);
 }
 
 // ─── Download staging + failure attribution ──────────────────────────────────

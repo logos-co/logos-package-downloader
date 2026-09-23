@@ -320,6 +320,10 @@ std::string curlFailDetail(CURLcode res, long httpCode) {
 
 class HttpsFetcher : public Fetcher {
 public:
+    bool canHandle(const std::string& url) const override {
+        return url.rfind("https://", 0) == 0;
+    }
+
     FetchResult get(const std::string& url, std::string& out) override {
         curlInit();
         CURL* c = curl_easy_init();
@@ -1018,6 +1022,7 @@ std::string RepositoryRegistry::configPath() const { return impl_->configPath; }
 struct PackageDownloaderLib::Impl {
     RepositoryRegistry registry;
     std::shared_ptr<Fetcher> fetcher = std::make_shared<HttpsFetcher>();
+    std::shared_ptr<Fetcher> storageFetcher;
 
     // Caches: url -> body
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
@@ -1306,6 +1311,11 @@ void PackageDownloaderLib::setFetcher(std::shared_ptr<Fetcher> fetcher) {
     // New fetcher → the once-per-process metadata resolution must run
     // again (against the new fetcher) on the next ensureMetadata.
     impl_->metadataResolved = false;
+}
+
+void PackageDownloaderLib::setStorageFetcher(std::shared_ptr<Fetcher> fetcher) {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->storageFetcher = fetcher;
 }
 
 RepositoryRegistry& PackageDownloaderLib::registry() { return impl_->registry; }
@@ -1740,7 +1750,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                                                   const std::string& version,
                                                   const std::string& rootHash,
                                                   const std::string& outputDir,
-                                                  const ProgressFn& onProgress) {
+                                                  const ProgressFn& onProgress,
+                                                  std::string* source) {
 
     // Clear any previous error message before starting a new download attempt.
     errorMessage.clear();
@@ -1879,7 +1890,37 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         const Repository& repo = *pickedRepo;
         const json* v = &pickedVersion;
         const std::string url = v->value("url", "");
-        if (url.empty()) {
+
+        std::shared_ptr<Fetcher> storageFetcher;
+        std::shared_ptr<Fetcher> httpsFetcher;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mu);
+            storageFetcher = impl_->storageFetcher;
+            httpsFetcher = impl_->fetcher;
+        }
+
+        std::string storageUrl;
+        // Fallback on `url` if `urls` doesn't exist or is empty.
+        std::string httpsUrl = url;
+        for (const auto& u : v->value("urls", json::array())) {
+            if (!u.is_string()) {
+                // Just being defensive here, this should never happen.
+                // The index builder should write only strings into the urls array.
+                continue;
+            }
+
+            // urls is not guaranteed to be in any particular order,
+            // so each fetcher takes the urls it can handle and the
+            // others are ignored.
+            const std::string candidate = u.get<std::string>();
+            if (storageFetcher && storageFetcher->canHandle(candidate)) {
+                storageUrl = candidate;
+            } else if (httpsFetcher->canHandle(candidate)) {
+                httpsUrl = candidate;
+            }
+        }
+
+        if (storageUrl.empty() && httpsUrl.empty()) {
             // Ranking already considered every candidate; there is no next
             // repository to fall through to.
             errorMessage = packageName + " has no download url for the selected "
@@ -1898,8 +1939,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 return {};
             }
         }
-        std::string filename = fs::path(url).filename().string();
-        if (filename.empty()) filename = packageName + ".lgx";
+        const std::string packageVersion = objOrEmpty(*v, "manifest").value("version", "");
+        std::string filename = packageName + "-" + packageVersion + ".lgx";
         std::string dest = (fs::path(destDir) / filename).string();
 
         // Use a random suffix to avoid collisions.
@@ -1911,8 +1952,15 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         // Example: 3f9a2c1b.
         suffix << std::hex << rd();
 
-        const std::string pendingFile =
+        const std::string pendingBase =
             (fs::path(destDir) / (filename + "." + suffix.str())).string();
+
+        // Define a pending file for each transport for potential
+        // concurrent downloads.
+        const std::string storagePending = pendingBase + ".logos";
+        const std::string httpsPending   = pendingBase + ".https";
+
+        std::string pendingFile = httpsPending;
 
         // Known before any byte moves, and still right for a chunked
         // response where curl reports dltotal == 0 throughout. It is also
@@ -1945,16 +1993,59 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                          })
                        : ProgressFn{};
 
-        const FetchResult fetched =
-            impl_->fetcher->getToFile(url, pendingFile, progressSink);
+        bool downloaded = false;
+        std::string sourceUrl = httpsUrl;
 
-        if (!fetched.ok) {
-            std::error_code rmEc;
-            fs::remove(pendingFile, rmEc);
-            errorMessage = "download of " + packageName + " from " + url
-                         + " failed: " + fetched.error;
+        // Keep Storage error for error reporting when
+        // https fails.
+        std::string storageError;
+
+        if (!storageUrl.empty()) {
+            const FetchResult storageFetched =
+                storageFetcher->getToFile(storageUrl, storagePending, progressSink);
+            downloaded = storageFetched.ok;
+
+            if (!downloaded) {
+                storageError = storageFetched.error;
+                std::error_code rmEc;
+                fs::remove(storagePending, rmEc);
+            } else {
+                sourceUrl = storageUrl;
+                pendingFile = storagePending;
+            }
+        }
+
+        if (!downloaded) {
+            throttle.reset();
+
+            const FetchResult fetched =
+                httpsFetcher->getToFile(httpsUrl, httpsPending, progressSink);
+
+            if (!fetched.ok) {
+                std::error_code rmEc;
+                fs::remove(httpsPending, rmEc);
+                errorMessage = "https download of " + packageName + " from "
+                             + httpsUrl + " failed: " + fetched.error;
+
+                if (!storageError.empty()) {
+                    errorMessage += "; storage " + storageUrl + " failed: " + storageError;
+                }
+
+                return {};
+            }
+        }
+
+        if (source) {
+            *source = sourceUrl;
+        }
+
+        // Super defensive here: check destination file existence
+        if (!fs::exists(pendingFile)) {
+            errorMessage = "download of " + packageName + " from " + sourceUrl
+                         + " failed: file not found after download";
             return {};
         }
+
         // Bind the downloaded artifact to what the index advertised
         // — manifest fields + signer DID. The .lgx `url` and the
         // `index.json` come from independent hosts; without this a
@@ -1968,7 +2059,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             if (!verifyDownloadAgainstIndex(pendingFile, *v, verr)) {
                 std::error_code rmEc;
                 fs::remove(pendingFile, rmEc);
-                errorMessage = "rejected " + packageName + " from " + url
+                errorMessage = "rejected " + packageName + " from " + sourceUrl
                              + ": " + verr;
                 return {};
             }
