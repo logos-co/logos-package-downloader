@@ -200,6 +200,7 @@ explicit RepositoryRegistry(std::string configPath);  // persisted
 | `std::string removeRepository(const std::string& url)` | Remove any repo from `list()`. For the default URL, sets `defaultRemoved=true` — the row is omitted entirely; user re-adds by pasting the URL. Persists on success. |
 | `std::string setEnabled(const std::string& url, bool enabled)` | Enable/disable any repo. Toggling the default sets the `defaultDisabled` config flag. |
 | `std::string refresh()` | Re-fetch `logos-repo.json` for every repo. Best-effort: per-entry failures land in `resolveError`, never abort. |
+| `DownloadSource downloadSource() const` / `std::string setDownloadSource(DownloadSource)` | The transports downloads may use: `Any`, `Logos` (Logos Storage only) or `Http` (HTTP only). Persisted as `downloadSource` when the registry has a config file; `downloadSourceName` / `parseDownloadSource` convert to and from `"any"`, `"logos"`, `"http"`. |
 | `std::optional<Repository> findByUrlOrName(const std::string& s) const` | Look up by URL or canonical name. |
 | `bool isPersistent() const` | True if constructed with a config-file path. |
 | `std::string configPath() const` | The backing config path, or empty when in-memory. |
@@ -347,11 +348,17 @@ stored.
   "schemaVersion": 1,
   "defaultDisabled": false,
   "defaultRemoved":  false,
+  "downloadSource":  "any",
   "repositories": [
     { "url": "https://example.com/my/logos-repo.json", "enabled": true }
   ]
 }
 ```
+
+`downloadSource` is `"any"`, `"logos"` or `"http"`; an unknown value reads as
+`"any"`. Under `"logos"` or `"http"`, `getCatalogJson()` marks each version the
+source cannot serve with `sourceAvailable: false`, `requiredSource` and
+`sourceUnavailableReason`, next to `sources` and `allowedSources` on every version.
 
 The default repository has two independent flags:
 
@@ -426,6 +433,7 @@ The test suite (`tests/test_downloader.cpp`, GoogleTest via CTest) covers:
 | `FetchSelection.HttpsIsUsedWhenNoStorageFetcherIsDefined` | https is used when no storage fetcher is set. |
 | `FetchSelection.LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls` | `url` is used when the index has no `urls`. |
 | `FetchSelection.HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork` | https is used when the storage fetcher is on another network. |
+| `DownloadSource.*` | The download source round-trips through the config, marks versions it cannot serve in the catalog, keeps downloads and the resolver off them, and takes the other transport out (no HTTP fallback under `logos`, no storage node under `http`). |
 
 ### Raw CMake (inside `nix develop`)
 

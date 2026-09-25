@@ -57,6 +57,22 @@ namespace lgpd {
 const char* kDefaultRepositoryUrl =
     "https://raw.githubusercontent.com/logos-co/logos-modules-release/refs/heads/main/logos-repo.json";
 
+std::string downloadSourceName(DownloadSource source) {
+    switch (source) {
+        case DownloadSource::Logos: return "logos";
+        case DownloadSource::Http:  return "http";
+        case DownloadSource::Any:   break;
+    }
+    return "any";
+}
+
+std::optional<DownloadSource> parseDownloadSource(const std::string& name) {
+    if (name == "any")   return DownloadSource::Any;
+    if (name == "logos") return DownloadSource::Logos;
+    if (name == "http")  return DownloadSource::Http;
+    return std::nullopt;
+}
+
 namespace {
 
 // ─── Small string utilities ──────────────────────────────────────────────────
@@ -84,6 +100,68 @@ const json& objOrEmpty(const json& parent, const char* key) {
     auto it = parent.find(key);
     if (it == parent.end() || !it->is_object()) return kEmpty;
     return *it;
+}
+
+// ─── Download source ─────────────────────────────────────────────────────────
+
+// The transports a version is published on, read from `url` and `urls`.
+struct VersionSources {
+    bool logos = false;
+    bool http = false;
+};
+
+VersionSources sourcesOf(const json& v) {
+    VersionSources s;
+    const auto classify = [&s](const json& u) {
+        if (!u.is_string()) return;
+        const std::string url = u.get<std::string>();
+        if (url.rfind("logos:", 0) == 0) {
+            s.logos = true;
+        } else if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
+            s.http = true;
+        }
+    };
+    if (!v.is_object()) return s;
+    if (v.contains("url")) classify(v["url"]);
+    if (v.contains("urls") && v["urls"].is_array()) {
+        for (const auto& u : v["urls"]) classify(u);
+    }
+    return s;
+}
+
+// Why `source` cannot download a version published on `s`; empty when it can.
+std::string sourceUnavailableReason(DownloadSource source, const VersionSources& s) {
+    if (source == DownloadSource::Logos && !s.logos)
+        return "Not on Logos Storage (download source: Logos only)";
+    if (source == DownloadSource::Http && !s.http)
+        return "Not available over HTTP (download source: HTTP only)";
+    return {};
+}
+
+// Adds `sources` (published on), `allowedSources` (those `source` lets a
+// download use) and `sourceAvailable`; when false, also `requiredSource` and
+// a readable `sourceUnavailableReason`.
+void annotateSources(json& v, DownloadSource source) {
+    const VersionSources s = sourcesOf(v);
+    json published = json::array();
+    json allowed = json::array();
+    if (s.logos) {
+        published.push_back("logos");
+        if (source != DownloadSource::Http) allowed.push_back("logos");
+    }
+    if (s.http) {
+        published.push_back("http");
+        if (source != DownloadSource::Logos) allowed.push_back("http");
+    }
+    v["sources"] = std::move(published);
+    v["allowedSources"] = std::move(allowed);
+
+    const std::string reason = sourceUnavailableReason(source, s);
+    v["sourceAvailable"] = reason.empty();
+    if (!reason.empty()) {
+        v["requiredSource"] = downloadSourceName(source);
+        v["sourceUnavailableReason"] = reason;
+    }
 }
 
 // ─── Repository source ───────────────────────────────────────────────────────
@@ -618,6 +696,7 @@ struct RepositoryRegistry::Impl {
     // every refresh(); never persisted, never offered to add/remove/setEnabled.
     std::vector<Repository> derivedRepos;
     bool followIncludes = true;
+    DownloadSource downloadSource = DownloadSource::Any;
     std::shared_ptr<Fetcher> fetcher;
     mutable std::mutex mu;
 
@@ -644,6 +723,11 @@ struct RepositoryRegistry::Impl {
             defaultDisabled = j.value("defaultDisabled", false);
             defaultRemoved  = j.value("defaultRemoved",  false);
             followIncludes  = j.value("followIncludes",  true);
+            // An unknown value keeps Any rather than dropping the whole config.
+            if (j.contains("downloadSource") && j["downloadSource"].is_string()) {
+                if (auto s = parseDownloadSource(j["downloadSource"].get<std::string>()))
+                    downloadSource = *s;
+            }
             userRepos.clear();
             if (j.contains("repositories") && j["repositories"].is_array()) {
                 for (const auto& r : j["repositories"]) {
@@ -666,6 +750,7 @@ struct RepositoryRegistry::Impl {
         j["defaultDisabled"] = defaultDisabled;
         j["defaultRemoved"]  = defaultRemoved;
         j["followIncludes"]  = followIncludes;
+        j["downloadSource"]  = downloadSourceName(downloadSource);
         json arr = json::array();
         for (const auto& r : userRepos) {
             json e;
@@ -898,6 +983,17 @@ void RepositoryRegistry::setFollowIncludes(bool follow) {
 bool RepositoryRegistry::followIncludes() const {
     std::lock_guard<std::mutex> lock(impl_->mu);
     return impl_->followIncludes;
+}
+
+DownloadSource RepositoryRegistry::downloadSource() const {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    return impl_->downloadSource;
+}
+
+std::string RepositoryRegistry::setDownloadSource(DownloadSource source) {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->downloadSource = source;
+    return impl_->persistent ? impl_->save() : std::string();
 }
 
 std::string RepositoryRegistry::addRepository(const std::string& url) {
@@ -1172,6 +1268,9 @@ struct PackageDownloaderLib::Impl {
         const std::string originName =
             source.name.empty() ? source.url : source.name;
         const auto slash = source.indexUrl.find_last_of('/');
+        // Stamped on each read, never into the cached index, so a new
+        // download source shows on the next listing.
+        const DownloadSource downloadSource = registry.downloadSource();
         for (auto& pkg : idx["packages"]) {
             if (!pkg.is_object() || !pkg.contains("name")) continue;
             // Per package, not per repo: a field of an unexpected type throws
@@ -1202,6 +1301,7 @@ struct PackageDownloaderLib::Impl {
                         const std::string iconPath = objOrEmpty(v, "icon").value("path", "");
                         if (!iconPath.empty() && slash != std::string::npos)
                             v["iconUrl"] = source.indexUrl.substr(0, slash) + "/" + iconPath;
+                        annotateSources(v, downloadSource);
                     }
                     versions.push_back(v);
                 }
@@ -1798,6 +1898,11 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
     bool sawPackage = false;
     bool readAnyIndex = false;
 
+    // Narrows the releases below the way an include filter does, and takes
+    // the other transport out once one is picked.
+    const DownloadSource downloadSource = impl_->registry.downloadSource();
+    bool sourceExcluded = false;
+
     // Choosing is a pass of its own, ranked across EVERY candidate rather than
     // stopping at the first one that can serve the name.
     //
@@ -1861,7 +1966,31 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 candidate = &filtered;
             }
             sawPackage = true;
-            const json* v = pickVersion(*candidate, version, rootHash);
+            // A release the download source cannot serve is listed as not
+            // available, so it is never picked either.
+            json served;
+            if (downloadSource != DownloadSource::Any) {
+                served = *candidate;
+                json keep = json::array();
+                for (const auto& r : candidate->value("versions", json::array())) {
+                    if (r.is_object() && sourceUnavailableReason(downloadSource, sourcesOf(r)).empty())
+                        keep.push_back(r);
+                }
+                served["versions"] = std::move(keep);
+            }
+            const json& pickable = downloadSource == DownloadSource::Any ? *candidate : served;
+            const json* v = pickVersion(pickable, version, rootHash);
+            if ((!v || !v->is_object()) && &pickable != candidate) {
+                // Say why a release that exists was not picked.
+                const json* unserved = pickVersion(*candidate, version, rootHash);
+                if (unserved && unserved->is_object()) {
+                    sourceExcluded = true;
+                    notes.push_back(repo.url + ": " + packageName + " " +
+                                    objOrEmpty(*unserved, "manifest").value("version", "") +
+                                    ": " + sourceUnavailableReason(downloadSource, sourcesOf(*unserved)));
+                    continue;
+                }
+            }
             if (!v || !v->is_object()) {
                 notes.push_back(repo.url + ": no release of " + packageName +
                                 " matches" +
@@ -1918,6 +2047,17 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             } else if (httpsFetcher->canHandle(candidate)) {
                 httpsUrl = candidate;
             }
+        }
+
+        if (downloadSource == DownloadSource::Http) storageUrl.clear();
+        if (downloadSource == DownloadSource::Logos) httpsUrl.clear();
+
+        if (downloadSource == DownloadSource::Logos && storageUrl.empty()) {
+            // The release is on Logos Storage, but no node here can fetch it.
+            errorMessage = packageName + " is on Logos Storage, but the storage node "
+                           "cannot fetch it: it is not running, or runs on another "
+                           "network (download source: logos, so HTTP is not tried)";
+            return {};
         }
 
         if (storageUrl.empty() && httpsUrl.empty()) {
@@ -2015,6 +2155,14 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
             }
         }
 
+        if (!downloaded && httpsUrl.empty()) {
+            // Logos only: a failed storage download has no HTTP fallback.
+            errorMessage = "storage download of " + packageName + " from " + storageUrl
+                         + " failed: " + storageError
+                         + " (download source: logos, so HTTP is not tried)";
+            return {};
+        }
+
         if (!downloaded) {
             throttle.reset();
 
@@ -2079,7 +2227,11 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
     }
 
     if (errorMessage.empty()) {
-        if (sawPackage)
+        if (sourceExcluded)
+            errorMessage = "no release of " + packageName +
+                           " is available with the download source " +
+                           downloadSourceName(downloadSource);
+        else if (sawPackage)
             errorMessage = "no release of " + packageName +
                            " matched the requested pin";
         else if (!readAnyIndex)
@@ -2239,7 +2391,11 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
     std::unordered_map<std::string, std::string> topLevelChosen; // name -> version
 
     // Lookup helper: find best candidate across repos.
+    const DownloadSource downloadSource = impl_->registry.downloadSource();
+
     auto findBest = [&](const ParsedDep& dep, json& chosen, std::string& chosenRepo, std::string& errMsg) -> bool {
+        // Set when a release matched but the download source cannot serve it.
+        bool sourceExcluded = false;
         // Hold the best candidate as an owned value, NOT a pointer.
         //
         // The previous `const json* bestVer = &v` aliased an element of
@@ -2282,6 +2438,11 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                 if (!v.is_object()) continue;
                 std::string ver = objOrEmpty(v, "manifest").value("version", "");
                 if (dep.versionRange && !semverRangeMatches(*dep.versionRange, ver)) continue;
+                // The catalog listed it as not available: the download would fail.
+                if (!v.value("sourceAvailable", true)) {
+                    sourceExcluded = true;
+                    continue;
+                }
                 // Signer pin — SELECTION ONLY. This narrows the candidate set
                 // and does nothing else: no keyring is consulted here, no
                 // anchor set exists in this process, and a satisfied pin
@@ -2315,6 +2476,9 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
             if (dep.versionRange) oss << " @ " << *dep.versionRange;
             if (dep.signer) oss << " (signer=" << *dep.signer << ")";
             if (dep.repositoryUrl) oss << " (repo=" << *dep.repositoryUrl << ")";
+            if (sourceExcluded)
+                oss << " that is available with the download source "
+                    << downloadSourceName(downloadSource);
             errMsg = oss.str();
             return false;
         }

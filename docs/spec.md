@@ -97,8 +97,15 @@ User repositories are persisted to a JSON config file with a stable schema:
   "defaultDisabled": false,
   "defaultRemoved":  false,
   "followIncludes":  true,
+  "downloadSource":  "any",
   "repositories": [ { "url": "...", "enabled": true }, ... ] }
 ```
+
+`downloadSource` (default `"any"`) picks the transports a download may use:
+`"any"` tries Logos Storage first and falls back to HTTP, `"logos"` uses Logos
+Storage only, `"http"` uses HTTP only. The catalog marks every version the
+setting cannot serve as not available (`sourceAvailable: false`, with a
+`sourceUnavailableReason`), and neither a download nor the resolver picks it.
 
 `followIncludes` (default `true`) is the client's opt-out from the include
 mechanism as a whole: with it off, `includesUrl` is not even fetched. An include is a real delegation — the included catalog's
@@ -277,6 +284,8 @@ A download is **pinned and verified** — never a blind fetch. The flow:
    2. FETCH   the .lgx from the version's urls
         first from Logos Storage (logos:<network>:<CID>)
         then from https (https://...), else from the version's url
+        downloadSource "logos" → Logos Storage only, no HTTP fallback
+        downloadSource "http"  → HTTP only, the storage node is not asked
         output dir empty → system temp (TMPDIR, else /tmp)
         a failed transfer leaves no half-written file behind
 

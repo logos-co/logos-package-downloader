@@ -2582,3 +2582,221 @@ TEST(IncludesDocument, DeclaredUrlIsReportedEvenWhenItResolvesToNothing) {
     EXPECT_EQ(r.value("includesUrl", ""), kRootIncludes);
     EXPECT_EQ(r.value("includes", json::array()).size(), 0u);
 }
+
+// ─── Download source ─────────────────────────────────────────────────────────
+
+namespace {
+
+// blockchain_module 0.2.0 over HTTP only, 0.1.0 on Logos Storage only.
+std::shared_ptr<MockFetcher> splitSourceCatalogFetcher() {
+    auto f = catalogFetcher(json::parse(uiDep));
+    json idx = json::parse(f->indexJson);
+    for (auto& pkg : idx["packages"]) {
+        if (pkg["name"] != packageName) continue;
+        for (auto& v : pkg["versions"]) {
+            if (v["manifest"]["version"] != "0.1.0") continue;
+            v.erase("url");
+            v["urls"] = json::array({storageUrl});
+        }
+    }
+    f->indexJson = idx.dump();
+    return f;
+}
+
+// One release of blockchain_module out of getCatalogJson.
+json catalogRelease(lgpd::PackageDownloaderLib& lib, const std::string& ver) {
+    for (const auto& pkg : json::parse(lib.getCatalogJson())) {
+        if (pkg.value("name", "") != packageName) continue;
+        for (const auto& v : pkg["versions"]) {
+            if (v["manifest"].value("version", "") == ver) return v;
+        }
+    }
+    return json::object();
+}
+
+}  // namespace
+
+TEST(DownloadSource, NamesRoundTrip) {
+    for (auto s : {lgpd::DownloadSource::Any, lgpd::DownloadSource::Logos,
+                   lgpd::DownloadSource::Http}) {
+        const auto parsed = lgpd::parseDownloadSource(lgpd::downloadSourceName(s));
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_TRUE(*parsed == s);
+    }
+    EXPECT_FALSE(lgpd::parseDownloadSource("https").has_value());
+    EXPECT_FALSE(lgpd::parseDownloadSource("").has_value());
+}
+
+TEST(DownloadSource, DefaultsToAnyAndPersists) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_test_src_" + std::to_string(std::rand()) + ".json");
+    {
+        lgpd::PackageDownloaderLib lib(cfg.string());
+        EXPECT_TRUE(lib.registry().downloadSource() == lgpd::DownloadSource::Any);
+        const auto err = lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+        EXPECT_TRUE(err.empty()) << err;
+    }
+    {
+        std::ifstream in(cfg);
+        json j; in >> j;
+        EXPECT_EQ(j.value("downloadSource", ""), "logos");
+
+        lgpd::PackageDownloaderLib lib2(cfg.string());
+        EXPECT_TRUE(lib2.registry().downloadSource() == lgpd::DownloadSource::Logos);
+    }
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+// An unknown value must not cost the user their repositories.
+TEST(DownloadSource, AnUnknownValueKeepsAnyAndTheRepositories) {
+    fs::path cfg = fs::temp_directory_path() / ("lgpd_test_src_bad_" + std::to_string(std::rand()) + ".json");
+    {
+        std::ofstream out(cfg);
+        out << json{{"schemaVersion", 1}, {"downloadSource", "ftp"},
+                    {"repositories", json::array({json{{"url", "https://example.com/logos-repo.json"},
+                                                       {"enabled", true}}})}}.dump();
+    }
+    lgpd::PackageDownloaderLib lib(cfg.string());
+
+    EXPECT_TRUE(lib.registry().downloadSource() == lgpd::DownloadSource::Any);
+    EXPECT_EQ(lib.registry().list().size(), 2u);
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(DownloadSource, TheCatalogMarksReleasesTheSourceCannotServe) {
+    auto http = storageCatalogFetcher();   // 0.2.0 on both, 0.1.0 over HTTP only
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+
+    const json both = catalogRelease(lib, "0.2.0");
+    EXPECT_EQ(both["sources"], json::array({"logos", "http"}));
+    EXPECT_EQ(both["allowedSources"], json::array({"logos"}));
+    EXPECT_TRUE(both.value("sourceAvailable", false));
+    EXPECT_FALSE(both.contains("sourceUnavailableReason"));
+
+    const json httpOnly = catalogRelease(lib, "0.1.0");
+    EXPECT_EQ(httpOnly["sources"], json::array({"http"}));
+    EXPECT_EQ(httpOnly["allowedSources"], json::array());
+    EXPECT_FALSE(httpOnly.value("sourceAvailable", true));
+    EXPECT_EQ(httpOnly.value("requiredSource", ""), "logos");
+    EXPECT_NE(httpOnly.value("sourceUnavailableReason", "").find("Logos Storage"), std::string::npos);
+}
+
+TEST(DownloadSource, AnyMarksEveryReleaseAvailable) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+
+    const json v = catalogRelease(lib, "0.1.0");
+    EXPECT_TRUE(v.value("sourceAvailable", false));
+    EXPECT_EQ(v["allowedSources"], json::array({"http"}));
+    EXPECT_FALSE(v.contains("requiredSource"));
+}
+
+TEST(DownloadSource, LogosOnlyNeverFallsBackToHttp) {
+    auto http = storageCatalogFetcher();
+    http->fileGetSucceeds = true;
+    auto storage = std::make_shared<StorageFetcher>(network, false);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+    std::string err;
+    const std::string path =
+        lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_TRUE(path.empty());
+    EXPECT_EQ(storage->attempts, std::vector<std::string>{storageUrl});
+    EXPECT_TRUE(http->fileGets.empty());
+    EXPECT_NE(err.find("HTTP is not tried"), std::string::npos) << err;
+}
+
+TEST(DownloadSource, HttpOnlyNeverAsksTheStorageNode) {
+    auto http = storageCatalogFetcher();
+    auto storage = std::make_shared<StorageFetcher>(network, true);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Http);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_TRUE(storage->attempts.empty());
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(DownloadSource, LogosOnlyPicksTheNewestReleaseOnStorage) {
+    auto http = splitSourceCatalogFetcher();
+    auto storage = std::make_shared<StorageFetcher>(network, true);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, "", rootHash, outputDir);
+
+    // 0.2.0 is newer but over HTTP only; 0.1.0 is the release on Logos Storage.
+    EXPECT_EQ(storage->fileGets, std::vector<std::string>{storageUrl});
+    EXPECT_TRUE(http->fileGets.empty());
+}
+
+TEST(DownloadSource, APinnedReleaseTheSourceCannotServeFailsWithTheReason) {
+    auto http = storageCatalogFetcher();
+    auto storage = std::make_shared<StorageFetcher>(network, true);
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+    std::string err;
+    const std::string path =
+        lib.downloadPackage(repoUrl, packageName, err, "0.1.0", rootHash, outputDir);
+
+    EXPECT_TRUE(path.empty());
+    EXPECT_TRUE(storage->attempts.empty());
+    EXPECT_TRUE(http->fileGets.empty());
+    EXPECT_NE(err.find("download source logos"), std::string::npos) << err;
+    EXPECT_NE(err.find("Not on Logos Storage"), std::string::npos) << err;
+}
+
+TEST(DownloadSource, LogosOnlyNeedsAStorageNodeThatCanFetchIt) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir);
+
+    EXPECT_TRUE(http->fileGets.empty());
+    EXPECT_NE(err.find("storage node cannot fetch it"), std::string::npos) << err;
+}
+
+TEST(DownloadSource, TheResolverOnlyPicksReleasesTheSourceCanServe) {
+    auto http = splitSourceCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    const std::string input = json::array({packageName}).dump();
+
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+    EXPECT_EQ(resolvedVersions(lib.resolveDependenciesJson(input))[packageName],
+              std::vector<std::string>{"0.1.0"});
+
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Http);
+    EXPECT_EQ(resolvedVersions(lib.resolveDependenciesJson(input))[packageName],
+              std::vector<std::string>{"0.2.0"});
+}
+
+TEST(DownloadSource, TheResolverSaysWhenTheSourceExcludesEveryRelease) {
+    auto http = storageCatalogFetcher();   // blockchain_ui is over HTTP only
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+
+    const json out = json::parse(lib.resolveDependenciesJson(json::array({"blockchain_ui"}).dump()));
+
+    ASSERT_FALSE(out.empty());
+    EXPECT_NE(out[0].value("error", "").find("download source logos"), std::string::npos) << out.dump();
+}
