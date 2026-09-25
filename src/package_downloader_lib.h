@@ -20,6 +20,20 @@ struct FetchResult {
     std::string error;
 };
 
+/// The transports a download may use. A client setting, persisted with the
+/// repositories.
+enum class DownloadSource {
+    Any,    ///< Logos Storage first, then HTTP.
+    Logos,  ///< Logos Storage only: never falls back to HTTP.
+    Http,   ///< HTTP only: never asks the storage node.
+};
+
+/// "any", "logos" or "http".
+std::string downloadSourceName(DownloadSource source);
+
+/// The source a name from downloadSourceName() stands for; nullopt otherwise.
+std::optional<DownloadSource> parseDownloadSource(const std::string& name);
+
 /// Byte-progress sink for one transfer. `total` is 0 for "size unknown" —
 /// never divide by it.
 using ProgressFn = std::function<void(std::uint64_t received, std::uint64_t total)>;
@@ -188,6 +202,13 @@ public:
     void setFollowIncludes(bool follow);
     bool followIncludes() const;
 
+    /// The transports downloads may use. Default Any.
+    DownloadSource downloadSource() const;
+
+    /// Sets the download source and persists it when the registry has a
+    /// config file. Returns an empty string on success or the save error.
+    std::string setDownloadSource(DownloadSource source);
+
     /// Add a user repo by URL, or re-enable the default repo when `url` is
     /// `kDefaultRepositoryUrl`. The URL must point to a `logos-repo.json`
     /// (or wherever the client can fetch one). On success persists the
@@ -281,6 +302,12 @@ public:
     /// `releasedAt, publisherRef, url, size, sha256, rootHash, manifest,
     /// signature?` exactly as in `index.json`, plus the synthesised
     /// `originRepository{Url,Name,DisplayName}` and `iconUrl?`.
+    ///
+    /// Each version also carries `sources` (the transports it is published
+    /// on: "logos", "http"), `allowedSources` (those the download source lets
+    /// a download use) and `sourceAvailable`. When that is false, the version
+    /// also has `requiredSource` ("logos" or "http") and a readable
+    /// `sourceUnavailableReason`; downloads and the resolver skip it.
     std::string getCatalogJson();
 
     /// JSON array of all packages for one repo (URL or canonical name).
@@ -308,7 +335,10 @@ public:
     /// else 0. It covers the TRANSFER ONLY — index-binding verification runs
     /// after the last callback, so 100% is not "done".
     ///
-    /// Tries Logos Storage first, then https, then the `url` entry.
+    /// Tries Logos Storage first, then https, then the `url` entry. The
+    /// download source narrows that: Logos never falls back to HTTP, Http
+    /// never asks the storage node, and a release it cannot serve is not
+    /// picked.
     ///
     /// `source` reports the source URL used to fetch the package.
     std::string downloadPackage(const std::string& repoUrlOrName,
