@@ -271,21 +271,46 @@ std::uint64_t monotonicNowMs() {
             std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-// libcurl progress trampoline; `userp` is the caller's ProgressFn. Always
-// returns 0 — non-zero would ABORT the transfer, and a slow sink must not be
-// able to fail a good download.
+bool cancellationRequested(const CancelFn& isCancelled) noexcept {
+    if (!isCancelled) return false;
+    try {
+        return isCancelled();
+    } catch (...) {
+        // An exception must not cross a libcurl callback's C boundary.
+        return true;
+    }
+}
+
+struct CurlTransferCallbacks {
+    const ProgressFn& onProgress;
+    const CancelFn& isCancelled;
+    bool cancelled = false;
+};
+
+// libcurl's transfer callback runs even when no progress listener is set.
+// Its cancellation result aborts the transfer; a throwing progress listener
+// still costs only that sample.
 int curlXferInfo(void* userp, curl_off_t dltotal, curl_off_t dlnow,
                  curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
-    const auto& fn = *static_cast<const ProgressFn*>(userp);
-    if (fn && dlnow >= 0 && dltotal >= 0) {
+    auto& callbacks = *static_cast<CurlTransferCallbacks*>(userp);
+    if (cancellationRequested(callbacks.isCancelled)) {
+        callbacks.cancelled = true;
+        return 1;
+    }
+    if (callbacks.onProgress && dlnow >= 0 && dltotal >= 0) {
         // This is a C boundary: letting an exception unwind through libcurl's
         // frames is undefined behaviour. A sink that throws — bad_alloc while
         // marshalling an event, say — must cost a progress sample, not the
         // process.
         try {
-            fn(static_cast<std::uint64_t>(dlnow), static_cast<std::uint64_t>(dltotal));
+            callbacks.onProgress(static_cast<std::uint64_t>(dlnow),
+                                 static_cast<std::uint64_t>(dltotal));
         } catch (...) {
         }
+    }
+    if (cancellationRequested(callbacks.isCancelled)) {
+        callbacks.cancelled = true;
+        return 1;
     }
     return 0;
 }
@@ -437,6 +462,13 @@ public:
 
     FetchResult getToFile(const std::string& url, const std::string& path,
                           const ProgressFn& onProgress) override {
+        return getToFile(url, path, onProgress, CancelFn{});
+    }
+
+    FetchResult getToFile(const std::string& url, const std::string& path,
+                          const ProgressFn& onProgress,
+                          const CancelFn& isCancelled) override {
+        if (cancellationRequested(isCancelled)) return {false, "download cancelled"};
         curlInit();
         std::error_code ec;
         fs::create_directories(fs::path(path).parent_path(), ec);
@@ -473,9 +505,10 @@ public:
         // redirects — needed for GitHub release assets, where only the
         // redirect target carries a Content-Length. `dltotal` is 0 until the
         // headers land, and stays 0 for a chunked response.
-        if (onProgress) {
+        CurlTransferCallbacks callbacks{onProgress, isCancelled};
+        if (onProgress || isCancelled) {
             curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, curlXferInfo);
-            curl_easy_setopt(c, CURLOPT_XFERINFODATA, &onProgress);
+            curl_easy_setopt(c, CURLOPT_XFERINFODATA, &callbacks);
             curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
         }
         CURLcode res = curl_easy_perform(c);
@@ -484,6 +517,9 @@ public:
         curl_easy_cleanup(c);
         f.close();
 
+        if (callbacks.cancelled || cancellationRequested(isCancelled)) {
+            return fail("download cancelled");
+        }
         if (res != CURLE_OK || code < 200 || code >= 300) {
             return fail(curlFailDetail(res, code));
         }
@@ -677,6 +713,10 @@ struct VersionPrecedenceDesc {
 
 } // namespace
 
+std::shared_ptr<Fetcher> makeHttpsFetcher() {
+    return std::make_shared<HttpsFetcher>();
+}
+
 // ─── RepositoryRegistry::Impl ─────────────────────────────────────────────────
 
 struct RepositoryRegistry::Impl {
@@ -711,7 +751,7 @@ struct RepositoryRegistry::Impl {
         defaultRepo.url = kDefaultRepositoryUrl;
         defaultRepo.isDefault = true;
         defaultRepo.enabled = true;
-        fetcher = std::make_shared<HttpsFetcher>();
+        fetcher = makeHttpsFetcher();
     }
 
     void load() {
@@ -1117,7 +1157,7 @@ std::string RepositoryRegistry::configPath() const { return impl_->configPath; }
 
 struct PackageDownloaderLib::Impl {
     RepositoryRegistry registry;
-    std::shared_ptr<Fetcher> fetcher = std::make_shared<HttpsFetcher>();
+    std::shared_ptr<Fetcher> fetcher = makeHttpsFetcher();
     std::shared_ptr<Fetcher> storageFetcher;
 
     // Caches: url -> body
@@ -1852,11 +1892,37 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                                                   const std::string& outputDir,
                                                   const ProgressFn& onProgress,
                                                   std::string* source) {
+    return downloadPackage(repoUrlOrName, packageName, errorMessage, version,
+                           rootHash, outputDir, onProgress, source, CancelFn{});
+}
+
+std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrName,
+                                                  const std::string& packageName,
+                                                  std::string& errorMessage,
+                                                  const std::string& version,
+                                                  const std::string& rootHash,
+                                                  const std::string& outputDir,
+                                                  const ProgressFn& onProgress,
+                                                  std::string* source,
+                                                  const CancelFn& isCancelled) {
 
     // Clear any previous error message before starting a new download attempt.
     errorMessage.clear();
 
+    auto cancelled = [&](const std::string& pendingFile) {
+        if (!cancellationRequested(isCancelled)) return false;
+        if (!pendingFile.empty()) {
+            std::error_code ec;
+            fs::remove(pendingFile, ec);
+        }
+        errorMessage = "download cancelled";
+        return true;
+    };
+
+    if (cancelled("")) return {};
+
     impl_->ensureMetadata();
+    if (cancelled("")) return {};
 
     // Build the list of repos to consider. Included catalogs are candidates
     // too — a package the catalog LISTS has to be a package it can serve, or
@@ -1923,8 +1989,10 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
     std::string pickedDate;
 
     for (const auto& repo : candidates) {
+        if (cancelled("")) return {};
         std::string fetchErr;
         std::string body = impl_->fetchIndex(repo, &fetchErr);
+        if (cancelled("")) return {};
         if (body.empty()) {
             notes.push_back(repo.url + ": " +
                             (fetchErr.empty() ? "index unavailable" : fetchErr));
@@ -2140,6 +2208,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         // https fails.
         std::string storageError;
 
+        if (cancelled("")) return {};
         if (!storageUrl.empty()) {
             const FetchResult storageFetched =
                 storageFetcher->getToFile(storageUrl, storagePending, progressSink);
@@ -2153,6 +2222,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 sourceUrl = storageUrl;
                 pendingFile = storagePending;
             }
+            if (cancelled(storagePending)) return {};
         }
 
         if (!downloaded && httpsUrl.empty()) {
@@ -2164,10 +2234,16 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         }
 
         if (!downloaded) {
+            if (cancelled("")) return {};
             throttle.reset();
 
-            const FetchResult fetched =
-                httpsFetcher->getToFile(httpsUrl, httpsPending, progressSink);
+            // Keep the established virtual call for clients without a token:
+            // an already-compiled custom Fetcher may not have the new slot.
+            const FetchResult fetched = isCancelled
+                ? httpsFetcher->getToFile(httpsUrl, httpsPending, progressSink, isCancelled)
+                : httpsFetcher->getToFile(httpsUrl, httpsPending, progressSink);
+
+            if (cancelled(httpsPending)) return {};
 
             if (!fetched.ok) {
                 std::error_code rmEc;
@@ -2182,6 +2258,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 return {};
             }
         }
+
+        if (cancelled(pendingFile)) return {};
 
         if (source) {
             *source = sourceUrl;
@@ -2212,6 +2290,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                 return {};
             }
         }
+
+        if (cancelled(pendingFile)) return {};
 
         std::error_code mvEc;
         fs::rename(pendingFile, dest, mvEc);

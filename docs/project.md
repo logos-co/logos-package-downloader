@@ -172,7 +172,8 @@ Logos module wrapper and existing CLI code use that name).
 | `std::string getCatalogJson()` | Merged catalog JSON across enabled repos: `[{repositoryUrl, repositoryName, repositoryDisplayName, name, description, type, category, author, icon, versions:[...]}]`; `versions[]` newest-first by SemVer, `releasedAt` breaks ties. |
 | `std::string getCatalogForRepoJson(const std::string& urlOrName)` | Same synthesised shape scoped to one repo (by URL or canonical name). Returns `"[]"` if the repo is not found. |
 | `std::string refreshCatalogs()` | Clear caches and force re-fetch of every enabled repo's metadata + `index.json`. Empty string on success, else an error summary. |
-| `std::string downloadPackage(repoUrlOrName, packageName, version="", rootHash="", outputDir="", onProgress={}, source=nullptr)` | Download + verify a `.lgx`; returns the local path or empty on error. `repo` empty = any enabled repo (registry order); `version` empty = newest; `rootHash` disambiguates same-version builds; `outputDir` empty = a private per-user staging directory under the system temp dir (`<temp>/lgpd-<uid>`), never the shared temp root. Tries Logos Storage first, then https, then `url`. `source` gives the URL used. |
+| `std::string downloadPackage(repoUrlOrName, packageName, errorMessage, version="", rootHash="", outputDir="", onProgress={}, source=nullptr)` | Download + verify a `.lgx`; returns the local path or empty with `errorMessage` set. `repo` empty = any enabled repo (registry order); `version` empty = newest; `rootHash` disambiguates same-version builds; `outputDir` empty = a private per-user staging directory under the system temp dir (`<temp>/lgpd-<uid>`). Tries Logos Storage first, then HTTPS. `source` gives the URL used. |
+| `downloadPackage(..., onProgress, source, isCancelled)` | Cancel-aware overload. `isCancelled` stops an active HTTPS transfer, removes its pending file, and prevents fallback to HTTPS after Storage cancellation. Keep its result true after cancellation. The original overload remains available to compiled clients. |
 | `std::string resolveDependenciesJson(dependenciesJson, installedPackagesJson="")` | Cross-repo BFS resolver. Output is a JSON array in install order: `[{repositoryUrl, name, version, rootHash, url, topLevel}]`; on failure an `{error, name}` entry at the unsatisfied position. The installed-state snapshot (`[{name, version, rootHash}]`) short-circuits already-satisfied transitive deps. |
 | `static bool semverMatches(const std::string& range, const std::string& version)` | True if the semver range matches the concrete version. Empty range matches anything. Exposed for tests/filtering. |
 
@@ -218,12 +219,19 @@ class Fetcher {
     virtual FetchResult getToFile(const std::string& url, const std::string& path) = 0;  // GET to a file
     virtual FetchResult getToFile(const std::string& url, const std::string& path,
                                   const ProgressFn& onProgress);                  // same, with progress
+    virtual FetchResult getToFile(const std::string& url, const std::string& path,
+                                  const ProgressFn& onProgress,
+                                  const CancelFn& isCancelled);                  // cancel-aware transfer
 };
 ```
 
 The concrete `HttpsFetcher` in the `.cpp` uses libcurl and downloads `https://`
-URLs; tests inject their own. A storage fetcher knows its network and downloads
-`logos:<network>:<CID>` URLs.
+URLs; its transfer callback checks `isCancelled` even when no progress listener
+is supplied. Existing custom fetchers keep working through the default overload;
+they can override the cancel-aware overload to stop in-flight transfers. A
+storage fetcher knows its network and downloads `logos:<network>:<CID>` URLs.
+`makeHttpsFetcher()` constructs the default fetcher when a caller needs it
+directly or wants to restore it after injecting another implementation.
 
 ### `lgpd::Repository` (struct)
 
