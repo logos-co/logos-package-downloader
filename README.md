@@ -38,6 +38,7 @@ The public API speaks JSON strings so it's trivially callable from a C
 wrapper, the package-downloader Logos module, and tests.
 
 ```cpp
+#include <atomic>
 #include <package_downloader_lib.h>
 
 // In-memory only, or backed by a config file that persists user repos.
@@ -69,9 +70,18 @@ std::string plan2 = dl.resolveDependenciesJson(depsJson, installedJson);
 // repoUrlOrName empty → any enabled repo (registry order); version empty
 // → newest matching; rootHash disambiguates two builds sharing a version.
 // Returns the local .lgx path, or empty on error.
-std::string path = dl.downloadPackage(/*repo*/"", "wallet_module",
+std::string error;
+std::string path = dl.downloadPackage(/*repo*/"", "wallet_module", error,
                                       /*version*/"1.0.0", /*rootHash*/"",
                                       /*outputDir*/"/tmp/pkgs");
+
+// A caller unloading on another thread can stop an active HTTPS transfer.
+// Keep the flag true once set; the optional callback is checked even when
+// no progress listener is supplied. The controlling thread sets
+// unloading.store(true) while this call is in progress.
+std::atomic<bool> unloading{false};
+path = dl.downloadPackage("", "wallet_module", error, "1.0.0", "", "",
+                          {}, nullptr, [&] { return unloading.load(); });
 ```
 
 ### C API

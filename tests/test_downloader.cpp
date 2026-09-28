@@ -3,6 +3,7 @@
 #include "progress_throttle.h"   // private header; reachable via the lib's PUBLIC src/ include dir
 #include <nlohmann/json.hpp>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +26,7 @@ class MockFetcher : public lgpd::Fetcher {
 public:
     std::string repoJson;   // served for the default repo URL
     std::string indexJson;  // served for kIndexUrl
+    std::vector<std::string> gets;      // URLs passed to get
     std::vector<std::string> fileGets;  // URLs passed to getToFile
     std::string lastDest;               // path passed to the last getToFile
     bool fileGetSucceeds = false;       // result returned by getToFile
@@ -38,6 +40,7 @@ public:
     }
 
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        gets.push_back(url);
         auto it = byUrl.find(url);
         if (it != byUrl.end()) {
             out = it->second;
@@ -1556,6 +1559,50 @@ private:
     bool succeed_;
 };
 
+class CancellingStorageFetcher : public StorageFetcher {
+public:
+    explicit CancellingStorageFetcher(bool& cancelled)
+        : StorageFetcher(network, false), cancelled_(cancelled) {}
+
+    std::string pendingFile;
+
+    lgpd::FetchResult getToFile(const std::string& url,
+                                const std::string& path) override {
+        attempts.push_back(url);
+        pendingFile = path;
+        std::ofstream(path, std::ios::binary) << "partial storage download";
+        cancelled_ = true;
+        return {false, "storage cancelled"};
+    }
+
+private:
+    bool& cancelled_;
+};
+
+class CancellingHttpFetcher : public MockFetcher {
+public:
+    explicit CancellingHttpFetcher(bool& cancelled) : cancelled_(cancelled) {}
+
+    bool receivedCancelCheck = false;
+    std::string pendingFile;
+
+    lgpd::FetchResult getToFile(const std::string& url, const std::string& path,
+                                const lgpd::ProgressFn&,
+                                const lgpd::CancelFn& isCancelled) override {
+        fileGets.push_back(url);
+        pendingFile = path;
+        receivedCancelCheck = static_cast<bool>(isCancelled) && !isCancelled();
+        std::ofstream(path, std::ios::binary) << "partial HTTPS download";
+        cancelled_ = true;
+        // A transport may finish at the same instant cancellation arrives.
+        // The library must still remove the file instead of publishing it.
+        return {true, {}};
+    }
+
+private:
+    bool& cancelled_;
+};
+
 std::shared_ptr<MockFetcher> storageCatalogFetcher() {
     const json uiDepRangeJson = json::parse(uiDep);
     const json urlsJson = json::array({storageUrl, lgxStorageUrl});
@@ -1609,6 +1656,94 @@ TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
     EXPECT_EQ(storage->attempts, std::vector<std::string>{storageUrl});
     EXPECT_TRUE(storage->fileGets.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+TEST(DownloadCancellation, AlreadyCancelledSkipsMetadataAndTransfer) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+
+    std::string err;
+    const std::string path = lib.downloadPackage(
+        repoUrl, packageName, err, version, rootHash, outputDir, {}, nullptr,
+        [] { return true; });
+
+    EXPECT_TRUE(path.empty());
+    EXPECT_EQ(err, "download cancelled");
+    EXPECT_TRUE(http->gets.empty());
+    EXPECT_TRUE(http->fileGets.empty());
+}
+
+TEST(DownloadCancellation, CancelledStorageDoesNotFallBackToHttps) {
+    auto http = storageCatalogFetcher();
+    bool cancelled = false;
+    auto storage = std::make_shared<CancellingStorageFetcher>(cancelled);
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+
+    std::string err;
+    const std::string path = lib.downloadPackage(
+        repoUrl, packageName, err, version, rootHash, outputDir, {}, nullptr,
+        [&] { return cancelled; });
+
+    EXPECT_TRUE(path.empty());
+    EXPECT_EQ(err, "download cancelled");
+    EXPECT_EQ(storage->attempts, std::vector<std::string>{storageUrl});
+    EXPECT_TRUE(http->fileGets.empty());
+    EXPECT_FALSE(storage->pendingFile.empty());
+    EXPECT_FALSE(fs::exists(storage->pendingFile));
+}
+
+TEST(DownloadCancellation, InFlightHttpsReceivesCancellationWithoutProgressSink) {
+    bool cancelled = false;
+    auto http = std::make_shared<CancellingHttpFetcher>(cancelled);
+    auto catalog = storageCatalogFetcher();
+    http->repoJson = catalog->repoJson;
+    http->indexJson = catalog->indexJson;
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+
+    std::string err;
+    const std::string path = lib.downloadPackage(
+        repoUrl, packageName, err, version, rootHash, outputDir, {}, nullptr,
+        [&] { return cancelled; });
+
+    EXPECT_TRUE(path.empty());
+    EXPECT_EQ(err, "download cancelled");
+    EXPECT_TRUE(http->receivedCancelCheck);
+    EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+    EXPECT_FALSE(http->pendingFile.empty());
+    EXPECT_FALSE(fs::exists(http->pendingFile));
+}
+
+// file:// uses the same libcurl transfer callback as HTTPS, without an
+// external server or certificate fixture. The cancellation check changes its
+// answer only after the pre-flight check, so this proves libcurl invokes the
+// callback even when there is no progress listener.
+TEST(DownloadCancellation, CurlAbortsAndRemovesPartialFileWithoutProgressSink) {
+    const fs::path src = fs::temp_directory_path() /
+        ("lgpd_cancel_source_" + std::to_string(std::rand()) + ".bin");
+    const fs::path dest = fs::temp_directory_path() /
+        ("lgpd_cancel_dest_" + std::to_string(std::rand()) + ".bin");
+    {
+        std::ofstream out(src, std::ios::binary);
+        const std::string chunk(1024 * 1024, 'x');
+        out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    }
+
+    int checks = 0;
+    const lgpd::FetchResult result = lgpd::makeHttpsFetcher()->getToFile(
+        "file://" + src.string(), dest.string(), {},
+        [&] { return ++checks >= 3; });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.error, "download cancelled");
+    EXPECT_GE(checks, 3);
+    EXPECT_FALSE(fs::exists(dest));
+
+    std::error_code ec;
+    fs::remove(src, ec);
 }
 
 TEST(FetchSelection, StorageReportsTheCidAsTheSource) {

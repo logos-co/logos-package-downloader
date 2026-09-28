@@ -38,6 +38,11 @@ std::optional<DownloadSource> parseDownloadSource(const std::string& name);
 /// never divide by it.
 using ProgressFn = std::function<void(std::uint64_t received, std::uint64_t total)>;
 
+/// Return true after cancellation is requested. The callback must be safe to
+/// call from the transfer thread and keep returning true for the lifetime of
+/// the download; the HTTPS fetcher checks it even without a progress listener.
+using CancelFn = std::function<bool()>;
+
 /// Minimal HTTP(S) fetcher abstraction. The concrete implementation in the
 /// .cpp uses libcurl. Tests can inject their own implementation.
 class Fetcher {
@@ -62,7 +67,27 @@ public:
         (void)onProgress;
         return getToFile(url, path);
     }
+
+    /// Cancel-aware transfer. Existing fetchers retain their old overload;
+    /// transports with in-flight cancellation override this one.
+    virtual FetchResult getToFile(const std::string& url,
+                                  const std::string& path,
+                                  const ProgressFn& onProgress,
+                                  const CancelFn& isCancelled) {
+        const auto cancelled = [&]() noexcept {
+            try { return isCancelled && isCancelled(); }
+            catch (...) { return true; }
+        };
+        if (cancelled()) return {false, "download cancelled"};
+        FetchResult result = getToFile(url, path, onProgress);
+        if (cancelled()) return {false, "download cancelled"};
+        return result;
+    }
 };
+
+/// Construct the default libcurl-backed fetcher. Also useful when a caller
+/// needs to restore HTTPS after temporarily injecting another Fetcher.
+std::shared_ptr<Fetcher> makeHttpsFetcher();
 
 /// One package a catalog pulls in from another catalog, and how much of it.
 ///
@@ -349,6 +374,21 @@ public:
                                 const std::string& outputDir = "",
                                 const ProgressFn& onProgress = {},
                                 std::string* source = nullptr);
+
+    /// Cancel-aware overload. `isCancelled` may be checked from the transfer
+    /// thread; it must stay true once cancellation is requested. Cancellation
+    /// removes the pending file, prevents an HTTPS fallback, and reports
+    /// "download cancelled". The old overload stays available to compiled
+    /// callers.
+    std::string downloadPackage(const std::string& repoUrlOrName,
+                                const std::string& packageName,
+                                std::string& errorMessage,
+                                const std::string& version,
+                                const std::string& rootHash,
+                                const std::string& outputDir,
+                                const ProgressFn& onProgress,
+                                std::string* source,
+                                const CancelFn& isCancelled);
 
     /// Cross-repo dependency resolution.
     ///
