@@ -28,6 +28,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <random>
@@ -2341,6 +2342,7 @@ struct ParsedDep {
     // clicked) can pin it. Manifest-declared transitive deps don't set
     // this; they fall through to the cross-repo "best" pick.
     std::optional<std::string> repositoryUrl;
+    std::optional<std::string> rootHash;
 };
 
 // A dependency's `signer` field DISAMBIGUATES among same-named candidates: "of
@@ -2422,6 +2424,8 @@ bool parseDep(const json& j, ParsedDep& out, std::string& err) {
 
     if (j.contains("repositoryUrl") && j["repositoryUrl"].is_string())
         out.repositoryUrl = j["repositoryUrl"].get<std::string>();
+    if (j.contains("rootHash") && j["rootHash"].is_string() && !j["rootHash"].get<std::string>().empty())
+        out.rootHash = j["rootHash"].get<std::string>();
     return true;
 }
 
@@ -2518,6 +2522,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                 if (!v.is_object()) continue;
                 std::string ver = objOrEmpty(v, "manifest").value("version", "");
                 if (dep.versionRange && !semverRangeMatches(*dep.versionRange, ver)) continue;
+                if (dep.rootHash && v.value("rootHash", "") != *dep.rootHash) continue;
                 // The catalog listed it as not available: the download would fail.
                 if (!v.value("sourceAvailable", true)) {
                     sourceExcluded = true;
@@ -2567,6 +2572,92 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         return true;
     };
 
+    // Optional packages are offers, kept outside the executable closure. A
+    // caller opts in by adding an offer's `request` to its next input array.
+    json optionalOffers = json::array();
+    std::unordered_set<std::string> requiredNames;
+    std::unordered_set<std::string> scannedManifests;
+    std::unordered_set<std::string> offeredRequests;
+    std::map<std::string, json> planManifests;
+    auto requiredClosureError = [&](const json& candidate) {
+        std::vector<json> manifests{objOrEmpty(candidate, "manifest")};
+        std::unordered_set<std::string> visited;
+        for (size_t head = 0; head < manifests.size(); ++head) {
+            const json manifest = manifests[head];
+            const auto deps = manifest.find("dependencies");
+            if (deps == manifest.end() || !deps->is_array()) continue;
+            for (const auto& raw : *deps) {
+                ParsedDep d; std::string why;
+                if (!parseDep(raw, d, why)) return why;
+                auto installed = installedByName.find(d.name);
+                if (installed != installedByName.end()
+                    && (!d.versionRange || semverRangeMatches(*d.versionRange, installed->second)))
+                    continue;
+                json chosen; std::string repo;
+                if (!findBest(d, chosen, repo, why)) return why;
+                const std::string key = d.name + "|" + chosen.value("rootHash", "");
+                if (visited.insert(key).second) manifests.push_back(objOrEmpty(chosen, "manifest"));
+            }
+        }
+        return std::string{};
+    };
+    std::function<void(const json&, const std::string&)> collectOffers;
+    collectOffers = [&](const json& manifest, const std::string& parent) {
+        const std::string scanKey = parent + "|" + manifest.value("version", "");
+        if (!scannedManifests.insert(scanKey).second) return;
+        const auto optional = manifest.find("optional_dependencies");
+        if (optional != manifest.end() && optional->is_array()) {
+            for (const auto& raw : *optional) {
+                ParsedDep d; std::string why;
+                if (!parseDep(raw, d, why)) continue;
+                auto installed = installedByName.find(d.name);
+                if (installed != installedByName.end()
+                    && (!d.versionRange || semverRangeMatches(*d.versionRange, installed->second)))
+                    continue;
+                json request = raw.is_string() ? json{{"name", d.name}} : raw;
+                if (!offeredRequests.insert(request.dump()).second) continue;
+                json offer{{"name", d.name}, {"requiredBy", parent}};
+                json chosen; std::string repo;
+                if (!findBest(d, chosen, repo, why)) {
+                    offer["error"] = why;
+                } else if (!(why = requiredClosureError(chosen)).empty()) {
+                    offer["error"] = "required dependency unavailable: " + why;
+                } else {
+                    const std::string version = objOrEmpty(chosen, "manifest").value("version", "");
+                    offer["version"] = version;
+                    offer["repositoryUrl"] = repo;
+                    offer["rootHash"] = chosen.value("rootHash", "");
+                    request["version"] = version;
+                    request["repositoryUrl"] = repo;
+                    request["rootHash"] = offer["rootHash"];
+                }
+                offer["request"] = request;
+                optionalOffers.push_back(std::move(offer));
+            }
+        }
+        // A satisfied installed dependency is omitted from the install plan,
+        // but its optional collaborators must still be discoverable.
+        const auto deps = manifest.find("dependencies");
+        if (deps == manifest.end() || !deps->is_array()) return;
+        for (const auto& raw : *deps) {
+            ParsedDep d; std::string why;
+            if (!parseDep(raw, d, why)) continue;
+            requiredNames.insert(d.name);
+            auto planned = planManifests.find(d.name);
+            if (planned != planManifests.end()) {
+                collectOffers(planned->second, d.name);
+                continue;
+            }
+            auto installed = installedByName.find(d.name);
+            if (installed != installedByName.end()
+                && (!d.versionRange || semverRangeMatches(*d.versionRange, installed->second)))
+                d.versionRange = installed->second;
+            json chosen; std::string repo;
+            if (findBest(d, chosen, repo, why))
+                collectOffers(objOrEmpty(chosen, "manifest"), d.name);
+        }
+    };
+
     // BFS so deps-of-deps are added before their consumers. Each queue
     // entry carries an isTopLevel flag — true for the caller's input
     // array, false for deps the resolver pulled in. Top-level entries
@@ -2593,6 +2684,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
     for (size_t head = 0; head < queue.size(); ++head) {
         QueueEntry qe = std::move(queue[head]);
         const ParsedDep& dep = qe.dep;
+        requiredNames.insert(dep.name);
 
         // Installed-state short-circuit (transitive only). If an
         // installed copy's version meets the dep's range, the dep is
@@ -2620,7 +2712,14 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
             if (it != installedByName.end()) {
                 const bool inRange = !dep.versionRange
                                   || semverRangeMatches(*dep.versionRange, it->second);
-                if (inRange) continue;
+                if (inRange) {
+                    ParsedDep installedDep = dep;
+                    installedDep.versionRange = it->second;
+                    json chosen; std::string repo; std::string why;
+                    if (findBest(installedDep, chosen, repo, why))
+                        planManifests[dep.name] = objOrEmpty(chosen, "manifest");
+                    continue;
+                }
             }
         }
 
@@ -2649,6 +2748,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
         // Remember the version an explicit top-level input resolved to, so a
         // later transitive encounter of the same name defers to it (above).
         if (qe.isTopLevel) topLevelChosen[dep.name] = ver;
+        planManifests[dep.name] = chosenManifest;
         // Enqueue transitive deps from the chosen version's manifest.
         //
         // A dependency entry that cannot be parsed is REPORTED and resolution
@@ -2685,6 +2785,45 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
     }
     // Reverse so deps appear before their consumers.
     std::reverse(out.begin(), out.end());
+    // Explicit optional selections can also be dependencies of each other.
+    // Reversing a breadth-first walk alone does not order that graph (or a
+    // diamond) correctly. Visit required edges before emitting each consumer.
+    json ordered = json::array();
+    std::vector<int> state(out.size(), 0);
+    std::unordered_map<std::string, std::vector<size_t>> rowsByName;
+    for (size_t i = 0; i < out.size(); ++i) rowsByName[out[i].value("name", "")].push_back(i);
+    std::function<void(size_t)> visit = [&](size_t i) {
+        if (state[i]) return;
+        state[i] = 1;
+        const auto manifest = planManifests.find(out[i].value("name", ""));
+        if (manifest != planManifests.end()) {
+            const auto deps = manifest->second.find("dependencies");
+            if (deps != manifest->second.end() && deps->is_array()) {
+                for (const auto& raw : *deps) {
+                    ParsedDep d; std::string why;
+                    if (!parseDep(raw, d, why)) continue;
+                    const auto rows = rowsByName.find(d.name);
+                    if (rows != rowsByName.end())
+                        for (size_t j : rows->second) visit(j);
+                }
+            }
+        }
+        ordered.push_back(out[i]);
+        state[i] = 2;
+    };
+    for (size_t i = 0; i < out.size(); ++i) visit(i);
+    out = std::move(ordered);
+    for (const auto& [name, manifest] : planManifests) collectOffers(manifest, name);
+    json offers = json::array();
+    for (const auto& offer : optionalOffers)
+        if (!requiredNames.count(offer.value("name", ""))) offers.push_back(offer);
+    if (!offers.empty()) {
+        for (auto& entry : out) {
+            if (!entry.value("topLevel", false)) continue;
+            entry["optionalDependencies"] = offers;
+            break;
+        }
+    }
     return out.dump();
 }
 

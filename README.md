@@ -84,6 +84,13 @@ path = dl.downloadPackage("", "wallet_module", error, "1.0.0", "", "",
                           {}, nullptr, [&] { return unloading.load(); });
 ```
 
+The executable plan contains required packages only. One top-level row may
+carry `optionalDependencies`: available offers include a pinned `request`
+object that can be appended to the input array to select the package and its
+required dependencies. Offers with `error` are unavailable and do not fail the
+required plan. Optional dependencies are discovered throughout the required
+closure, including compatible dependencies already installed on disk.
+
 ### C API
 
 A C-compatible API is available via `lgpd.h` for non-C++ consumers. All

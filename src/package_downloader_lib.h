@@ -402,6 +402,12 @@ public:
     /// `topLevel: true` marks entries that came from the input array (the
     /// packages the caller explicitly requested); other entries are
     /// transitive deps the resolver pulled in.
+    /// A top-level entry may also carry `optionalDependencies`, an array of
+    /// offers `{name, version, repositoryUrl, rootHash, requiredBy, request}`.
+    /// These are not executable plan entries. Add an offer's `request` to the
+    /// input to select it and resolve its required closure. Unavailable offers
+    /// carry `error` and never fail the required plan; satisfied installed
+    /// optionals and packages already required by the plan are not offered.
     ///
     /// `installedPackagesJson` is an optional `[{ name, version, rootHash }, ...]`
     /// describing what's currently on disk. When supplied, the resolver
