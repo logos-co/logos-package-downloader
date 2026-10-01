@@ -415,8 +415,9 @@ public:
     /// its chosen entry, preserving the request's repository and signer pins.
     /// These are not executable plan entries. Add an offer's `request` to the
     /// input to select it and resolve its required closure. Unavailable offers
-    /// carry `error` and never fail the required plan; satisfied installed
-    /// optionals and packages already required by the plan are not offered.
+    /// carry `error` and never fail the required plan; packages already required
+    /// by the plan are not offered. Installed optionals are offered with
+    /// `installedVersion`/`installedRootHash`, defaulting to the installed release.
     /// A request marked `"optional": true` stays listed as an offer, and is
     /// skipped if it no longer resolves.
     /// Each input's required closure is emitted in input order.

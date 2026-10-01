@@ -2456,6 +2456,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
     // optimisation — the resolver then picks every transitive from the
     // catalog (pre-installed-aware behaviour).
     std::unordered_map<std::string, std::string> installedByName;
+    std::unordered_map<std::string, std::string> installedHashByName;
     if (!installedPackagesJson.empty()) {
         try {
             json inst = json::parse(installedPackagesJson);
@@ -2465,6 +2466,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                     const std::string n = e.value("name", "");
                     const std::string v = e.value("version", "");
                     if (!n.empty() && !v.empty()) installedByName[n] = v;
+                    if (!n.empty()) installedHashByName[n] = e.value("rootHash", "");
                 }
             }
         } catch (...) { /* silent — best effort */ }
@@ -2638,13 +2640,17 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                 }
                 // Already required: the offer would be filtered out below anyway.
                 if (requiredNames.count(d.name)) continue;
+                // Installed optionals are offered too, so a caller can upgrade or
+                // downgrade them; the offer defaults to the installed release.
                 auto installed = installedByName.find(d.name);
-                if (installed != installedByName.end()
-                    && (!d.versionRange || semverRangeMatches(*d.versionRange, installed->second)))
-                    continue;
+                const bool isInstalled = installed != installedByName.end();
                 json request = raw.is_string() ? json{{"name", d.name}} : raw;
                 if (!offeredRequests.insert(parent + "|" + request.dump()).second) continue;
                 json offer{{"name", d.name}, {"requiredBy", parent}};
+                if (isInstalled) {
+                    offer["installedVersion"] = installed->second;
+                    offer["installedRootHash"] = installedHashByName[d.name];
+                }
                 json chosen; std::string repo;
                 if (!findBest(d, chosen, repo, why)) {
                     offer["error"] = why;
@@ -2678,7 +2684,15 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                         offer["error"] = "required dependency unavailable: "
                                        + (why.empty() ? std::string("no installable release") : why);
                     } else {
-                        const json& best = versions.front();
+                        // The installed release (same artifact if listed), else the best.
+                        const json* match = nullptr;
+                        for (const auto& v : versions) {
+                            if (!isInstalled || objOrEmpty(v, "manifest").value("version", "") != installed->second)
+                                continue;
+                            if (!match) match = &v;
+                            if (v.value("rootHash", "") == installedHashByName[d.name]) { match = &v; break; }
+                        }
+                        const json& best = match ? *match : versions.front();
                         const std::string version = objOrEmpty(best, "manifest").value("version", "");
                         offer["version"] = version;
                         offer["repositoryUrl"] = repo;
