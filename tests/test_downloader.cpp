@@ -292,12 +292,36 @@ TEST(OptionalDependencies, InstalledRequiredDependencyStillOffersItsOptionals) {
     EXPECT_TRUE(plan[0]["dependencyGraph"].contains("blockchain_module"));
 }
 
-TEST(OptionalDependencies, InstalledOptionalIsNotOfferedAgain) {
+TEST(OptionalDependencies, InstalledOptionalIsOfferedAtItsInstalledRelease) {
+    auto f = optionalCatalog();
+    auto index = json::parse(f->indexJson);
+    auto older = makeVersion("1.1.0", "h_storage_110", json::array());
+    older["manifest"]["name"] = "storage";
+    index["packages"][2]["versions"].push_back(older);
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])",
+        R"([{"name":"storage","version":"1.1.0","rootHash":"h_storage_110"}])"));
+    const auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    // Upgrades stay available through `versions`; the default changes nothing.
+    EXPECT_EQ(offers[0]["installedVersion"], "1.1.0");
+    EXPECT_EQ(offers[0]["installedRootHash"], "h_storage_110");
+    EXPECT_EQ(offers[0]["version"], "1.1.0");
+    EXPECT_EQ(offers[0]["request"]["rootHash"], "h_storage_110");
+    EXPECT_EQ(offers[0]["versions"].size(), 2u);
+}
+
+TEST(OptionalDependencies, InstalledOptionalMissingFromTheCatalogDefaultsToTheBestRelease) {
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(optionalCatalog());
     auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])",
-        R"([{"name":"storage","version":"1.2.0"}])"));
-    EXPECT_TRUE(offersIn(plan).empty());
+        R"([{"name":"storage","version":"0.9.0"}])"));
+    const auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["installedVersion"], "0.9.0");
+    EXPECT_EQ(offers[0]["version"], "1.2.0");
 }
 
 TEST(OptionalDependencies, UnavailableOptionalNeverBreaksMandatoryPlan) {

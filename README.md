@@ -94,6 +94,10 @@ dependencies. To select a different version, copy its manifest version and
 Offers with `error` are unavailable and do not fail the
 required plan. Optional dependencies are discovered throughout the required
 closure, including compatible dependencies already installed on disk.
+Installed optional packages are offered too, with `installedVersion` and
+`installedRootHash`; their default `request` pins the installed release when
+the catalog lists it, so selecting another entry from `versions` upgrades or
+downgrades them.
 An offer is available only if its required dependencies are compatible with the
 versions the plan already installs. Its `request` carries `"optional": true`:
 a selected offer stays listed in `optionalDependencies`, and if its release has
