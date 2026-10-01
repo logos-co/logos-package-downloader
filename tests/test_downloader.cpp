@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <string>
 #include <utility>
@@ -328,8 +329,14 @@ TEST(OptionalDependencies, SelectingOfferIncludesItsRequiredDependencies) {
     inputs.push_back(offersIn(initial)[0]["request"]);
     auto plan = json::parse(lib.resolveDependenciesJson(inputs.dump()));
     ASSERT_EQ(plan.size(), 4u);
-    EXPECT_EQ(plan[0]["name"], "helper");
-    EXPECT_TRUE(offersIn(plan).empty());
+    std::map<std::string, size_t> at;
+    for (size_t i = 0; i < plan.size(); ++i) at[plan[i]["name"].get<std::string>()] = i;
+    EXPECT_LT(at.at("helper"), at.at("storage"));
+    // The requested app's closure comes first, so a failing optional cannot stop it.
+    EXPECT_LT(at.at("blockchain_ui"), at.at("storage"));
+    // The selected optional is still listed as an offer.
+    ASSERT_EQ(offersIn(plan).size(), 1u);
+    EXPECT_EQ(offersIn(plan)[0]["name"], "storage");
     for (const auto& entry : plan)
         if (entry.contains("dependencyGraph"))
             EXPECT_EQ(entry["dependencyGraph"]["storage"], json::array({"helper"}));
@@ -345,10 +352,11 @@ TEST(OptionalDependencies, SelectedOptionalRequiredChildOffersNestedOptionals) {
     auto initial = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])"));
     json inputs = json::array({"blockchain_ui", offersIn(initial)[0]["request"]});
     auto plan = json::parse(lib.resolveDependenciesJson(inputs.dump()));
-    ASSERT_EQ(offersIn(plan).size(), 1u);
-    EXPECT_EQ(offersIn(plan)[0]["requiredBy"], "helper");
-    EXPECT_EQ(offersIn(plan)[0]["name"], "missing");
-    EXPECT_TRUE(offersIn(plan)[0].contains("error"));
+    json nested;
+    for (const auto& offer : offersIn(plan)) if (offer["name"] == "missing") nested = offer;
+    ASSERT_FALSE(nested.is_null());
+    EXPECT_EQ(nested["requiredBy"], "helper");
+    EXPECT_TRUE(nested.contains("error"));
 }
 
 TEST(OptionalDependencies, ExplicitVersionPinDoesNotOfferOptionalsOfANewerRelease) {
@@ -380,6 +388,131 @@ TEST(OptionalDependencies, SelectedPackagesInstallBeforeConsumersEvenWhenBothAre
     for (size_t i = 0; i < plan.size(); ++i) positions[plan[i]["name"].get<std::string>()] = i;
     EXPECT_LT(positions.at("helper"), positions.at("storage"));
     EXPECT_LT(positions.at("blockchain_module"), positions.at("blockchain_ui"));
+}
+
+namespace {
+// A catalog from {name, version, hash, deps, optional deps} rows.
+std::shared_ptr<MockFetcher> catalogOf(const std::vector<std::tuple<std::string, std::string, json, json>>& rows) {
+    auto f = catalogFetcher("blockchain_module");
+    auto index = json::parse(f->indexJson);
+    index["packages"] = json::array();
+    std::map<std::string, json> byName;
+    for (const auto& [name, version, deps, optional] : rows) {
+        auto v = makeVersion(version.c_str(), (name + "@" + version).c_str(), deps);
+        v["manifest"]["name"] = name;
+        if (!optional.is_null()) v["manifest"]["optional_dependencies"] = optional;
+        byName[name].push_back(v);
+    }
+    for (auto& [name, versions] : byName)
+        index["packages"].push_back({{"name", name}, {"versions", versions}});
+    f->indexJson = index.dump();
+    return f;
+}
+}
+
+TEST(OptionalDependencies, InstalledDependencyDoesNotReplaceThePlannedManifest) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(catalogOf({
+        {"S", "1.0.0", json::array({"F", json{{"name", "C"}, {"version", "^2.0.0"}}, "E"}), nullptr},
+        {"E", "1.0.0", json::array({"C"}), nullptr},
+        {"F", "1.0.0", json::array(), nullptr},
+        {"C", "2.0.0", json::array({"F"}), json::array({"O20"})},
+        {"C", "1.5.0", json::array(), json::array({"O15"})},
+        {"O20", "1.0.0", json::array(), nullptr},
+        {"O15", "1.0.0", json::array(), nullptr},
+    }));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["S"])", R"([{"name":"C","version":"1.5.0"}])"));
+    std::map<std::string, size_t> at;
+    for (size_t i = 0; i < plan.size(); ++i) at[plan[i]["name"].get<std::string>()] = i;
+    EXPECT_LT(at.at("F"), at.at("C"));
+    const auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["name"], "O20");
+}
+
+TEST(OptionalDependencies, OfferConflictingWithAPlannedVersionIsUnavailable) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(catalogOf({
+        {"S", "1.0.0", json::array({"M"}), json::array({"O"})},
+        {"M", "1.0.0", json::array({json{{"name", "D"}, {"version", "^1.0.0"}}}), nullptr},
+        {"O", "1.0.0", json::array({json{{"name", "D"}, {"version", "^2.0.0"}}}), nullptr},
+        {"D", "1.0.0", json::array(), nullptr},
+        {"D", "2.0.0", json::array(), nullptr},
+    }));
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["S"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_TRUE(offers[0].contains("error"));
+}
+
+TEST(OptionalDependencies, OfferFallsBackToAnOlderReleaseWhoseClosureResolves) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(catalogOf({
+        {"S", "1.0.0", json::array(), json::array({"O"})},
+        {"O", "2.0.0", json::array({"missing"}), nullptr},
+        {"O", "1.0.0", json::array(), nullptr},
+    }));
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["S"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_FALSE(offers[0].contains("error"));
+    EXPECT_EQ(offers[0]["version"], "1.0.0");
+    EXPECT_EQ(offers[0]["request"]["rootHash"], "O@1.0.0");
+}
+
+TEST(OptionalDependencies, MalformedOptionalEntryIsReportedAsUnavailable) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(catalogOf({
+        {"S", "1.0.0", json::array(), json::array({json{{"name", "O"}, {"signer", ""}}})},
+        {"O", "1.0.0", json::array(), nullptr},
+    }));
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["S"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["name"], "O");
+    EXPECT_TRUE(offers[0].contains("error"));
+}
+
+TEST(OptionalDependencies, VanishedOptionalSelectionDoesNotFailTheRequiredPlan) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(catalogOf({
+        {"S", "1.0.0", json::array({"A"}), json::array({"O"})},
+        {"A", "1.0.0", json::array(), nullptr},
+        {"O", "1.0.0", json::array(), nullptr},
+    }));
+    const auto stale = json{{"name", "O"}, {"version", "1.0.0"}, {"rootHash", "gone"}, {"optional", true}};
+    auto plan = json::parse(lib.resolveDependenciesJson(json::array({"S", stale}).dump()));
+    for (const auto& entry : plan) EXPECT_FALSE(entry.contains("error"));
+    EXPECT_EQ(resolvedVersions(plan.dump()).count("A"), 1u);
+    EXPECT_EQ(resolvedVersions(plan.dump()).count("O"), 0u);
+    // Without the marker the same request is still a hard error.
+    auto pinned = stale; pinned.erase("optional");
+    plan = json::parse(lib.resolveDependenciesJson(json::array({"S", pinned}).dump()));
+    EXPECT_TRUE(plan.back().contains("error"));
+}
+
+TEST(OptionalDependencies, OfferRequestsAreMarkedOptional) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog());
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["request"]["optional"], true);
+}
+
+TEST(OptionalDependencies, GraphReachesOffersBelowInstalledDependencies) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(catalogOf({
+        {"S", "1.0.0", json::array({"I"}), nullptr},
+        {"I", "1.0.0", json::array({"J"}), nullptr},
+        {"J", "1.0.0", json::array({"K"}), nullptr},
+        {"K", "1.0.0", json::array(), json::array({"Q"})},
+        {"Q", "1.0.0", json::array(), nullptr},
+    }));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["S"])",
+        R"([{"name":"I","version":"1.0.0"},{"name":"J","version":"1.0.0"},{"name":"K","version":"1.0.0"}])"));
+    const auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["requiredBy"], "K");
+    json graph;
+    for (const auto& entry : plan) if (entry.contains("dependencyGraph")) graph = entry["dependencyGraph"];
+    EXPECT_EQ(graph["J"], json::array({"K"}));
 }
 
 // ─── Semver matcher ───────────────────────────────────────────────────────────
