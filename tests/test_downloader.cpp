@@ -142,6 +142,246 @@ std::map<std::string, std::vector<std::string>> resolvedVersions(const std::stri
 }
 }  // namespace
 
+namespace {
+std::shared_ptr<MockFetcher> optionalCatalog(const json& optional = json::array({"storage"}),
+                                            const json& storageDeps = json::array()) {
+    auto f = catalogFetcher("blockchain_module");
+    auto index = json::parse(f->indexJson);
+    for (auto& v : index["packages"][0]["versions"])
+        v["manifest"]["optional_dependencies"] = optional;
+    auto storage = makeVersion("1.2.0", "h_storage", storageDeps);
+    storage["manifest"]["name"] = "storage";
+    auto helper = makeVersion("1.0.0", "h_helper", json::array());
+    helper["manifest"]["name"] = "helper";
+    index["packages"].push_back({{"name", "storage"}, {"versions", json::array({storage})}});
+    index["packages"].push_back({{"name", "helper"}, {"versions", json::array({helper})}});
+    f->indexJson = index.dump();
+    return f;
+}
+
+json offersIn(const json& plan) {
+    for (const auto& entry : plan)
+        if (entry.contains("optionalDependencies")) return entry["optionalDependencies"];
+    return json::array();
+}
+}
+
+TEST(OptionalDependencies, DirectInstallOffersWithoutAddingToExecutablePlan) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog(json::array({json{{"name", "storage"}, {"version", "^1.0.0"}}})));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"([{"name":"blockchain_module","version":"0.1.0"}])"));
+    ASSERT_EQ(plan.size(), 1u);
+    EXPECT_EQ(plan[0]["version"], "0.1.0");
+    auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["name"], "storage");
+    EXPECT_EQ(offers[0]["version"], "1.2.0");
+    EXPECT_EQ(offers[0]["requiredBy"], "blockchain_module");
+    EXPECT_EQ(offers[0]["request"]["rootHash"], "h_storage");
+    EXPECT_FALSE(offers[0].contains("error"));
+}
+
+TEST(OptionalDependencies, AppOffersOptionalDependenciesOfRequiredModules) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog());
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])"));
+    ASSERT_EQ(plan.size(), 2u);
+    auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["requiredBy"], "blockchain_module");
+}
+
+TEST(OptionalDependencies, VersionChoicesRespectRangeAndResolverOrder) {
+    auto f = optionalCatalog(json::array({json{{"name", "storage"}, {"version", "^1.0.0"}}}));
+    auto index = json::parse(f->indexJson);
+    auto& versions = index["packages"][2]["versions"];
+    for (const char* version : {"1.0.0", "2.0.0", "1.1.0"}) {
+        auto entry = makeVersion(version, version, json::array());
+        entry["manifest"]["name"] = "storage";
+        versions.push_back(entry);
+    }
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["version"], "1.2.0");
+    const auto choices = offers[0]["versions"];
+    ASSERT_EQ(choices.size(), 3u);
+    EXPECT_EQ(choices[0]["manifest"]["version"], "1.2.0");
+    EXPECT_EQ(choices[1]["manifest"]["version"], "1.1.0");
+    EXPECT_EQ(choices[2]["manifest"]["version"], "1.0.0");
+    EXPECT_EQ(choices[2]["rootHash"], "1.0.0");
+}
+
+TEST(OptionalDependencies, VersionChoicesExcludeUnavailableRequiredClosures) {
+    auto f = optionalCatalog();
+    auto index = json::parse(f->indexJson);
+    auto entry = makeVersion("1.1.0", "h_unavailable", json::array({"missing"}));
+    entry["manifest"]["name"] = "storage";
+    index["packages"][2]["versions"].push_back(entry);
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    ASSERT_EQ(offers[0]["versions"].size(), 1u);
+    EXPECT_EQ(offers[0]["versions"][0]["rootHash"], "h_storage");
+}
+
+TEST(OptionalDependencies, VersionChoicesPreserveArtifactPin) {
+    auto f = optionalCatalog(json::array({json{{"name", "storage"}, {"rootHash", "h_storage"}}}));
+    auto index = json::parse(f->indexJson);
+    auto entry = makeVersion("1.1.0", "h_other", json::array());
+    entry["manifest"]["name"] = "storage";
+    index["packages"][2]["versions"].push_back(entry);
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    ASSERT_EQ(offers[0]["versions"].size(), 1u);
+    EXPECT_EQ(offers[0]["versions"][0]["rootHash"], "h_storage");
+}
+
+TEST(OptionalDependencies, VersionChoicesRespectTheDownloadSource) {
+    auto f = optionalCatalog();
+    auto index = json::parse(f->indexJson);
+    auto entry = makeVersion("1.1.0", "h_logos_only", json::array());
+    entry["manifest"]["name"] = "storage";
+    entry.erase("url");
+    entry["urls"] = json::array({"logos:logos.test:zDvZRwzm3g3mPcYu1NmDKV5jCccw4FZ83XKyu85AjSCg7gH7zQdL"});
+    index["packages"][2]["versions"].push_back(entry);
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Http);
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    ASSERT_EQ(offers[0]["versions"].size(), 1u);
+    EXPECT_EQ(offers[0]["versions"][0]["rootHash"], "h_storage");
+}
+
+TEST(OptionalDependencies, VersionChoicesPreserveSignerPin) {
+    const char* signer = "did:jwk:eyJrdHkiOiJPS1AiLCJnb29kIn0";
+    auto f = optionalCatalog(json::array({json{{"name", "storage"}, {"signer", signer}}}));
+    auto index = json::parse(f->indexJson);
+    index["packages"][2]["versions"][0]["signature"] = {{"did", signer}, {"sig", "cafe"}};
+    auto unsignedEntry = makeVersion("1.1.0", "h_unsigned", json::array());
+    unsignedEntry["manifest"]["name"] = "storage";
+    index["packages"][2]["versions"].push_back(unsignedEntry);
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    const auto offers = offersIn(json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])")));
+    ASSERT_EQ(offers.size(), 1u);
+    ASSERT_EQ(offers[0]["versions"].size(), 1u);
+    EXPECT_EQ(offers[0]["versions"][0]["signature"]["did"], signer);
+    EXPECT_EQ(offers[0]["request"]["signer"], signer);
+}
+
+TEST(OptionalDependencies, InstalledRequiredDependencyStillOffersItsOptionals) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog());
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])",
+        R"([{"name":"blockchain_module","version":"0.1.0"}])"));
+    ASSERT_EQ(plan.size(), 1u);
+    EXPECT_EQ(offersIn(plan).size(), 1u);
+    EXPECT_EQ(plan[0]["dependencyGraph"]["blockchain_ui"], json::array({"blockchain_module"}));
+    EXPECT_TRUE(plan[0]["dependencyGraph"].contains("blockchain_module"));
+}
+
+TEST(OptionalDependencies, InstalledOptionalIsNotOfferedAgain) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog());
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])",
+        R"([{"name":"storage","version":"1.2.0"}])"));
+    EXPECT_TRUE(offersIn(plan).empty());
+}
+
+TEST(OptionalDependencies, UnavailableOptionalNeverBreaksMandatoryPlan) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog(json::array({"missing"})));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])"));
+    ASSERT_EQ(plan.size(), 2u);
+    for (const auto& entry : plan) EXPECT_FALSE(entry.contains("error"));
+    auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_TRUE(offers[0].contains("error"));
+}
+
+TEST(OptionalDependencies, OptionalWithUnavailableRequiredDependencyIsUnavailable) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog(json::array({"storage"}), json::array({"missing"})));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])"));
+    ASSERT_EQ(plan.size(), 2u);
+    auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_TRUE(offers[0].contains("error"));
+}
+
+TEST(OptionalDependencies, SelectingOfferIncludesItsRequiredDependencies) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog(json::array({"storage"}), json::array({"helper"})));
+    json inputs = json::array({"blockchain_ui"});
+    auto initial = json::parse(lib.resolveDependenciesJson(inputs.dump()));
+    inputs.push_back(offersIn(initial)[0]["request"]);
+    auto plan = json::parse(lib.resolveDependenciesJson(inputs.dump()));
+    ASSERT_EQ(plan.size(), 4u);
+    EXPECT_EQ(plan[0]["name"], "helper");
+    EXPECT_TRUE(offersIn(plan).empty());
+    for (const auto& entry : plan)
+        if (entry.contains("dependencyGraph"))
+            EXPECT_EQ(entry["dependencyGraph"]["storage"], json::array({"helper"}));
+}
+
+TEST(OptionalDependencies, SelectedOptionalRequiredChildOffersNestedOptionals) {
+    auto f = optionalCatalog(json::array({"storage"}), json::array({"helper"}));
+    auto index = json::parse(f->indexJson);
+    index["packages"][3]["versions"][0]["manifest"]["optional_dependencies"] = json::array({"missing"});
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto initial = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])"));
+    json inputs = json::array({"blockchain_ui", offersIn(initial)[0]["request"]});
+    auto plan = json::parse(lib.resolveDependenciesJson(inputs.dump()));
+    ASSERT_EQ(offersIn(plan).size(), 1u);
+    EXPECT_EQ(offersIn(plan)[0]["requiredBy"], "helper");
+    EXPECT_EQ(offersIn(plan)[0]["name"], "missing");
+    EXPECT_TRUE(offersIn(plan)[0].contains("error"));
+}
+
+TEST(OptionalDependencies, ExplicitVersionPinDoesNotOfferOptionalsOfANewerRelease) {
+    auto f = optionalCatalog();
+    auto index = json::parse(f->indexJson);
+    index["packages"][0]["versions"][0]["manifest"]["optional_dependencies"] = json::array({"helper"});
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto plan = json::parse(lib.resolveDependenciesJson(
+        R"(["blockchain_ui",{"name":"blockchain_module","version":"0.1.0"}])"));
+    auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_EQ(offers[0]["name"], "storage");
+}
+
+TEST(OptionalDependencies, RequiredPackageIsNotAlsoOfferedAsOptional) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog());
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui","storage"])"));
+    EXPECT_TRUE(offersIn(plan).empty());
+}
+
+TEST(OptionalDependencies, SelectedPackagesInstallBeforeConsumersEvenWhenBothAreExplicit) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog(json::array({"storage", "helper"}), json::array({"helper"})));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui","helper","storage"])"));
+    std::map<std::string, size_t> positions;
+    for (size_t i = 0; i < plan.size(); ++i) positions[plan[i]["name"].get<std::string>()] = i;
+    EXPECT_LT(positions.at("helper"), positions.at("storage"));
+    EXPECT_LT(positions.at("blockchain_module"), positions.at("blockchain_ui"));
+}
+
 // ─── Semver matcher ───────────────────────────────────────────────────────────
 // These are pure tests — no network involved.
 
