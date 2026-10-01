@@ -417,6 +417,9 @@ public:
     /// input to select it and resolve its required closure. Unavailable offers
     /// carry `error` and never fail the required plan; satisfied installed
     /// optionals and packages already required by the plan are not offered.
+    /// A request marked `"optional": true` stays listed as an offer, and is
+    /// skipped if it no longer resolves.
+    /// Each input's required closure is emitted in input order.
     ///
     /// `installedPackagesJson` is an optional `[{ name, version, rootHash }, ...]`
     /// describing what's currently on disk. When supplied, the resolver
