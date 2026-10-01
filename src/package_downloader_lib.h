@@ -403,7 +403,12 @@ public:
     /// packages the caller explicitly requested); other entries are
     /// transitive deps the resolver pulled in.
     /// A top-level entry may also carry `optionalDependencies`, an array of
-    /// offers `{name, version, repositoryUrl, rootHash, requiredBy, request}`.
+    /// offers `{name, version, repositoryUrl, rootHash, requiredBy, request, versions}`.
+    /// `versions` contains catalog entries from the selected repository that
+    /// satisfy the optional dependency's constraints and have available
+    /// required closures, ordered by the resolver's version ranking. A version
+    /// picker must update both `request.version` and `request.rootHash` from
+    /// its chosen entry, preserving the request's repository and signer pins.
     /// These are not executable plan entries. Add an offer's `request` to the
     /// input to select it and resolve its required closure. Unavailable offers
     /// carry `error` and never fail the required plan; satisfied installed

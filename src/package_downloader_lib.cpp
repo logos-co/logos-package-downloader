@@ -2630,6 +2630,28 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                     request["version"] = version;
                     request["repositoryUrl"] = repo;
                     request["rootHash"] = offer["rootHash"];
+                    json versions = json::array();
+                    for (const auto& pkg : cat) {
+                        if (!pkg.is_object()) continue;
+                        if (pkg.value("name", "") != d.name || pkg.value("repositoryUrl", "") != repo)
+                            continue;
+                        for (const auto& candidate : pkg.value("versions", json::array())) {
+                            if (!candidate.is_object()) continue;
+                            const std::string candidateVersion = objOrEmpty(candidate, "manifest").value("version", "");
+                            if (d.versionRange && !semverRangeMatches(*d.versionRange, candidateVersion)) continue;
+                            if (d.rootHash && candidate.value("rootHash", "") != *d.rootHash) continue;
+                            if (!candidate.value("sourceAvailable", true)) continue;
+                            if (d.signer && !signerPinMatches(*d.signer, objOrEmpty(candidate, "signature").value("did", "")))
+                                continue;
+                            if (!requiredClosureError(candidate).empty()) continue;
+                            versions.push_back(candidate);
+                        }
+                    }
+                    std::stable_sort(versions.begin(), versions.end(), [](const json& a, const json& b) {
+                        return outranks(objOrEmpty(a, "manifest").value("version", ""), a.value("releasedAt", ""),
+                                        objOrEmpty(b, "manifest").value("version", ""), b.value("releasedAt", ""));
+                    });
+                    offer["versions"] = std::move(versions);
                 }
                 offer["request"] = request;
                 optionalOffers.push_back(std::move(offer));
