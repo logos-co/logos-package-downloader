@@ -287,6 +287,8 @@ TEST(OptionalDependencies, InstalledRequiredDependencyStillOffersItsOptionals) {
         R"([{"name":"blockchain_module","version":"0.1.0"}])"));
     ASSERT_EQ(plan.size(), 1u);
     EXPECT_EQ(offersIn(plan).size(), 1u);
+    EXPECT_EQ(plan[0]["dependencyGraph"]["blockchain_ui"], json::array({"blockchain_module"}));
+    EXPECT_TRUE(plan[0]["dependencyGraph"].contains("blockchain_module"));
 }
 
 TEST(OptionalDependencies, InstalledOptionalIsNotOfferedAgain) {
@@ -328,6 +330,25 @@ TEST(OptionalDependencies, SelectingOfferIncludesItsRequiredDependencies) {
     ASSERT_EQ(plan.size(), 4u);
     EXPECT_EQ(plan[0]["name"], "helper");
     EXPECT_TRUE(offersIn(plan).empty());
+    for (const auto& entry : plan)
+        if (entry.contains("dependencyGraph"))
+            EXPECT_EQ(entry["dependencyGraph"]["storage"], json::array({"helper"}));
+}
+
+TEST(OptionalDependencies, SelectedOptionalRequiredChildOffersNestedOptionals) {
+    auto f = optionalCatalog(json::array({"storage"}), json::array({"helper"}));
+    auto index = json::parse(f->indexJson);
+    index["packages"][3]["versions"][0]["manifest"]["optional_dependencies"] = json::array({"missing"});
+    f->indexJson = index.dump();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto initial = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])"));
+    json inputs = json::array({"blockchain_ui", offersIn(initial)[0]["request"]});
+    auto plan = json::parse(lib.resolveDependenciesJson(inputs.dump()));
+    ASSERT_EQ(offersIn(plan).size(), 1u);
+    EXPECT_EQ(offersIn(plan)[0]["requiredBy"], "helper");
+    EXPECT_EQ(offersIn(plan)[0]["name"], "missing");
+    EXPECT_TRUE(offersIn(plan)[0].contains("error"));
 }
 
 TEST(OptionalDependencies, ExplicitVersionPinDoesNotOfferOptionalsOfANewerRelease) {

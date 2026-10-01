@@ -402,6 +402,10 @@ public:
     /// `topLevel: true` marks entries that came from the input array (the
     /// packages the caller explicitly requested); other entries are
     /// transitive deps the resolver pulled in.
+    /// A top-level entry carries `dependencyGraph`, mapping resolved package
+    /// names to their chosen manifest's mandatory dependency entries, including
+    /// satisfied installed nodes. Preview callers can use it to distinguish
+    /// selected optional roots from the mandatory dependencies they introduce.
     /// A top-level entry may also carry `optionalDependencies`, an array of
     /// offers `{name, version, repositoryUrl, rootHash, requiredBy, request, versions}`.
     /// `versions` contains catalog entries from the selected repository that

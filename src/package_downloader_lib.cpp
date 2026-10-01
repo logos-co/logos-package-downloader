@@ -2615,7 +2615,7 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                     && (!d.versionRange || semverRangeMatches(*d.versionRange, installed->second)))
                     continue;
                 json request = raw.is_string() ? json{{"name", d.name}} : raw;
-                if (!offeredRequests.insert(request.dump()).second) continue;
+                if (!offeredRequests.insert(parent + "|" + request.dump()).second) continue;
                 json offer{{"name", d.name}, {"requiredBy", parent}};
                 json chosen; std::string repo;
                 if (!findBest(d, chosen, repo, why)) {
@@ -2836,6 +2836,16 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
     for (size_t i = 0; i < out.size(); ++i) visit(i);
     out = std::move(ordered);
     for (const auto& [name, manifest] : planManifests) collectOffers(manifest, name);
+    // Include satisfied installed nodes as well: an optional collaborator can
+    // belong to a dependency that was omitted from the executable plan.
+    json dependencyGraph = json::object();
+    for (const auto& [name, manifest] : planManifests)
+        dependencyGraph[name] = manifest.value("dependencies", json::array());
+    for (auto& entry : out) {
+        if (!entry.value("topLevel", false)) continue;
+        entry["dependencyGraph"] = dependencyGraph;
+        break;
+    }
     json offers = json::array();
     for (const auto& offer : optionalOffers)
         if (!requiredNames.count(offer.value("name", ""))) offers.push_back(offer);
