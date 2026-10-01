@@ -324,6 +324,36 @@ TEST(OptionalDependencies, InstalledOptionalMissingFromTheCatalogDefaultsToTheBe
     EXPECT_EQ(offers[0]["version"], "1.2.0");
 }
 
+TEST(OptionalDependencies, InstalledOptionalAbsentFromTheCatalogIsOfferedAsInstalledOnly) {
+    // An embedded module (modules_state) ships with the app, never in a catalog.
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog(json::array({"missing"})));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])",
+        R"([{"name":"missing","version":"0.1.0","rootHash":"h_local"}])"));
+    for (const auto& entry : plan) EXPECT_FALSE(entry.contains("error"));
+    const auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_FALSE(offers[0].contains("error"));
+    EXPECT_TRUE(offers[0].value("installedOnly", false));
+    EXPECT_EQ(offers[0]["installedVersion"], "0.1.0");
+    EXPECT_EQ(offers[0]["version"], "0.1.0");
+    EXPECT_EQ(offers[0]["rootHash"], "h_local");
+    EXPECT_TRUE(offers[0]["versions"].empty());
+    EXPECT_EQ(offers[0]["request"]["version"], "0.1.0");
+}
+
+TEST(OptionalDependencies, InstalledOptionalOutsideTheRangeAndAbsentFromTheCatalogIsUnavailable) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(optionalCatalog(json::array({json{{"name", "missing"}, {"version", "^2.0.0"}}})));
+    auto plan = json::parse(lib.resolveDependenciesJson(R"(["blockchain_ui"])",
+        R"([{"name":"missing","version":"0.1.0"}])"));
+    const auto offers = offersIn(plan);
+    ASSERT_EQ(offers.size(), 1u);
+    EXPECT_TRUE(offers[0].contains("error"));
+    EXPECT_FALSE(offers[0].contains("installedOnly"));
+    EXPECT_EQ(offers[0]["installedVersion"], "0.1.0");
+}
+
 TEST(OptionalDependencies, UnavailableOptionalNeverBreaksMandatoryPlan) {
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(optionalCatalog(json::array({"missing"})));

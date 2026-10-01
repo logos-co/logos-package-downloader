@@ -418,6 +418,9 @@ public:
     /// carry `error` and never fail the required plan; packages already required
     /// by the plan are not offered. Installed optionals are offered with
     /// `installedVersion`/`installedRootHash`, defaulting to the installed release.
+    /// An installed optional that satisfies its constraints but has no catalog
+    /// release to offer (an embedded module) is offered with `installedOnly: true`,
+    /// its installed version and empty `versions`; its request must not be sent.
     /// A request marked `"optional": true` stays listed as an offer, and is
     /// skipped if it no longer resolves.
     /// Each input's required closure is emitted in input order.

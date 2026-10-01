@@ -2704,6 +2704,20 @@ std::string PackageDownloaderLib::resolveDependenciesJson(const std::string& dep
                         offer["versions"] = std::move(versions);
                     }
                 }
+                // Installed and satisfying, but no catalog release to change it to (e.g. an
+                // embedded module): offered as installed, with no other version to pick.
+                if (offer.contains("error") && isInstalled
+                    && (!d.versionRange || semverRangeMatches(*d.versionRange, installed->second))
+                    && (!d.rootHash || installedHashByName[d.name] == *d.rootHash)) {
+                    offer.erase("error");
+                    offer["installedOnly"] = true;
+                    offer["version"] = installed->second;
+                    offer["rootHash"] = installedHashByName[d.name];
+                    offer["versions"] = json::array();
+                    request["version"] = installed->second;
+                    request["rootHash"] = offer["rootHash"];
+                    request["optional"] = true;
+                }
                 offer["request"] = request;
                 optionalOffers.push_back(std::move(offer));
             }
