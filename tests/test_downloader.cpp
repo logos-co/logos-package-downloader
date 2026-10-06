@@ -2390,6 +2390,75 @@ TEST(RefreshCatalogs, ReportsAnIndexItCannotRead) {
     EXPECT_NE(errs.find("connection refused"), std::string::npos);
 }
 
+// Consumers keep their own copy of the catalog and re-read it when the
+// revision moves, so it must move exactly when what getCatalogJson serves does.
+TEST(CatalogRevision, ARefreshThatFetchesTheSameCatalogLeavesItAlone) {
+    auto f = repoWith(new MockFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    lib.getCatalogJson();
+
+    const uint64_t before = lib.catalogRevision();
+    lib.refreshCatalogs();
+    EXPECT_EQ(lib.catalogRevision(), before);
+}
+
+TEST(CatalogRevision, ARepublishedIndexMovesIt) {
+    auto f = repoWith(new MockFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    lib.getCatalogJson();
+
+    const uint64_t before = lib.catalogRevision();
+    f->indexJson = repoWith(new MockFetcher, onePackage("stage_module", "1.0.1"))->indexJson;
+    lib.refreshCatalogs();
+    EXPECT_GT(lib.catalogRevision(), before);
+    EXPECT_NE(lib.getCatalogJson().find("1.0.1"), std::string::npos);
+}
+
+TEST(CatalogRevision, ChangedRepositoryMetadataMovesIt) {
+    auto f = repoWith(new MockFetcher, onePackage("stage_module", "1.0.0"));
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    lib.getCatalogJson();
+
+    const uint64_t before = lib.catalogRevision();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Renamed"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    lib.refreshCatalogs();
+    EXPECT_GT(lib.catalogRevision(), before);
+}
+
+namespace {
+class FlakyIndexFetcher : public MockFetcher {
+public:
+    bool indexDown = true;
+    lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        if (indexDown && url == kIndexUrl) return {false, "connection refused"};
+        return MockFetcher::get(url, out);
+    }
+};
+}  // namespace
+
+// A caller that read the catalog while an index was down holds a copy without
+// that repository; whichever call reads the index later has to say so.
+TEST(CatalogRevision, AnIndexReadAfterAFailedFetchMovesItOnce) {
+    auto f = repoWith(new FlakyIndexFetcher, onePackage("stage_module", "1.0.0"));
+    auto* flaky = static_cast<FlakyIndexFetcher*>(f.get());
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    EXPECT_EQ(lib.getCatalogJson().find("stage_module"), std::string::npos);
+
+    const uint64_t before = lib.catalogRevision();
+    flaky->indexDown = false;
+    EXPECT_NE(lib.getCatalogJson().find("stage_module"), std::string::npos);
+    const uint64_t after = lib.catalogRevision();
+    EXPECT_GT(after, before);
+
+    lib.getCatalogJson();
+    EXPECT_EQ(lib.catalogRevision(), after);
+}
+
 // ─── Catalog includes ─────────────────────────────────────────────────────────
 //
 // A catalog can name other catalogs in `logos-repo.json#includes[]` and draw

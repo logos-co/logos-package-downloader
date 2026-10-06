@@ -343,6 +343,11 @@ public:
     /// empty string on success or a summary of errors.
     std::string refreshCatalogs();
 
+    /// Moves when the catalog served changes under its callers: a
+    /// refreshCatalogs() that fetched something different, or an index read
+    /// after an earlier fetch of it failed. Registry edits don't move it.
+    uint64_t catalogRevision() const;
+
     /// Download a package. If `rootHash` is empty and multiple entries
     /// share the same `version`, pick the newest by `releasedAt`. If
     /// `version` is empty, pick the newest version. `repoUrlOrName` may be

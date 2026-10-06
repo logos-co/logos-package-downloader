@@ -1163,6 +1163,9 @@ struct PackageDownloaderLib::Impl {
 
     // Caches: url -> body
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
+    // Repos whose index fetch last failed: reading one later changes the catalog.
+    std::unordered_set<std::string> failedIndexRepoUrls;
+    std::atomic<uint64_t> catalogRevision{0};
     // True once registry.refresh() has resolved every repo's
     // logos-repo.json this process. Guards ensureMetadata so a catalog
     // browse doesn't re-fetch all repo metadata on every call. Reset by
@@ -1207,6 +1210,10 @@ struct PackageDownloaderLib::Impl {
         FetchResult result = fetcher->get(r.indexUrl, body);
 
         if (!result.ok) {
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                failedIndexRepoUrls.insert(r.url);
+            }
             if (err)
                 *err = "index fetch failed: " + r.indexUrl +
                        (result.error.empty() ? "" : " - " + result.error);
@@ -1215,11 +1222,13 @@ struct PackageDownloaderLib::Impl {
 
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl[r.url] = body;
+        if (failedIndexRepoUrls.erase(r.url)) ++catalogRevision;
         return body;
     }
 
     void clearCaches() {
         indexJsonByRepoUrl.clear();
+        failedIndexRepoUrls.clear();
     }
 
     // Does `source`'s include filter admit this package at all? Returns the
@@ -1459,14 +1468,15 @@ void PackageDownloaderLib::setStorageFetcher(std::shared_ptr<Fetcher> fetcher) {
     impl_->storageFetcher = fetcher;
 }
 
+uint64_t PackageDownloaderLib::catalogRevision() const { return impl_->catalogRevision.load(); }
+
 RepositoryRegistry& PackageDownloaderLib::registry() { return impl_->registry; }
 const RepositoryRegistry& PackageDownloaderLib::registry() const { return impl_->registry; }
 
-std::string PackageDownloaderLib::listRepositoriesJson() {
-    impl_->ensureMetadata();
-    const auto all = impl_->registry.listAll();
+static json repositoriesJson(const RepositoryRegistry& registry) {
+    const auto all = registry.listAll();
     json arr = json::array();
-    for (const auto& r : impl_->registry.list()) {
+    for (const auto& r : registry.list()) {
         json e;
         e["url"] = r.url;
         const RepoSource src = repoSource(r.url);
@@ -1512,7 +1522,12 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
         e["includeWarnings"] = r.includeWarnings;
         arr.push_back(std::move(e));
     }
-    return arr.dump();
+    return arr;
+}
+
+std::string PackageDownloaderLib::listRepositoriesJson() {
+    impl_->ensureMetadata();
+    return repositoriesJson(impl_->registry).dump();
 }
 
 std::string PackageDownloaderLib::getCatalogJson() {
@@ -1559,6 +1574,14 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
 }
 
 std::string PackageDownloaderLib::refreshCatalogs() {
+    // What callers could see before, to tell whether the reload changed it.
+    const json reposBefore = repositoriesJson(impl_->registry);
+    std::unordered_map<std::string, std::string> indexesBefore;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        indexesBefore = impl_->indexJsonByRepoUrl;
+    }
+
     // Explicit reload: force the metadata refresh now and mark it done
     // so the next ensureMetadata() doesn't redundantly refresh again.
     std::string out = impl_->registry.refresh();
@@ -1583,6 +1606,13 @@ std::string PackageDownloaderLib::refreshCatalogs() {
             out += ": " + (err.empty() ? "index unavailable" : err) + "\n";
         }
     }
+
+    bool changed = repositoriesJson(impl_->registry) != reposBefore;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        changed = changed || impl_->indexJsonByRepoUrl != indexesBefore;
+    }
+    if (changed) ++impl_->catalogRevision;
 
     // Collision warnings only exist once the merge has actually run, so do
     // one pass over the built catalog. The indexes are cached by now, so this

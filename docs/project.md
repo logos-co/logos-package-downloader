@@ -172,6 +172,7 @@ Logos module wrapper and existing CLI code use that name).
 | `std::string getCatalogJson()` | Merged catalog JSON across enabled repos: `[{repositoryUrl, repositoryName, repositoryDisplayName, name, description, type, category, author, icon, versions:[...]}]`; `versions[]` newest-first by SemVer, `releasedAt` breaks ties. |
 | `std::string getCatalogForRepoJson(const std::string& urlOrName)` | Same synthesised shape scoped to one repo (by URL or canonical name). Returns `"[]"` if the repo is not found. |
 | `std::string refreshCatalogs()` | Clear caches and force re-fetch of every enabled repo's metadata + `index.json`. Empty string on success, else an error summary. |
+| `uint64_t catalogRevision() const` | Moves when the catalog served changes under its callers: a `refreshCatalogs()` that fetched different metadata or indexes, or an index read after an earlier fetch of it failed. Registry edits don't move it. Callers holding a copy of the catalog re-read it when it moves. |
 | `std::string downloadPackage(repoUrlOrName, packageName, errorMessage, version="", rootHash="", outputDir="", onProgress={}, source=nullptr)` | Download + verify a `.lgx`; returns the local path or empty with `errorMessage` set. `repo` empty = any enabled repo (registry order); `version` empty = newest; `rootHash` disambiguates same-version builds; `outputDir` empty = a private per-user staging directory under the system temp dir (`<temp>/lgpd-<uid>`). Tries Logos Storage first, then HTTPS. `source` gives the URL used. |
 | `downloadPackage(..., onProgress, source, isCancelled)` | Cancel-aware overload. `isCancelled` stops an active HTTPS transfer, removes its pending file, and prevents fallback to HTTPS after Storage cancellation. Keep its result true after cancellation. The original overload remains available to compiled clients. |
 | `std::string resolveDependenciesJson(dependenciesJson, installedPackagesJson="")` | Cross-repo BFS resolver. Output is a JSON array in install order: `[{repositoryUrl, name, version, rootHash, url, topLevel}]`; on failure an `{error, name}` entry at the unsatisfied position. The installed-state snapshot (`[{name, version, rootHash}]`) short-circuits already-satisfied transitive deps. |
@@ -543,7 +544,8 @@ lgpd_free(ctx);
   `logos-package-manager`'s job at install time.
 - **Lazy, per-process metadata cache.** Catalog metadata is resolved once per
   process (`ensureMetadata`); a stale view requires `refreshCatalogs()` /
-  `lgpd repo refresh` to re-fetch.
+  `lgpd repo refresh` to re-fetch. `catalogRevision()` tells other holders of
+  the catalog that it moved.
 - **Best-effort registry.** Per-repo fetch/parse failures are recorded in
   `resolveError` and skipped, not fatal.
 - **Legacy catalog rows.** A version row with `manifest: null` or a missing
