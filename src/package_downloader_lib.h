@@ -52,6 +52,9 @@ public:
     /// Whether this fetcher can download `url` with getToFile.
     virtual bool canHandle(const std::string& url) const = 0;
 
+    /// The Logos Storage network this fetcher serves; empty when it serves none.
+    virtual std::string network() const { return {}; }
+
     /// HTTP GET. Succeeds on 2xx with the response body in `out`.
     virtual FetchResult get(const std::string& url, std::string& out) = 0;
 
@@ -330,7 +333,9 @@ public:
     ///
     /// Each version also carries `sources` (the transports it is published
     /// on: "logos", "http"), `allowedSources` (those the download source lets
-    /// a download use) and `sourceAvailable`. When that is false, the version
+    /// a download use), `usableSources` (those allowed that can fetch it now:
+    /// "logos" needs a storage node on the network of one of its `urls`) and
+    /// `sourceAvailable`. When that is false, the version
     /// also has `requiredSource` ("logos" or "http") and a readable
     /// `sourceUnavailableReason`; downloads and the resolver skip it.
     std::string getCatalogJson();
@@ -345,7 +350,8 @@ public:
 
     /// Moves when the catalog served changes under its callers: a
     /// refreshCatalogs() that fetched something different, or an index read
-    /// after an earlier fetch of it failed. Registry edits don't move it.
+    /// after an earlier fetch of it failed. Registry edits and storage network
+    /// changes don't move it.
     uint64_t catalogRevision() const;
 
     /// Download a package. If `rootHash` is empty and multiple entries

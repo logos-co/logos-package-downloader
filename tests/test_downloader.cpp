@@ -1962,9 +1962,17 @@ public:
     std::vector<std::string> attempts;
     // Keep track of the URLs that were actually fetched to file.
     std::vector<std::string> fileGets;
+    // Calls that ask the storage node, each one an IPC round trip in the module.
+    mutable int nodeQueries = 0;
 
     bool canHandle(const std::string& url) const override {
+        ++nodeQueries;
         return url.rfind("logos:" + network_ + ":", 0) == 0;
+    }
+
+    std::string network() const override {
+        ++nodeQueries;
+        return network_;
     }
 
     lgpd::FetchResult get(const std::string&, std::string&) override {
@@ -1989,7 +1997,7 @@ private:
 class CancellingStorageFetcher : public StorageFetcher {
 public:
     explicit CancellingStorageFetcher(bool& cancelled)
-        : StorageFetcher(network, false), cancelled_(cancelled) {}
+        : StorageFetcher(::network, false), cancelled_(cancelled) {}
 
     std::string pendingFile;
 
@@ -3322,6 +3330,77 @@ TEST(DownloadSource, AnyMarksEveryReleaseAvailable) {
     EXPECT_TRUE(v.value("sourceAvailable", false));
     EXPECT_EQ(v["allowedSources"], json::array({"http"}));
     EXPECT_FALSE(v.contains("requiredSource"));
+}
+
+TEST(DownloadSource, AReleaseTheStorageNodeCanFetchIsUsableOverStorage) {
+    auto http = storageCatalogFetcher();   // 0.2.0 on both, 0.1.0 over HTTP only
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(std::make_shared<StorageFetcher>(network, true));
+
+    const json v = catalogRelease(lib, "0.2.0");
+    EXPECT_EQ(v.value("usableSources", json()), json::array({"logos", "http"}));
+}
+
+TEST(DownloadSource, AStorageNodeOnAnotherNetworkLeavesOnlyHttpUsable) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(std::make_shared<StorageFetcher>("logos.dev", true));
+
+    const json v = catalogRelease(lib, "0.2.0");
+    EXPECT_EQ(v.value("usableSources", json()), json::array({"http"}));
+}
+
+TEST(DownloadSource, HttpOnlyLeavesStorageUnusable) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(std::make_shared<StorageFetcher>(network, true));
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Http);
+
+    const json v = catalogRelease(lib, "0.2.0");
+    EXPECT_EQ(v.value("usableSources", json()), json::array({"http"}));
+}
+
+TEST(DownloadSource, WithoutAStorageNodeOnlyHttpIsUsable) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+
+    const json v = catalogRelease(lib, "0.2.0");
+    EXPECT_EQ(v.value("usableSources", json()), json::array({"http"}));
+}
+
+TEST(DownloadSource, LogosOnlyWithTheNodeOnAnotherNetworkLeavesNothingUsable) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(std::make_shared<StorageFetcher>("logos.dev", true));
+    lib.registry().setDownloadSource(lgpd::DownloadSource::Logos);
+
+    const json v = catalogRelease(lib, "0.2.0");
+    EXPECT_EQ(v.value("usableSources", json()), json::array());
+}
+
+TEST(DownloadSource, ACatalogReadAsksTheStorageNodeOnce) {
+    auto http = storageCatalogFetcher();
+    json idx = json::parse(http->indexJson);
+    for (auto& pkg : idx["packages"]) {
+        if (pkg["name"] != packageName) continue;
+        for (auto& v : pkg["versions"]) {
+            if (v["manifest"]["version"] == "0.1.0") v["urls"] = json::array({storageUrl});
+        }
+    }
+    http->indexJson = idx.dump();   // 0.2.0 and 0.1.0 both on Logos Storage
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    auto storage = std::make_shared<StorageFetcher>(network, true);
+    lib.setStorageFetcher(storage);
+
+    lib.getCatalogJson();
+    EXPECT_EQ(storage->nodeQueries, 1);
 }
 
 TEST(DownloadSource, LogosOnlyNeverFallsBackToHttp) {
