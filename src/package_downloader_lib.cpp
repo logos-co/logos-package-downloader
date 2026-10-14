@@ -139,23 +139,59 @@ std::string sourceUnavailableReason(DownloadSource source, const VersionSources&
     return {};
 }
 
+// True when a storage node on `network` can fetch one of the version's
+// `urls`, the ones a download hands to it.
+bool storageCanFetch(const json& v, const std::string& network) {
+    if (network.empty()) {
+        return false;
+    }
+
+    const std::string prefix = "logos:" + network + ":";
+
+    for (const auto& u : v.value("urls", json::array())) {
+        if (!u.is_string()) {
+            continue;
+        }
+
+        const std::string url = u.get<std::string>();
+
+        if (url.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Adds `sources` (published on), `allowedSources` (those `source` lets a
-// download use) and `sourceAvailable`; when false, also `requiredSource` and
-// a readable `sourceUnavailableReason`.
-void annotateSources(json& v, DownloadSource source) {
+// download use), `usableSources` (those allowed that can fetch it now) and
+// `sourceAvailable`; when false, also `requiredSource` and a readable
+// `sourceUnavailableReason`.
+void annotateSources(json& v, DownloadSource source, const std::string& storageNetwork) {
     const VersionSources s = sourcesOf(v);
     json published = json::array();
     json allowed = json::array();
+    json usable = json::array();
     if (s.logos) {
         published.push_back("logos");
-        if (source != DownloadSource::Http) allowed.push_back("logos");
+
+        if (source != DownloadSource::Http) {
+            allowed.push_back("logos");
+            if (storageCanFetch(v, storageNetwork)) {
+                usable.push_back("logos");
+            }
+        }
     }
     if (s.http) {
         published.push_back("http");
-        if (source != DownloadSource::Logos) allowed.push_back("http");
+        if (source != DownloadSource::Logos) {
+            allowed.push_back("http");
+            usable.push_back("http");
+        }
     }
     v["sources"] = std::move(published);
     v["allowedSources"] = std::move(allowed);
+    v["usableSources"] = std::move(usable);
 
     const std::string reason = sourceUnavailableReason(source, s);
     v["sourceAvailable"] = reason.empty();
@@ -1319,8 +1355,21 @@ struct PackageDownloaderLib::Impl {
             source.name.empty() ? source.url : source.name;
         const auto slash = source.indexUrl.find_last_of('/');
         // Stamped on each read, never into the cached index, so a new
-        // download source shows on the next listing.
+        // download source or storage network shows on the next listing.
         const DownloadSource downloadSource = registry.downloadSource();
+
+        std::shared_ptr<Fetcher> storage;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            storage = storageFetcher;
+        }
+
+        // Once per index: in the module, each call is an IPC round trip.
+        std::string storageNetwork;
+        if (storage && downloadSource != DownloadSource::Http) {
+            storageNetwork = storage->network();
+        }
+
         for (auto& pkg : idx["packages"]) {
             if (!pkg.is_object() || !pkg.contains("name")) continue;
             // Per package, not per repo: a field of an unexpected type throws
@@ -1351,7 +1400,7 @@ struct PackageDownloaderLib::Impl {
                         const std::string iconPath = objOrEmpty(v, "icon").value("path", "");
                         if (!iconPath.empty() && slash != std::string::npos)
                             v["iconUrl"] = source.indexUrl.substr(0, slash) + "/" + iconPath;
-                        annotateSources(v, downloadSource);
+                        annotateSources(v, downloadSource, storageNetwork);
                     }
                     versions.push_back(v);
                 }

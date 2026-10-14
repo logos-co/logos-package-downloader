@@ -172,7 +172,7 @@ Logos module wrapper and existing CLI code use that name).
 | `std::string getCatalogJson()` | Merged catalog JSON across enabled repos: `[{repositoryUrl, repositoryName, repositoryDisplayName, name, description, type, category, author, icon, versions:[...]}]`; `versions[]` newest-first by SemVer, `releasedAt` breaks ties. |
 | `std::string getCatalogForRepoJson(const std::string& urlOrName)` | Same synthesised shape scoped to one repo (by URL or canonical name). Returns `"[]"` if the repo is not found. |
 | `std::string refreshCatalogs()` | Clear caches and force re-fetch of every enabled repo's metadata + `index.json`. Empty string on success, else an error summary. |
-| `uint64_t catalogRevision() const` | Moves when the catalog served changes under its callers: a `refreshCatalogs()` that fetched different metadata or indexes, or an index read after an earlier fetch of it failed. Registry edits don't move it. Callers holding a copy of the catalog re-read it when it moves. |
+| `uint64_t catalogRevision() const` | Moves when the catalog served changes under its callers: a `refreshCatalogs()` that fetched different metadata or indexes, or an index read after an earlier fetch of it failed. Registry edits and storage network changes don't move it. Callers holding a copy of the catalog re-read it when it moves. |
 | `std::string downloadPackage(repoUrlOrName, packageName, errorMessage, version="", rootHash="", outputDir="", onProgress={}, source=nullptr)` | Download + verify a `.lgx`; returns the local path or empty with `errorMessage` set. `repo` empty = any enabled repo (registry order); `version` empty = newest; `rootHash` disambiguates same-version builds; `outputDir` empty = a private per-user staging directory under the system temp dir (`<temp>/lgpd-<uid>`). Tries Logos Storage first, then HTTPS. `source` gives the URL used. |
 | `downloadPackage(..., onProgress, source, isCancelled)` | Cancel-aware overload. `isCancelled` stops an active HTTPS transfer, removes its pending file, and prevents fallback to HTTPS after Storage cancellation. Keep its result true after cancellation. The original overload remains available to compiled clients. |
 | `std::string resolveDependenciesJson(dependenciesJson, installedPackagesJson="")` | Cross-repo BFS resolver. Output is a JSON array in install order: `[{repositoryUrl, name, version, rootHash, url, topLevel}]`; on failure an `{error, name}` entry at the unsatisfied position. The installed-state snapshot (`[{name, version, rootHash}]`) short-circuits already-satisfied transitive deps. |
@@ -216,6 +216,7 @@ repo URL
 ```cpp
 class Fetcher {
     virtual bool canHandle(const std::string& url) const = 0;             // true if getToFile can download this url
+    virtual std::string network() const;                                  // Logos Storage network served, "" if none
     virtual FetchResult get(const std::string& url, std::string& out) = 0;       // GET into a string
     virtual FetchResult getToFile(const std::string& url, const std::string& path) = 0;  // GET to a file
     virtual FetchResult getToFile(const std::string& url, const std::string& path,
@@ -367,7 +368,9 @@ stored.
 `downloadSource` is `"any"`, `"logos"` or `"http"`; an unknown value reads as
 `"any"`. Under `"logos"` or `"http"`, `getCatalogJson()` marks each version the
 source cannot serve with `sourceAvailable: false`, `requiredSource` and
-`sourceUnavailableReason`, next to `sources` and `allowedSources` on every version.
+`sourceUnavailableReason`, next to `sources`, `allowedSources` and `usableSources`
+on every version. `usableSources` keeps `"logos"` only when the storage node runs
+on the network of one of the version's `logos:` URLs.
 
 The default repository has two independent flags:
 
@@ -442,7 +445,7 @@ The test suite (`tests/test_downloader.cpp`, GoogleTest via CTest) covers:
 | `FetchSelection.HttpsIsUsedWhenNoStorageFetcherIsDefined` | https is used when no storage fetcher is set. |
 | `FetchSelection.LegacyUrlIsUsedWhenTheIndexDoesNotContainUrls` | `url` is used when the index has no `urls`. |
 | `FetchSelection.HttpsIsUsedWhenTheStorageNodeIsOnAnotherNetwork` | https is used when the storage fetcher is on another network. |
-| `DownloadSource.*` | The download source round-trips through the config, marks versions it cannot serve in the catalog, keeps downloads and the resolver off them, and takes the other transport out (no HTTP fallback under `logos`, no storage node under `http`). |
+| `DownloadSource.*` | The download source round-trips through the config, marks versions it cannot serve in the catalog, keeps downloads and the resolver off them, and takes the other transport out (no HTTP fallback under `logos`, no storage node under `http`), and fills `usableSources` from the storage node's network, asked once per index. |
 
 ### Raw CMake (inside `nix develop`)
 
