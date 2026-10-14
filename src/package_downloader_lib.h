@@ -333,8 +333,8 @@ public:
     ///
     /// Each version also carries `sources` (the transports it is published
     /// on: "logos", "http"), `allowedSources` (those the download source lets
-    /// a download use), `usableSources` (those allowed that can fetch it now:
-    /// "logos" needs a storage node on the network of one of its `urls`) and
+    /// a download use), `usableSources` (those allowed; "logos" only on the
+    /// storage node's network) and
     /// `sourceAvailable`. When that is false, the version
     /// also has `requiredSource` ("logos" or "http") and a readable
     /// `sourceUnavailableReason`; downloads and the resolver skip it.
@@ -348,10 +348,14 @@ public:
     /// empty string on success or a summary of errors.
     std::string refreshCatalogs();
 
-    /// Moves when the catalog served changes under its callers: a
-    /// refreshCatalogs() that fetched something different, or an index read
-    /// after an earlier fetch of it failed. Registry edits and storage network
-    /// changes don't move it.
+    /// A counter for callers that keep a copy of the catalog: when it
+    /// increases, they read the catalog again.
+    /// It increases after a refreshCatalogs() that fetched something
+    /// different, and after an index loads that failed to load before.
+    /// It does not increase when the caller edits the registry
+    /// (repositories, download source) or when the storage node changes
+    /// network. The caller knows about these changes, so it reads the
+    /// catalog again itself.
     uint64_t catalogRevision() const;
 
     /// Download a package. If `rootHash` is empty and multiple entries

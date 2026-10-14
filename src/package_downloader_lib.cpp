@@ -139,8 +139,8 @@ std::string sourceUnavailableReason(DownloadSource source, const VersionSources&
     return {};
 }
 
-// True when a storage node on `network` can fetch one of the version's
-// `urls`, the ones a download hands to it.
+// True when the storage node is on the same network as one of the
+// version's `urls`. `url` is skipped: a download never fetches it over storage.
 bool storageCanFetch(const json& v, const std::string& network) {
     if (network.empty()) {
         return false;
@@ -164,9 +164,9 @@ bool storageCanFetch(const json& v, const std::string& network) {
 }
 
 // Adds `sources` (published on), `allowedSources` (those `source` lets a
-// download use), `usableSources` (those allowed that can fetch it now) and
-// `sourceAvailable`; when false, also `requiredSource` and a readable
-// `sourceUnavailableReason`.
+// download use), `usableSources` (those allowed; "logos" only on the storage
+// node's network) and `sourceAvailable`; when false, also `requiredSource`
+// and a readable `sourceUnavailableReason`.
 void annotateSources(json& v, DownloadSource source, const std::string& storageNetwork) {
     const VersionSources s = sourcesOf(v);
     json published = json::array();
@@ -1364,7 +1364,6 @@ struct PackageDownloaderLib::Impl {
             storage = storageFetcher;
         }
 
-        // Once per index: in the module, each call is an IPC round trip.
         std::string storageNetwork;
         if (storage && downloadSource != DownloadSource::Http) {
             storageNetwork = storage->network();
