@@ -334,9 +334,8 @@ public:
     /// Each version also carries `sources` (the transports it is published
     /// on: "logos", "http"), `allowedSources` (those the download source lets
     /// a download use), `usableSources` (those allowed; "logos" only on the
-    /// storage node's network) and
-    /// `sourceAvailable`. When that is false, the version
-    /// also has `requiredSource` ("logos" or "http") and a readable
+    /// storage node's network) and `sourceAvailable`. When that is false, the
+    /// version also has `requiredSource` ("logos" or "http") and a readable
     /// `sourceUnavailableReason`; downloads and the resolver skip it.
     std::string getCatalogJson();
 
