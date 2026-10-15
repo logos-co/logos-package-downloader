@@ -52,6 +52,9 @@ public:
     /// Whether this fetcher can download `url` with getToFile.
     virtual bool canHandle(const std::string& url) const = 0;
 
+    /// The Logos Storage network this fetcher serves; empty when it serves none.
+    virtual std::string network() const { return {}; }
+
     /// HTTP GET. Succeeds on 2xx with the response body in `out`.
     virtual FetchResult get(const std::string& url, std::string& out) = 0;
 
@@ -330,8 +333,9 @@ public:
     ///
     /// Each version also carries `sources` (the transports it is published
     /// on: "logos", "http"), `allowedSources` (those the download source lets
-    /// a download use) and `sourceAvailable`. When that is false, the version
-    /// also has `requiredSource` ("logos" or "http") and a readable
+    /// a download use), `usableSources` (those allowed; "logos" only on the
+    /// storage node's network) and `sourceAvailable`. When that is false, the
+    /// version also has `requiredSource` ("logos" or "http") and a readable
     /// `sourceUnavailableReason`; downloads and the resolver skip it.
     std::string getCatalogJson();
 
@@ -343,9 +347,14 @@ public:
     /// empty string on success or a summary of errors.
     std::string refreshCatalogs();
 
-    /// Moves when the catalog served changes under its callers: a
-    /// refreshCatalogs() that fetched something different, or an index read
-    /// after an earlier fetch of it failed. Registry edits don't move it.
+    /// A counter for callers that keep a copy of the catalog: when it
+    /// increases, they read the catalog again.
+    /// It increases after a refreshCatalogs() that fetched something
+    /// different, and after an index loads that failed to load before.
+    /// It does not increase when the caller edits the registry
+    /// (repositories, download source) or when the storage node changes
+    /// network. The caller knows about these changes, so it reads the
+    /// catalog again itself.
     uint64_t catalogRevision() const;
 
     /// Download a package. If `rootHash` is empty and multiple entries
