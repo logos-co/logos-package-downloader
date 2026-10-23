@@ -1935,7 +1935,8 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
                                                   const std::string& outputDir,
                                                   const ProgressFn& onProgress,
                                                   std::string* source,
-                                                  const CancelFn& isCancelled) {
+                                                  const CancelFn& isCancelled,
+                                                  const TransportFn& onTransport) {
 
     // Clear any previous error message before starting a new download attempt.
     errorMessage.clear();
@@ -2239,8 +2240,20 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         // https fails.
         std::string storageError;
 
+        // Says which transport the bytes that follow come from.
+        auto beginAttempt = [&](const char* transport) {
+            if (onTransport) {
+                try {
+                    onTransport(transport);
+                } catch (...) {
+                }
+            }
+            if (progressSink) progressSink(0, advertisedSize);
+        };
+
         if (cancelled("")) return {};
         if (!storageUrl.empty()) {
+            beginAttempt("logos");
             const FetchResult storageFetched =
                 storageFetcher->getToFile(storageUrl, storagePending, progressSink);
             downloaded = storageFetched.ok;
@@ -2267,6 +2280,7 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
         if (!downloaded) {
             if (cancelled("")) return {};
             throttle.reset();
+            beginAttempt("http");
 
             // Keep the established virtual call for clients without a token:
             // an already-compiled custom Fetcher may not have the new slot.

@@ -43,6 +43,13 @@ using ProgressFn = std::function<void(std::uint64_t received, std::uint64_t tota
 /// the download; the HTTPS fetcher checks it even without a progress listener.
 using CancelFn = std::function<bool()>;
 
+/// The transport a download is about to try: "logos" (Logos Storage) or
+/// "http" (HTTP(S)), the names the download source and the catalog's
+/// `sources` already use. Called before each attempt, so a fallback from Logos Storage to
+/// HTTP calls it twice. A progress sample of 0 bytes follows each call, so a
+/// listener knows the transport before any byte arrives.
+using TransportFn = std::function<void(const std::string& transport)>;
+
 /// Minimal HTTP(S) fetcher abstraction. The concrete implementation in the
 /// .cpp uses libcurl. Tests can inject their own implementation.
 class Fetcher {
@@ -393,7 +400,8 @@ public:
                                 const std::string& outputDir,
                                 const ProgressFn& onProgress,
                                 std::string* source,
-                                const CancelFn& isCancelled);
+                                const CancelFn& isCancelled,
+                                const TransportFn& onTransport = {});
 
     /// Cross-repo dependency resolution.
     ///

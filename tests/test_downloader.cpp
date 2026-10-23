@@ -936,19 +936,23 @@ TEST(DownloadProgress, AThrowingSinkDoesNotBreakTheDownload) {
 }
 
 // A Fetcher implementing only the two-argument getToFile must still be
-// driven, and the download must still succeed — it just reports no progress.
+// driven, and the download must still succeed — it reports nothing past the
+// 0-byte sample every attempt starts with.
 TEST(DownloadProgress, FetcherWithoutProgressSupportStillDownloads) {
     auto* seed = new LegacyOnlyFetcher();
     lgpd::PackageDownloaderLib lib;
     lib.setFetcher(sizedFetcher(4096, seed));
 
-    bool progressed = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> samples;
     std::string err;
     lib.downloadPackage("", "dl_module", err, "", "", "",
-                        [&](std::uint64_t, std::uint64_t) { progressed = true; });
+                        [&](std::uint64_t received, std::uint64_t total) {
+                            samples.emplace_back(received, total);
+                        });
 
     EXPECT_TRUE(seed->called) << "the legacy overload must still be reached";
-    EXPECT_FALSE(progressed);
+    ASSERT_EQ(samples.size(), 1u);
+    EXPECT_EQ(samples[0], (std::pair<std::uint64_t, std::uint64_t>{0, 4096}));
 }
 
 // ─── Repository registry (in-memory) ─────────────────────────────────────────
@@ -2083,6 +2087,66 @@ TEST(FetchSelection, HttpsTakesOverWhenTheStorageDownloadFails) {
     EXPECT_EQ(storage->attempts, std::vector<std::string>{storageUrl});
     EXPECT_TRUE(storage->fileGets.empty());
     EXPECT_EQ(http->fileGets, std::vector<std::string>{lgxStorageUrl});
+}
+
+// The transport is reported before each attempt, and a 0-byte sample follows
+// it: a Logos Storage download can sit at 0 bytes while it finds peers, and
+// the user should know that is where it is.
+TEST(FetchTransport, StorageIsReportedBeforeAnyByteArrives) {
+    auto http = storageCatalogFetcher();
+    bool success = true;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+
+    std::vector<std::string> events;
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir,
+                        [&](std::uint64_t received, std::uint64_t) {
+                            events.push_back("progress:" + std::to_string(received));
+                        },
+                        nullptr, {},
+                        [&](const std::string& transport) {
+                            events.push_back("transport:" + transport);
+                        });
+
+    ASSERT_GE(events.size(), 2u);
+    EXPECT_EQ(events[0], "transport:logos");
+    EXPECT_EQ(events[1], "progress:0");
+    for (const std::string& e : events) EXPECT_NE(e, "transport:http");
+}
+
+// The fallback is visible: the transport changes, and progress starts over.
+TEST(FetchTransport, AFallbackToHttpIsReportedAsASecondTransport) {
+    auto http = storageCatalogFetcher();
+    bool success = false;
+    auto storage = std::make_shared<StorageFetcher>(network, success);
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+
+    std::vector<std::string> transports;
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir,
+                        {}, nullptr, {},
+                        [&](const std::string& transport) { transports.push_back(transport); });
+
+    EXPECT_EQ(transports, (std::vector<std::string>{"logos", "http"}));
+}
+
+TEST(FetchTransport, HttpOnlyIsReportedOnce) {
+    auto http = storageCatalogFetcher();
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(http);
+
+    std::vector<std::string> transports;
+    std::string err;
+    lib.downloadPackage(repoUrl, packageName, err, version, rootHash, outputDir,
+                        {}, nullptr, {},
+                        [&](const std::string& transport) { transports.push_back(transport); });
+
+    EXPECT_EQ(transports, std::vector<std::string>{"http"});
 }
 
 TEST(DownloadCancellation, AlreadyCancelledSkipsMetadataAndTransfer) {
