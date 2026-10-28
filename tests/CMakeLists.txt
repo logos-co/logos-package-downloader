@@ -18,4 +18,8 @@ else()
     )
 endif()
 
+# Committed packages the tests read (see tests/fixtures/README.md).
+target_compile_definitions(lgpd_tests PRIVATE
+    LGPD_TEST_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
 gtest_discover_tests(lgpd_tests)
