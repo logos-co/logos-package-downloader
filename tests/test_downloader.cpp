@@ -3495,3 +3495,52 @@ TEST(DownloadSource, TheResolverSaysWhenTheSourceExcludesEveryRelease) {
     ASSERT_FALSE(out.empty());
     EXPECT_NE(out[0].value("error", "").find("download source logos"), std::string::npos) << out.dump();
 }
+
+namespace {
+
+// Serves the committed signed package as the download.
+class FixtureFetcher : public MockFetcher {
+public:
+    lgpd::FetchResult getToFile(const std::string&, const std::string& path) override {
+        fs::copy_file(std::string(LGPD_TEST_FIXTURES) + "/signed-with-backend.lgx", path,
+                      fs::copy_options::overwrite_existing);
+        return {true, {}};
+    }
+};
+
+}  // namespace
+
+// After a download the signature is checked with lgx_verify_signature, which
+// verifies the manifest as the linked logos-package re-serialises it. A
+// logos-package older than manifest 0.7.0 drops `backend`, so a correctly
+// signed ui_qml app with a module backend failed the signer binding and its
+// install was refused. The fixture was signed by logos-package 0.7.0.
+TEST(SignedPackage, DownloadWithBackendInManifestVerifies) {
+    auto f = std::make_shared<FixtureFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    json v = {
+        {"releasedAt", "2026-01-01T00:00:00Z"},
+        {"url", "https://test.local/fixture_app.lgx"},
+        {"rootHash", "6678411306a16f25eb54e93069f992c77d395dd8adda47484c638e419cbb29ab"},
+        {"manifest", {
+            {"manifestVersion", "0.7.0"}, {"name", "fixture_app"}, {"version", "0.0.1"},
+            {"type", "ui_qml"}, {"dependencies", json::array()},
+            {"main", {{"linux-x86_64", "Main.qml"}}}, {"backend", "fixture_app_backend"},
+        }},
+        {"signature", {{"did", "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ilg5TURyblRyQm5jZkJTRmdrT3RxWlRJSHNBdE9LM01ZSWdZT1VzWklOM0UifQ"}}},
+    };
+    f->indexJson = json{
+        {"schemaVersion", 2}, {"repositoryName", "test"},
+        {"packages", json::array({json{{"name", "fixture_app"}, {"versions", json::array({v})}}})},
+    }.dump();
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    const fs::path out = fs::temp_directory_path() / "lgpd-signed-with-backend";
+    fs::create_directories(out);
+    std::string err;
+    const std::string path = lib.downloadPackage("", "fixture_app", err, "", "", out.string());
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_FALSE(path.empty());
+}
