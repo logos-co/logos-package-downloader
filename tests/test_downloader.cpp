@@ -3467,6 +3467,26 @@ TEST(DownloadSource, ACatalogReadAsksTheStorageNodeOnce) {
     EXPECT_EQ(storage->nodeQueries, 1);
 }
 
+// One ask per listing, not one per catalog: a root with 100 includes would
+// otherwise ask the storage node 101 times.
+TEST(DownloadSource, ACatalogWithIncludesAsksTheStorageNodeOnce) {
+    auto f = rootIncluding(json::array({json{{"repo", kBRepo}}}),
+                           json::array({packageOf("root_module",
+                               json::array({versionFrom("root", "root_module", "1.0.0", "h_r")}))}));
+    f->byUrl[kBRepo]  = repoDoc("b", kBIndex);
+    f->byUrl[kBIndex] = indexDoc("b", json::array({
+        packageOf("b_one", json::array({versionFrom("b", "b_one", "1.0.0", "h_b1")})),
+    }));
+
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(f);
+    auto storage = std::make_shared<StorageFetcher>(network, true);
+    lib.setStorageFetcher(storage);
+
+    lib.getCatalogJson();
+    EXPECT_EQ(storage->nodeQueries, 1);
+}
+
 TEST(DownloadSource, LogosOnlyNeverFallsBackToHttp) {
     auto http = storageCatalogFetcher();
     http->fileGetSucceeds = true;

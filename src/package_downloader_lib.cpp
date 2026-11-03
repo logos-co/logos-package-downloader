@@ -1340,8 +1340,25 @@ struct PackageDownloaderLib::Impl {
     // aggregate catalog render as nothing at all. The origin travels in the
     // `origin*` fields instead, and on every version entry, because after a
     // merge one package's versions can come from several catalogs.
+    // The storage node's network, or empty under "http" or without a storage
+    // fetcher. Each call asks the storage fetcher: read it once per listing.
+    std::string readStorageNetwork() {
+        if (registry.downloadSource() == DownloadSource::Http) {
+            return {};
+        }
+
+        std::shared_ptr<Fetcher> storage;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            storage = storageFetcher;
+        }
+
+        return storage ? storage->network() : std::string();
+    }
+
     void appendCatalogEntries(const Repository& source, const Repository& root,
-                              const std::string& body, json& out) {
+                              const std::string& body, const std::string& storageNetwork,
+                              json& out) {
         if (body.empty()) return;
         json idx;
         try {
@@ -1357,17 +1374,6 @@ struct PackageDownloaderLib::Impl {
         // Stamped on each read, never into the cached index, so a new
         // download source or storage network shows on the next listing.
         const DownloadSource downloadSource = registry.downloadSource();
-
-        std::shared_ptr<Fetcher> storage;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            storage = storageFetcher;
-        }
-
-        std::string storageNetwork;
-        if (storage && downloadSource != DownloadSource::Http) {
-            storageNetwork = storage->network();
-        }
 
         for (auto& pkg : idx["packages"]) {
             if (!pkg.is_object() || !pkg.contains("name")) continue;
@@ -1481,13 +1487,14 @@ struct PackageDownloaderLib::Impl {
     // those of every catalog it includes, merged.
     json catalogForRoot(const Repository& root,
                         const std::vector<Repository>& all,
+                        const std::string& storageNetwork,
                         std::vector<std::string>* warnings) {
         json entries = json::array();
-        appendCatalogEntries(root, root, fetchIndex(root), entries);
+        appendCatalogEntries(root, root, fetchIndex(root), storageNetwork, entries);
         for (const auto& d : all) {
             if (!d.isDerived || d.rootUrl != root.url) continue;
             if (!d.resolveError.empty()) continue;
-            appendCatalogEntries(d, root, fetchIndex(d), entries);
+            appendCatalogEntries(d, root, fetchIndex(d), storageNetwork, entries);
         }
         return mergeCatalogEntries(entries, warnings);
     }
@@ -1581,6 +1588,7 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
 std::string PackageDownloaderLib::getCatalogJson() {
     impl_->ensureMetadata();
     const auto all = impl_->registry.listAll();
+    const std::string storageNetwork = impl_->readStorageNetwork();
     json out = json::array();
     // Merge per configured repository, not across all of them: two repos
     // publishing the same package name are two separate offerings the user
@@ -1590,7 +1598,7 @@ std::string PackageDownloaderLib::getCatalogJson() {
         if (r.isDerived) continue;
         if (!r.enabled) continue;
         if (!r.resolveError.empty()) continue;
-        for (auto& e : impl_->catalogForRoot(r, all, nullptr))
+        for (auto& e : impl_->catalogForRoot(r, all, storageNetwork, nullptr))
             out.push_back(std::move(e));
     }
     return out.dump();
@@ -1612,12 +1620,13 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
     // includes among them: that is what the user added. Naming an INCLUDED
     // catalog scopes to that catalog's own slice, which is how you ask where
     // a package actually came from.
+    const std::string storageNetwork = impl_->readStorageNetwork();
     if (!repo->isDerived) {
         const auto all = impl_->registry.listAll();
-        return impl_->catalogForRoot(*repo, all, nullptr).dump();
+        return impl_->catalogForRoot(*repo, all, storageNetwork, nullptr).dump();
     }
     json out = json::array();
-    impl_->appendCatalogEntries(*repo, *repo, impl_->fetchIndex(*repo), out);
+    impl_->appendCatalogEntries(*repo, *repo, impl_->fetchIndex(*repo), storageNetwork, out);
     return impl_->mergeCatalogEntries(out, nullptr).dump();
 }
 
@@ -1668,9 +1677,10 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     // is invisible in the catalog itself, and "this include contributed
     // nothing" must not look the same as "this include worked".
     std::vector<std::string> warnings;
+    const std::string storageNetwork = impl_->readStorageNetwork();
     for (const auto& r : all) {
         if (r.isDerived || !r.enabled || !r.resolveError.empty()) continue;
-        impl_->catalogForRoot(r, all, &warnings);
+        impl_->catalogForRoot(r, all, storageNetwork, &warnings);
     }
     for (const auto& w : warnings) out += w + "\n";
     return out;
