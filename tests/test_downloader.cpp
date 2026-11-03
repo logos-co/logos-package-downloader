@@ -3498,10 +3498,12 @@ TEST(DownloadSource, TheResolverSaysWhenTheSourceExcludesEveryRelease) {
 
 namespace {
 
-// Serves the committed signed package as the download.
+// Serves the committed signed package as the download, whatever the URL.
 class FixtureFetcher : public MockFetcher {
 public:
-    lgpd::FetchResult getToFile(const std::string&, const std::string& path) override {
+    std::vector<std::string> fetched;  // URLs downloaded, in order
+    lgpd::FetchResult getToFile(const std::string& url, const std::string& path) override {
+        fetched.push_back(url);
         fs::copy_file(std::string(LGPD_TEST_FIXTURES) + "/signed-with-backend.lgx", path,
                       fs::copy_options::overwrite_existing);
         return {true, {}};
@@ -3543,4 +3545,119 @@ TEST(SignedPackage, DownloadWithBackendInManifestVerifies) {
     const std::string path = lib.downloadPackage("", "fixture_app", err, "", "", out.string());
     EXPECT_TRUE(err.empty()) << err;
     EXPECT_FALSE(path.empty());
+}
+
+namespace {
+
+// The committed fixture's manifest and signer, as an index entry advertises
+// them, named `name`.
+json fixtureRelease(const std::string& name, const char* releasedAt, const char* url) {
+    return {
+        {"releasedAt", releasedAt},
+        {"url", url},
+        {"rootHash", "6678411306a16f25eb54e93069f992c77d395dd8adda47484c638e419cbb29ab"},
+        {"manifest", {
+            {"manifestVersion", "0.7.0"}, {"name", name}, {"version", "0.0.1"},
+            {"type", "ui_qml"}, {"dependencies", json::array()},
+            {"main", {{"linux-x86_64", "Main.qml"}}}, {"backend", "fixture_app_backend"},
+        }},
+        {"signature", {{"did", "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ilg5TURyblRyQm5jZkJTRmdrT3RxWlRJSHNBdE9LM01ZSWdZT1VzWklOM0UifQ"}}},
+    };
+}
+
+std::shared_ptr<FixtureFetcher> fixtureCatalog(const json& packages) {
+    auto f = std::make_shared<FixtureFetcher>();
+    f->repoJson = json{{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                       {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}}.dump();
+    f->indexJson = json{{"schemaVersion", 2}, {"repositoryName", "test"}, {"packages", packages}}.dump();
+    return f;
+}
+
+}  // namespace
+
+// A release installs under its manifest's name, and its root hash covers the
+// content, not the manifest. A second `cool` entry, dated later, with the
+// listed release's version and root hash but fixture_app's manifest and
+// signature, used to be the one downloaded: asked for cool, the caller got a
+// package that installs as fixture_app.
+TEST(DownloadBinding, AnEntryNamingAnotherPackageIsNeverTheDownload) {
+    lgpd::PackageDownloaderLib lib;
+    auto f = fixtureCatalog(json::array({
+        json{{"name", "cool"}, {"versions", json::array({
+            fixtureRelease("cool", "2026-01-01T00:00:00Z", "https://test.local/cool.lgx")})}},
+        json{{"name", "cool"}, {"versions", json::array({
+            fixtureRelease("fixture_app", "2026-06-01T00:00:00Z", "https://test.local/fixture_app.lgx")})}},
+    }));
+    lib.setFetcher(f);
+    const fs::path out = fs::temp_directory_path() / "lgpd-another-package";
+    fs::create_directories(out);
+    std::string err;
+    const std::string path = lib.downloadPackage(
+        "", "cool", err, "0.0.1",
+        "6678411306a16f25eb54e93069f992c77d395dd8adda47484c638e419cbb29ab", out.string());
+    EXPECT_TRUE(path.empty()) << path;
+    EXPECT_EQ(f->fetched, std::vector<std::string>{"https://test.local/cool.lgx"});
+    EXPECT_NE(err.find("https://test.local/cool.lgx"), std::string::npos) << err;
+}
+
+// The same duplicate beside a genuine release: the genuine one downloads.
+TEST(DownloadBinding, TheGenuineReleaseDownloadsBesideOneNamingAnotherPackage) {
+    lgpd::PackageDownloaderLib lib;
+    auto f = fixtureCatalog(json::array({
+        json{{"name", "fixture_app"}, {"versions", json::array({
+            fixtureRelease("fixture_app", "2026-01-01T00:00:00Z", "https://test.local/fixture_app.lgx")})}},
+        json{{"name", "fixture_app"}, {"versions", json::array({
+            fixtureRelease("other_app", "2026-06-01T00:00:00Z", "https://test.local/other_app.lgx")})}},
+    }));
+    lib.setFetcher(f);
+    const fs::path out = fs::temp_directory_path() / "lgpd-genuine-beside-another";
+    fs::create_directories(out);
+    std::string err;
+    const std::string path = lib.downloadPackage(
+        "", "fixture_app", err, "0.0.1",
+        "6678411306a16f25eb54e93069f992c77d395dd8adda47484c638e419cbb29ab", out.string());
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_FALSE(path.empty());
+    EXPECT_EQ(f->fetched, std::vector<std::string>{"https://test.local/fixture_app.lgx"});
+}
+
+// Listing and resolving agree with downloading: a release whose manifest names
+// another package is neither listed nor planned, so its dependencies never
+// reach a plan and the genuine older release is still found. The resolver used
+// to plan it, dependencies and all, for a download that then failed.
+TEST(DownloadBinding, AReleaseNamingAnotherPackageIsNeitherListedNorResolved) {
+    auto genuine = fixtureRelease("cool", "2026-01-01T00:00:00Z", "https://test.local/cool-0.0.1.lgx");
+    auto other = fixtureRelease("core_module", "2026-06-01T00:00:00Z", "https://test.local/cool-2.0.0.lgx");
+    other["manifest"]["version"] = "2.0.0";
+    other["manifest"]["dependencies"] = json::array({"another_module"});
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(fixtureCatalog(json::array({
+        json{{"name", "cool"}, {"versions", json::array({other, genuine})}},
+        json{{"name", "another_module"}, {"versions", json::array({
+            fixtureRelease("another_module", "2026-01-01T00:00:00Z", "https://test.local/another.lgx")})}},
+    })));
+
+    EXPECT_EQ(catalogVersions(lib)["cool"], std::vector<std::string>{"0.0.1"});
+    const auto plan = resolvedVersions(lib.resolveDependenciesJson(json::array({"cool"}).dump()));
+    EXPECT_EQ(plan.count("another_module"), 0u);
+    ASSERT_EQ(plan.count("cool"), 1u);
+    EXPECT_EQ(plan.at("cool"), std::vector<std::string>{"0.0.1"});
+}
+
+// With no manifest in the index to bind it to, the file is still held to the
+// name asked for: it used to download whatever package was served.
+TEST(DownloadBinding, AFileIsThePackageAskedForWithNoManifestToCompare) {
+    lgpd::PackageDownloaderLib lib;
+    lib.setFetcher(fixtureCatalog(json::array({
+        json{{"name", "other_app"}, {"versions", json::array({
+            json{{"releasedAt", "2026-01-01T00:00:00Z"}, {"url", "https://test.local/other_app.lgx"},
+                 {"manifest", nullptr}}})}},
+    })));
+    const fs::path out = fs::temp_directory_path() / "lgpd-no-manifest";
+    fs::create_directories(out);
+    std::string err;
+    const std::string path = lib.downloadPackage("", "other_app", err, "", "", out.string());
+    EXPECT_TRUE(path.empty()) << path;
+    EXPECT_NE(err.find("downloaded package is not other_app (its manifest names fixture_app)"),
+              std::string::npos) << err;
 }
