@@ -149,23 +149,59 @@ std::string sourceUnavailableReason(DownloadSource source, const VersionSources&
     return {};
 }
 
+// True when the storage node is on the same network as one of the
+// version's `urls`. `url` is skipped: a download never fetches it over storage.
+bool storageCanFetch(const json& v, const std::string& network) {
+    if (network.empty()) {
+        return false;
+    }
+
+    const std::string prefix = "logos:" + network + ":";
+
+    for (const auto& u : v.value("urls", json::array())) {
+        if (!u.is_string()) {
+            continue;
+        }
+
+        const std::string url = u.get<std::string>();
+
+        if (url.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Adds `sources` (published on), `allowedSources` (those `source` lets a
-// download use) and `sourceAvailable`; when false, also `requiredSource` and
-// a readable `sourceUnavailableReason`.
-void annotateSources(json& v, DownloadSource source) {
+// download use), `usableSources` (those allowed; "logos" only on the storage
+// node's network) and `sourceAvailable`; when false, also `requiredSource`
+// and a readable `sourceUnavailableReason`.
+void annotateSources(json& v, DownloadSource source, const std::string& storageNetwork) {
     const VersionSources s = sourcesOf(v);
     json published = json::array();
     json allowed = json::array();
+    json usable = json::array();
     if (s.logos) {
         published.push_back("logos");
-        if (source != DownloadSource::Http) allowed.push_back("logos");
+
+        if (source != DownloadSource::Http) {
+            allowed.push_back("logos");
+            if (storageCanFetch(v, storageNetwork)) {
+                usable.push_back("logos");
+            }
+        }
     }
     if (s.http) {
         published.push_back("http");
-        if (source != DownloadSource::Logos) allowed.push_back("http");
+        if (source != DownloadSource::Logos) {
+            allowed.push_back("http");
+            usable.push_back("http");
+        }
     }
     v["sources"] = std::move(published);
     v["allowedSources"] = std::move(allowed);
+    v["usableSources"] = std::move(usable);
 
     const std::string reason = sourceUnavailableReason(source, s);
     v["sourceAvailable"] = reason.empty();
@@ -1299,6 +1335,22 @@ struct PackageDownloaderLib::Impl {
             versionEntry.value("originRepositoryDisplayName", "");
     }
 
+    // The storage node's network, or empty under "http" or without a storage
+    // fetcher. Each call asks the storage fetcher: read it once per listing.
+    std::string readStorageNetwork() {
+        if (registry.downloadSource() == DownloadSource::Http) {
+            return {};
+        }
+
+        std::shared_ptr<Fetcher> storage;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            storage = storageFetcher;
+        }
+
+        return storage ? storage->network() : std::string();
+    }
+
     // Synthesise the catalog entries for one repo from its index.json
     // body and append them to `out`. Single source of truth for the
     // entry shape so getCatalogJson (all repos) and getCatalogForRepoJson
@@ -1315,7 +1367,8 @@ struct PackageDownloaderLib::Impl {
     // `origin*` fields instead, and on every version entry, because after a
     // merge one package's versions can come from several catalogs.
     void appendCatalogEntries(const Repository& source, const Repository& root,
-                              const std::string& body, json& out) {
+                              const std::string& body, const std::string& storageNetwork,
+                              json& out) {
         if (body.empty()) return;
         json idx;
         try {
@@ -1329,8 +1382,9 @@ struct PackageDownloaderLib::Impl {
             source.name.empty() ? source.url : source.name;
         const auto slash = source.indexUrl.find_last_of('/');
         // Stamped on each read, never into the cached index, so a new
-        // download source shows on the next listing.
+        // download source or storage network shows on the next listing.
         const DownloadSource downloadSource = registry.downloadSource();
+
         for (auto& pkg : idx["packages"]) {
             if (!pkg.is_object() || !pkg.contains("name")) continue;
             // Per package, not per repo: a field of an unexpected type throws
@@ -1364,7 +1418,7 @@ struct PackageDownloaderLib::Impl {
                         const std::string iconPath = objOrEmpty(v, "icon").value("path", "");
                         if (!iconPath.empty() && slash != std::string::npos)
                             v["iconUrl"] = source.indexUrl.substr(0, slash) + "/" + iconPath;
-                        annotateSources(v, downloadSource);
+                        annotateSources(v, downloadSource, storageNetwork);
                     }
                     versions.push_back(v);
                 }
@@ -1446,13 +1500,14 @@ struct PackageDownloaderLib::Impl {
     // those of every catalog it includes, merged.
     json catalogForRoot(const Repository& root,
                         const std::vector<Repository>& all,
-                        std::vector<std::string>* warnings) {
+                        std::vector<std::string>* warnings,
+                        const std::string& storageNetwork = {}) {
         json entries = json::array();
-        appendCatalogEntries(root, root, fetchIndex(root), entries);
+        appendCatalogEntries(root, root, fetchIndex(root), storageNetwork, entries);
         for (const auto& d : all) {
             if (!d.isDerived || d.rootUrl != root.url) continue;
             if (!d.resolveError.empty()) continue;
-            appendCatalogEntries(d, root, fetchIndex(d), entries);
+            appendCatalogEntries(d, root, fetchIndex(d), storageNetwork, entries);
         }
         return mergeCatalogEntries(entries, warnings);
     }
@@ -1546,6 +1601,7 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
 std::string PackageDownloaderLib::getCatalogJson() {
     impl_->ensureMetadata();
     const auto all = impl_->registry.listAll();
+    const std::string storageNetwork = impl_->readStorageNetwork();
     json out = json::array();
     // Merge per configured repository, not across all of them: two repos
     // publishing the same package name are two separate offerings the user
@@ -1555,7 +1611,7 @@ std::string PackageDownloaderLib::getCatalogJson() {
         if (r.isDerived) continue;
         if (!r.enabled) continue;
         if (!r.resolveError.empty()) continue;
-        for (auto& e : impl_->catalogForRoot(r, all, nullptr))
+        for (auto& e : impl_->catalogForRoot(r, all, nullptr, storageNetwork))
             out.push_back(std::move(e));
     }
     return out.dump();
@@ -1577,12 +1633,13 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
     // includes among them: that is what the user added. Naming an INCLUDED
     // catalog scopes to that catalog's own slice, which is how you ask where
     // a package actually came from.
+    const std::string storageNetwork = impl_->readStorageNetwork();
     if (!repo->isDerived) {
         const auto all = impl_->registry.listAll();
-        return impl_->catalogForRoot(*repo, all, nullptr).dump();
+        return impl_->catalogForRoot(*repo, all, nullptr, storageNetwork).dump();
     }
     json out = json::array();
-    impl_->appendCatalogEntries(*repo, *repo, impl_->fetchIndex(*repo), out);
+    impl_->appendCatalogEntries(*repo, *repo, impl_->fetchIndex(*repo), storageNetwork, out);
     return impl_->mergeCatalogEntries(out, nullptr).dump();
 }
 
