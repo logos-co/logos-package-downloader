@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -33,6 +34,8 @@
 #include <mutex>
 #include <random>
 #include <sstream>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -501,6 +504,10 @@ public:
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
         curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+        // Several of these run at once on different threads; without
+        // NOSIGNAL libcurl may use SIGALRM to time out name resolution,
+        // which is not thread-safe.
+        curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
         CURLcode res = curl_easy_perform(c);
         long code = 0;
@@ -557,6 +564,7 @@ public:
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
         curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+        curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
         // Reports the FINAL response's size, after FOLLOWLOCATION has chased
         // redirects — needed for GitHub release assets, where only the
@@ -584,6 +592,61 @@ public:
         return {true, {}};
     }
 };
+
+// At most this many fetches run at once. With includes a refresh can touch a
+// few dozen catalogs; a fixed bound keeps the threads, curl handles and TLS
+// connections in check while still overlapping the waits.
+constexpr size_t kMaxConcurrentFetches = 8;
+
+// Run fn(0..n-1) on up to kMaxConcurrentFetches threads, the calling thread
+// included, each taking the next index until none are left; returns once all
+// are done. A refresh then costs roughly the slowest fetch per batch instead
+// of the sum of all of them.
+//
+// After an exception from fn, no further items are started, and the first
+// exception is rethrown once every thread has joined, so the caller sees the
+// failure a serial loop would have raised. If a helper thread cannot be
+// created, the threads already started are still joined and the calling
+// thread works through what is left, so a starved system degrades to the old
+// serial loop instead of terminating.
+//
+// Not reentrant by design: fn must not call forEachConcurrently itself, so
+// the bound holds for the whole process.
+void forEachConcurrently(size_t n, const std::function<void(size_t)>& fn) {
+    if (n == 0) return;
+    if (n == 1) { fn(0); return; }
+
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::mutex errMu;
+    std::exception_ptr firstError;
+    auto work = [&] {
+        while (!failed.load()) {
+            const size_t i = next.fetch_add(1);
+            if (i >= n) return;
+            try {
+                fn(i);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(errMu);
+                if (!firstError) firstError = std::current_exception();
+                failed = true;
+            }
+        }
+    };
+
+    std::vector<std::thread> helpers;
+    const size_t wanted = std::min(n, kMaxConcurrentFetches) - 1;
+    try {
+        helpers.reserve(wanted);
+        for (size_t t = 0; t < wanted; ++t) helpers.emplace_back(work);
+    } catch (const std::exception&) {
+        // std::system_error from thread creation, or bad_alloc: carry on
+        // with the helpers that did start, plus this thread.
+    }
+    work();
+    for (auto& t : helpers) t.join();
+    if (firstError) std::rethrow_exception(firstError);
+}
 
 // ─── logos-repo.json + index.json parsers ─────────────────────────────────────
 
@@ -864,7 +927,11 @@ struct RepositoryRegistry::Impl {
         return f.good() ? std::string() : ("write failed: " + configPath);
     }
 
-    void refreshOne(Repository& r) {
+    // Resolve one repository's logos-repo.json (and its includes document)
+    // through `f`. Static and lock-free so refresh() can run it for several
+    // repositories at once with `mu` released; the fetcher is passed in
+    // because setFetcher may swap the member while a refresh is in flight.
+    static void refreshOne(Fetcher& f, Repository& r) {
         r.resolveError.clear();
         // Stale includes from a previous resolve must not survive a failed
         // one, or an unreachable catalog keeps pulling in the catalogs it
@@ -877,7 +944,7 @@ struct RepositoryRegistry::Impl {
             return;
         }
         std::string body;
-        const FetchResult result = fetcher->get(r.url, body);
+        const FetchResult result = f.get(r.url, body);
         if (!result.ok) {
             r.resolveError = "fetch failed: " + r.url;
             if (!result.error.empty())  {
@@ -899,7 +966,7 @@ struct RepositoryRegistry::Impl {
             r.resolveError = "logos-repo.json: " + err;
             return;
         }
-        fetchIncludesDoc(parsed);
+        fetchIncludesDoc(f, parsed);
         r = std::move(parsed);
     }
 
@@ -907,7 +974,7 @@ struct RepositoryRegistry::Impl {
     // never a resolveError: a catalog whose composition list is unreadable
     // still publishes its own packages, and dropping it would turn one
     // unreachable file into a blackout of everything it serves.
-    void fetchIncludesDoc(Repository& r) {
+    static void fetchIncludesDoc(Fetcher& f, Repository& r) {
         if (r.includesUrl.empty()) return;
         if (!isHttpsUrl(r.includesUrl)) {
             r.includeWarnings.push_back(
@@ -915,7 +982,7 @@ struct RepositoryRegistry::Impl {
             return;
         }
         std::string body;
-        const FetchResult result = fetcher->get(r.includesUrl, body);
+        const FetchResult result = f.get(r.includesUrl, body);
         if (!result.ok) {
             r.includeWarnings.push_back(
                 "includes document unavailable: " + r.includesUrl +
@@ -938,18 +1005,49 @@ struct RepositoryRegistry::Impl {
         return out;
     }
 
-    // Walk includes[] from every configured repository and rebuild
-    // `derivedRepos`. Breadth-first per root, so the resulting order is
-    // exactly the merge precedence the catalog wants: includes[] in declared
-    // order, shallower before deeper.
+    // One warning raised while walking includes[], kept until the walk is
+    // merged back under `mu` (see noteIncludeWarning).
+    struct IncludeWarning {
+        std::string rootUrl;
+        std::string viaUrl;
+        std::string text;
+    };
+    struct IncludeWalk {
+        std::vector<Repository> derived;
+        std::vector<IncludeWarning> warnings;
+    };
+
+    // Walk includes[] from every configured repository in `roots`, one root
+    // after another, in root order, which is the order derivedRepos has
+    // always had. Within a root each breadth-first wave is fetched at once;
+    // walking roots sequentially keeps that the only level of concurrency,
+    // so the fetch bound holds (and in practice few roots declare includes).
     //
     // Best-effort throughout. A derived node that fails to resolve is KEPT,
     // carrying its resolveError, so `repo list` can show why a catalog the
     // user expected is missing — dropping it here is what makes an include
     // look like it was never declared.
-    void rebuildDerived() {
-        derivedRepos.clear();
-        if (!followIncludes) return;
+    static IncludeWalk walkIncludes(Fetcher& f, const std::vector<Repository>& roots) {
+        IncludeWalk out;
+        for (const auto& root : roots) {
+            IncludeWalk w = walkRoot(f, root);
+            for (auto& d : w.derived) out.derived.push_back(std::move(d));
+            for (auto& x : w.warnings) out.warnings.push_back(std::move(x));
+        }
+        return out;
+    }
+
+    // Breadth-first per root, so the resulting order is exactly the merge
+    // precedence the catalog wants: includes[] in declared order, shallower
+    // before deeper. The walk proceeds in waves: every node queued so far is
+    // checked in queue order, the accepted ones are fetched at once, and only
+    // then are their own includes queued. A one-at-a-time BFS visits nodes in
+    // that same order, so the node cap, the depth cap, the cycle check and
+    // the resulting order are unchanged; only the waiting overlaps.
+    static IncludeWalk walkRoot(Fetcher& f, const Repository& root) {
+        IncludeWalk out;
+        if (!root.enabled || !root.resolveError.empty()) return out;
+        if (root.includes.empty()) return out;
 
         struct Pending {
             IncludeSpec spec;
@@ -957,26 +1055,25 @@ struct RepositoryRegistry::Impl {
             int depth;
             std::vector<std::string> ancestors;  // repo URLs on the path here
         };
+        auto warn = [&](const std::string& viaUrl, std::string text) {
+            out.warnings.push_back(IncludeWarning{root.url, viaUrl, std::move(text)});
+        };
 
-        for (auto& root : listLocked()) {
-            if (!root.enabled || !root.resolveError.empty()) continue;
-            if (root.includes.empty()) continue;
+        std::deque<Pending> queue;
+        for (const auto& spec : root.includes)
+            queue.push_back(Pending{spec, root.url, 1, {root.url}});
 
-            std::deque<Pending> queue;
-            for (const auto& spec : root.includes)
-                queue.push_back(Pending{spec, root.url, 1, {root.url}});
-
-            size_t nodes = 0;
-            bool cappedNodes = false;
+        size_t nodes = 0;
+        bool cappedNodes = false;
+        while (!queue.empty() && !cappedNodes) {
+            std::vector<Pending> accepted;
             while (!queue.empty()) {
+                if (nodes >= kMaxIncludeNodesPerRoot) { cappedNodes = true; break; }
                 Pending p = std::move(queue.front());
                 queue.pop_front();
-
-                if (nodes >= kMaxIncludeNodesPerRoot) { cappedNodes = true; break; }
                 if (p.depth > kMaxIncludeDepth) {
-                    noteIncludeWarning(root.url, p.viaUrl,
-                                       "include '" + p.spec.repoUrl + "' is deeper than " +
-                                       std::to_string(kMaxIncludeDepth) + " levels — not followed");
+                    warn(p.viaUrl, "include '" + p.spec.repoUrl + "' is deeper than " +
+                                   std::to_string(kMaxIncludeDepth) + " levels — not followed");
                     continue;
                 }
                 // Cycle check is per-PATH, not global: a diamond (two includes
@@ -984,13 +1081,18 @@ struct RepositoryRegistry::Impl {
                 // still resolve, while A -> B -> A must stop.
                 if (std::find(p.ancestors.begin(), p.ancestors.end(), p.spec.repoUrl)
                         != p.ancestors.end()) {
-                    noteIncludeWarning(root.url, p.viaUrl,
-                                       "include '" + p.spec.repoUrl +
-                                       "' would cycle back on itself — not followed");
+                    warn(p.viaUrl, "include '" + p.spec.repoUrl +
+                                   "' would cycle back on itself — not followed");
                     continue;
                 }
+                ++nodes;
+                accepted.push_back(std::move(p));
+            }
 
-                Repository d;
+            std::vector<Repository> wave(accepted.size());
+            for (size_t i = 0; i < accepted.size(); ++i) {
+                const Pending& p = accepted[i];
+                Repository& d = wave[i];
                 d.url         = p.spec.repoUrl;
                 d.enabled     = true;
                 d.isDerived   = true;
@@ -999,24 +1101,26 @@ struct RepositoryRegistry::Impl {
                 d.depth       = p.depth;
                 d.allPackages = p.spec.allPackages;
                 d.selectors   = p.spec.packages;
-                refreshOne(d);
-                ++nodes;
+            }
+            forEachConcurrently(wave.size(), [&](size_t i) { refreshOne(f, wave[i]); });
 
+            for (size_t i = 0; i < wave.size(); ++i) {
+                Repository& d = wave[i];
                 if (d.resolveError.empty()) {
-                    std::vector<std::string> ancestors = p.ancestors;
+                    std::vector<std::string> ancestors = accepted[i].ancestors;
                     ancestors.push_back(d.url);
                     for (const auto& spec : d.includes)
-                        queue.push_back(Pending{spec, d.url, p.depth + 1, ancestors});
+                        queue.push_back(Pending{spec, d.url, accepted[i].depth + 1, ancestors});
                 }
-                derivedRepos.push_back(std::move(d));
-            }
-            if (cappedNodes) {
-                noteIncludeWarning(root.url, root.url,
-                                   "include graph exceeds " +
-                                   std::to_string(kMaxIncludeNodesPerRoot) +
-                                   " catalogs — the rest was not followed");
+                out.derived.push_back(std::move(d));
             }
         }
+        if (cappedNodes) {
+            warn(root.url, "include graph exceeds " +
+                           std::to_string(kMaxIncludeNodesPerRoot) +
+                           " catalogs — the rest was not followed");
+        }
+        return out;
     }
 
     // Warnings are raised while walking, but the Repository they belong to is
@@ -1102,7 +1206,7 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
             return "already registered: " + url;
         Repository probe = impl_->defaultRepo;
         probe.enabled = true;
-        impl_->refreshOne(probe);
+        Impl::refreshOne(*impl_->fetcher, probe);
         if (!probe.resolveError.empty()) return probe.resolveError;
         impl_->defaultRepo     = std::move(probe);
         impl_->defaultRemoved  = false;
@@ -1118,7 +1222,7 @@ std::string RepositoryRegistry::addRepository(const std::string& url) {
     r.enabled = true;
     // Try to resolve metadata now so the caller learns about a bad URL
     // immediately instead of at first list time.
-    impl_->refreshOne(r);
+    Impl::refreshOne(*impl_->fetcher, r);
     if (!r.resolveError.empty()) return r.resolveError;
     impl_->userRepos.push_back(std::move(r));
     return impl_->save();
@@ -1157,21 +1261,60 @@ std::string RepositoryRegistry::setEnabled(const std::string& url, bool enabled)
 }
 
 std::string RepositoryRegistry::refresh() {
-    std::lock_guard<std::mutex> lock(impl_->mu);
+    // Snapshot the configured rows and the fetcher, fetch every repository at
+    // once with the mutex RELEASED, then merge the results back by URL.
+    // Holding the lock across one fetch after another meant a single slow
+    // host stalled list() and findByUrlOrName() for the sum of all fetch
+    // times. A row removed while
+    // the fetch ran is dropped; one added meanwhile was resolved by
+    // addRepository itself; an enabled flag toggled meanwhile wins over the
+    // stale snapshot.
+    std::vector<Repository> rows;
+    std::shared_ptr<Fetcher> fetcher;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        fetcher = impl_->fetcher;
+        if (!impl_->defaultRemoved) rows.push_back(impl_->defaultRepo);
+        for (const auto& r : impl_->userRepos) rows.push_back(r);
+    }
+    forEachConcurrently(rows.size(),
+                        [&](size_t i) { Impl::refreshOne(*fetcher, rows[i]); });
+
     std::vector<std::string> errs;
-    if (!impl_->defaultRemoved) {
-        impl_->refreshOne(impl_->defaultRepo);
-        if (!impl_->defaultRepo.resolveError.empty()) {
-            errs.push_back("default: " + impl_->defaultRepo.resolveError);
+    std::vector<Repository> roots;
+    bool followIncludes = true;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mu);
+        for (auto& fresh : rows) {
+            if (fresh.isDefault) {
+                if (impl_->defaultRemoved) continue;
+                impl_->defaultRepo = std::move(fresh);
+                if (!impl_->defaultRepo.resolveError.empty())
+                    errs.push_back("default: " + impl_->defaultRepo.resolveError);
+                continue;
+            }
+            auto it = std::find_if(impl_->userRepos.begin(), impl_->userRepos.end(),
+                                   [&](const Repository& r) { return r.url == fresh.url; });
+            if (it == impl_->userRepos.end()) continue;
+            fresh.enabled = it->enabled;
+            *it = std::move(fresh);
+            if (!it->resolveError.empty()) errs.push_back(it->url + ": " + it->resolveError);
         }
+        followIncludes = impl_->followIncludes;
+        // Only now: the walk starts from repositories that have just resolved,
+        // and refreshOne() is what populates their includes[].
+        roots = impl_->listLocked();
     }
-    for (auto& r : impl_->userRepos) {
-        impl_->refreshOne(r);
-        if (!r.resolveError.empty()) errs.push_back(r.url + ": " + r.resolveError);
-    }
-    // Only now: the walk starts from repositories that have just resolved,
-    // and refreshOne() is what populates their includes[].
-    impl_->rebuildDerived();
+
+    Impl::IncludeWalk walk;
+    if (followIncludes) walk = Impl::walkIncludes(*fetcher, roots);
+
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    // setFollowIncludes(false) while the walk ran discards what it found.
+    impl_->derivedRepos = impl_->followIncludes ? std::move(walk.derived)
+                                                : std::vector<Repository>{};
+    for (const auto& w : walk.warnings)
+        impl_->noteIncludeWarning(w.rootUrl, w.viaUrl, w.text);
     for (const auto& d : impl_->derivedRepos) {
         if (!d.resolveError.empty())
             errs.push_back(d.url + " (included via " + d.viaUrl + "): " + d.resolveError);
@@ -1257,13 +1400,15 @@ struct PackageDownloaderLib::Impl {
             return {};
         }
 
+        std::shared_ptr<Fetcher> f;
         {
             std::lock_guard<std::mutex> lock(mu);
             auto it = indexJsonByRepoUrl.find(r.url);
             if (it != indexJsonByRepoUrl.end()) return it->second;
+            f = fetcher;
         }
         std::string body;
-        FetchResult result = fetcher->get(r.indexUrl, body);
+        FetchResult result = f->get(r.indexUrl, body);
 
         if (!result.ok) {
             {
@@ -1280,6 +1425,52 @@ struct PackageDownloaderLib::Impl {
         indexJsonByRepoUrl[r.url] = body;
         if (failedIndexRepoUrls.erase(r.url)) ++catalogRevision;
         return body;
+    }
+
+    // One index as read for a single call: the body, or why it is missing.
+    struct IndexRead {
+        std::string body;
+        std::string err;
+    };
+    // repo url -> its index, for the call that read them.
+    using IndexReads = std::unordered_map<std::string, IndexRead>;
+
+    // Read the index of every repository in `repos` at once (cached ones are
+    // returned from the cache) and hand the results back to the caller. A
+    // catalog over N repositories then costs about the slowest index instead
+    // of the sum of all of them. The results belong to this call: a
+    // clearCaches() from a concurrent refresh cannot make them disappear
+    // between the fetch and the read. Callers pass exactly the repositories
+    // they are about to read; a URL listed twice (a diamond of includes) is
+    // read once.
+    IndexReads prefetchIndexes(const std::vector<Repository>& repos) {
+        std::vector<const Repository*> unique;
+        std::unordered_set<std::string> seen;
+        for (const auto& r : repos) {
+            if (seen.insert(r.url).second) unique.push_back(&r);
+        }
+        std::vector<IndexRead> out(unique.size());
+        forEachConcurrently(unique.size(), [&](size_t i) {
+            out[i].body = fetchIndex(*unique[i], &out[i].err);
+        });
+        IndexReads reads;
+        for (size_t i = 0; i < unique.size(); ++i)
+            reads.emplace(unique[i]->url, std::move(out[i]));
+        return reads;
+    }
+
+    // `r`'s index from `reads` when the caller prefetched it, else fetched
+    // (or served from the cache) as before.
+    std::string indexFor(const Repository& r, const IndexReads* reads,
+                         std::string* err = nullptr) {
+        if (reads) {
+            auto it = reads->find(r.url);
+            if (it != reads->end()) {
+                if (err) *err = it->second.err;
+                return it->second.body;
+            }
+        }
+        return fetchIndex(r, err);
     }
 
     void clearCaches() {
@@ -1511,13 +1702,14 @@ struct PackageDownloaderLib::Impl {
     json catalogForRoot(const Repository& root,
                         const std::vector<Repository>& all,
                         std::vector<std::string>* warnings,
-                        const std::string& storageNetwork = {}) {
+                        const std::string& storageNetwork = {},
+                        const IndexReads* reads = nullptr) {
         json entries = json::array();
-        appendCatalogEntries(root, root, fetchIndex(root), storageNetwork, entries);
+        appendCatalogEntries(root, root, indexFor(root, reads), storageNetwork, entries);
         for (const auto& d : all) {
             if (!d.isDerived || d.rootUrl != root.url) continue;
             if (!d.resolveError.empty()) continue;
-            appendCatalogEntries(d, root, fetchIndex(d), storageNetwork, entries);
+            appendCatalogEntries(d, root, indexFor(d, reads), storageNetwork, entries);
         }
         return mergeCatalogEntries(entries, warnings);
     }
@@ -1608,9 +1800,20 @@ std::string PackageDownloaderLib::listRepositoriesJson() {
     return repositoriesJson(impl_->registry).dump();
 }
 
+// The repositories whose indexes a full catalog build reads: enabled, with a
+// resolved logos-repo.json. Included catalogs only exist under such a root.
+static std::vector<Repository> catalogRepos(const std::vector<Repository>& all) {
+    std::vector<Repository> out;
+    for (const auto& r : all) {
+        if (r.enabled && r.resolveError.empty()) out.push_back(r);
+    }
+    return out;
+}
+
 std::string PackageDownloaderLib::getCatalogJson() {
     impl_->ensureMetadata();
     const auto all = impl_->registry.listAll();
+    const auto reads = impl_->prefetchIndexes(catalogRepos(all));
     const std::string storageNetwork = impl_->readStorageNetwork();
     json out = json::array();
     // Merge per configured repository, not across all of them: two repos
@@ -1621,7 +1824,7 @@ std::string PackageDownloaderLib::getCatalogJson() {
         if (r.isDerived) continue;
         if (!r.enabled) continue;
         if (!r.resolveError.empty()) continue;
-        for (auto& e : impl_->catalogForRoot(r, all, nullptr, storageNetwork))
+        for (auto& e : impl_->catalogForRoot(r, all, nullptr, storageNetwork, &reads))
             out.push_back(std::move(e));
     }
     return out.dump();
@@ -1646,7 +1849,13 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
     const std::string storageNetwork = impl_->readStorageNetwork();
     if (!repo->isDerived) {
         const auto all = impl_->registry.listAll();
-        return impl_->catalogForRoot(*repo, all, nullptr, storageNetwork).dump();
+        std::vector<Repository> scope{*repo};
+        for (const auto& d : all) {
+            if (d.isDerived && d.rootUrl == repo->url && d.resolveError.empty())
+                scope.push_back(d);
+        }
+        const auto reads = impl_->prefetchIndexes(scope);
+        return impl_->catalogForRoot(*repo, all, nullptr, storageNetwork, &reads).dump();
     }
     json out = json::array();
     impl_->appendCatalogEntries(*repo, *repo, impl_->fetchIndex(*repo), storageNetwork, out);
@@ -1675,12 +1884,14 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     // Then re-fetch the indexes themselves. refresh() above resolves only
     // logos-repo.json, so a catalog whose index.json was unreachable still
     // reported success here while every later browse quietly returned
-    // nothing. Not holding mu: fetchIndex takes it.
+    // nothing. All at once; the results are this call's own. Not holding
+    // mu: fetchIndex takes it.
     const auto all = impl_->registry.listAll();
+    const auto reads = impl_->prefetchIndexes(catalogRepos(all));
     for (const auto& r : all) {
         if (!r.enabled || !r.resolveError.empty()) continue;
         std::string err;
-        if (impl_->fetchIndex(r, &err).empty()) {
+        if (impl_->indexFor(r, &reads, &err).empty()) {
             out += r.url;
             if (r.isDerived) out += " (included via " + r.viaUrl + ")";
             out += ": " + (err.empty() ? "index unavailable" : err) + "\n";
@@ -1702,7 +1913,7 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     std::vector<std::string> warnings;
     for (const auto& r : all) {
         if (r.isDerived || !r.enabled || !r.resolveError.empty()) continue;
-        impl_->catalogForRoot(r, all, &warnings);
+        impl_->catalogForRoot(r, all, &warnings, {}, &reads);
     }
     for (const auto& w : warnings) out += w + "\n";
     return out;
@@ -2119,10 +2330,14 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
     std::string pickedVersionStr;
     std::string pickedDate;
 
+    // Every candidate's index at once; the loop below reads the results.
+    const auto reads = impl_->prefetchIndexes(candidates);
+    if (cancelled("")) return {};
+
     for (const auto& repo : candidates) {
         if (cancelled("")) return {};
         std::string fetchErr;
-        std::string body = impl_->fetchIndex(repo, &fetchErr);
+        std::string body = impl_->indexFor(repo, &reads, &fetchErr);
         if (cancelled("")) return {};
         if (body.empty()) {
             notes.push_back(repo.url + ": " +

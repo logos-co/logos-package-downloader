@@ -2,12 +2,19 @@
 #include "package_downloader_lib.h"
 #include "progress_throttle.h"   // private header; reachable via the lib's PUBLIC src/ include dir
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <cstdint>
+#include <thread>
 #include <cstdlib>
 #include <stdexcept>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <memory>
 #include <string>
@@ -27,7 +34,8 @@ class MockFetcher : public lgpd::Fetcher {
 public:
     std::string repoJson;   // served for the default repo URL
     std::string indexJson;  // served for kIndexUrl
-    std::vector<std::string> gets;      // URLs passed to get
+    std::vector<std::string> gets;      // URLs passed to get (guarded by getsMu)
+    std::mutex getsMu;                  // get() runs on several threads at once
     std::vector<std::string> fileGets;  // URLs passed to getToFile
     std::string lastDest;               // path passed to the last getToFile
     bool fileGetSucceeds = false;       // result returned by getToFile
@@ -41,7 +49,10 @@ public:
     }
 
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
-        gets.push_back(url);
+        {
+            std::lock_guard<std::mutex> lock(getsMu);
+            gets.push_back(url);
+        }
         auto it = byUrl.find(url);
         if (it != byUrl.end()) {
             out = it->second;
@@ -3759,4 +3770,303 @@ TEST(DownloadBinding, AFileIsThePackageAskedForWithNoManifestToCompare) {
     EXPECT_TRUE(path.empty()) << path;
     EXPECT_NE(err.find("downloaded package is not other_app (its manifest names fixture_app)"),
               std::string::npos) << err;
+}
+
+// ─── Concurrent fetching ─────────────────────────────────────────────────────
+//
+// One unreachable address behind a catalog host made every call into the
+// package_downloader module take minutes, because repositories were fetched
+// one after another and each stalled fetch waited out its own timeout
+// (logos-package-downloader-module#23). These tests pin that the fetches
+// overlap, and that one broken repository still neither hides the others nor
+// fails silently.
+namespace {
+
+// Serves a small multi-repo world from an in-memory map, and can be "armed"
+// to prove that the gets for a set of URLs overlap in time: every armed get()
+// blocks until `expected` armed gets are in flight together, giving up after
+// a bounded wait and counting a miss. Serial callers can never meet, so a
+// serial implementation turns every armed get into a miss.
+class WorldFetcher : public lgpd::Fetcher {
+public:
+    std::map<std::string, std::string> bodies;   // url -> body; absent = fails
+
+    void arm(std::function<bool(const std::string&)> match, int expected) {
+        std::lock_guard<std::mutex> lock(mu);
+        gate = std::move(match);
+        want = expected;
+        inFlight = 0;
+    }
+
+    int misses() const { return missCount.load(); }
+    int maxInFlight() const { return peak.load(); }
+
+    // Hold every get() this long, so overlapping calls are observable.
+    std::chrono::milliseconds delay{0};
+
+    bool canHandle(const std::string& url) const override {
+        return url.rfind("https://", 0) == 0;
+    }
+
+    lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        const int now = ++current;
+        for (int seen = peak.load(); now > seen && !peak.compare_exchange_weak(seen, now);) {}
+        struct Leave { std::atomic<int>& c; ~Leave() { --c; } } leave{current};
+        if (delay.count() > 0) std::this_thread::sleep_for(delay);
+        {
+            std::unique_lock<std::mutex> lock(mu);
+            if (gate && gate(url)) {
+                ++inFlight;
+                cv.notify_all();
+                const bool met = cv.wait_for(lock, std::chrono::seconds(2),
+                                             [&] { return inFlight >= want; });
+                if (!met) ++missCount;
+            }
+        }
+        auto it = bodies.find(url);
+        if (it == bodies.end()) return {false, "HTTP status 503"};
+        out = it->second;
+        return {true, {}};
+    }
+    lgpd::FetchResult getToFile(const std::string&, const std::string&) override {
+        return {false, "not served"};
+    }
+
+private:
+    std::mutex mu;
+    std::condition_variable cv;
+    std::function<bool(const std::string&)> gate;
+    int want = 0;
+    int inFlight = 0;
+    std::atomic<int> missCount{0};
+    std::atomic<int> current{0};
+    std::atomic<int> peak{0};
+};
+
+std::string worldRepoJson(const std::string& name, const std::string& indexUrl,
+                          const std::string& includesUrl = {}) {
+    json j{{"schemaVersion", 1}, {"name", name}, {"displayName", name},
+           {"indexUrl", indexUrl}, {"trustedSigners", json::array()}};
+    if (!includesUrl.empty()) j["includesUrl"] = includesUrl;
+    return j.dump();
+}
+
+std::string worldIndexWithOnePackage(const std::string& pkgName) {
+    const std::string hash = "h_" + pkgName;
+    json v = makeVersion("1.0.0", hash.c_str(), json::array());
+    v["manifest"]["name"] = pkgName;
+    return json{{"schemaVersion", 2}, {"repositoryName", pkgName},
+                {"packages", json::array({
+                    json{{"name", pkgName}, {"versions", json::array({v})}},
+                })}}.dump();
+}
+
+constexpr const char* kWorldRepoA  = "https://a.example/logos-repo.json";
+constexpr const char* kWorldRepoB  = "https://b.example/logos-repo.json";
+constexpr const char* kWorldIndexA = "https://a.example/index.json";
+constexpr const char* kWorldIndexB = "https://b.example/index.json";
+
+// Default repo + two user repos, each with its own index and one package.
+std::shared_ptr<WorldFetcher> threeRepoWorld() {
+    auto f = std::make_shared<WorldFetcher>();
+    f->bodies[lgpd::kDefaultRepositoryUrl] = worldRepoJson("official", kIndexUrl);
+    f->bodies[kIndexUrl]    = worldIndexWithOnePackage("pkg_official");
+    f->bodies[kWorldRepoA]  = worldRepoJson("a", kWorldIndexA);
+    f->bodies[kWorldIndexA] = worldIndexWithOnePackage("pkg_a");
+    f->bodies[kWorldRepoB]  = worldRepoJson("b", kWorldIndexB);
+    f->bodies[kWorldIndexB] = worldIndexWithOnePackage("pkg_b");
+    return f;
+}
+
+bool endsWith(const std::string& s, const char* suffix) {
+    const std::string suf(suffix);
+    return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+}
+
+std::vector<std::string> packageNames(const json& catalog) {
+    std::vector<std::string> out;
+    for (const auto& e : catalog) out.push_back(e.value("name", ""));
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Named after the running test: ctest runs each test in its own process, and
+// an unseeded std::rand() hands every one of them the same "random" name.
+fs::path concurrencyConfig() {
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    const fs::path p = fs::temp_directory_path() /
+                       (std::string("lgpd_test_conc_") + info->name() + ".json");
+    std::error_code ec;
+    fs::remove(p, ec);
+    return p;
+}
+
+}  // namespace
+
+TEST(Concurrency, RefreshFetchesEveryRepoAtOnce) {
+    const fs::path cfg = concurrencyConfig();
+    auto world = threeRepoWorld();
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(world);
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoA).empty());
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoB).empty());
+
+    // Three logos-repo.json fetches must be in flight together.
+    world->arm([](const std::string& u) { return endsWith(u, "logos-repo.json"); }, 3);
+    const std::string err = lib.registry().refresh();
+
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_EQ(world->misses(), 0) << "repo fetches did not overlap";
+    for (const auto& r : lib.registry().list()) {
+        EXPECT_TRUE(r.resolveError.empty()) << r.url << ": " << r.resolveError;
+        EXPECT_FALSE(r.indexUrl.empty()) << r.url;
+    }
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(Concurrency, CatalogFetchesEveryIndexAtOnce) {
+    const fs::path cfg = concurrencyConfig();
+    auto world = threeRepoWorld();
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(world);
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoA).empty());
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoB).empty());
+
+    // Three index.json fetches must be in flight together.
+    world->arm([](const std::string& u) { return endsWith(u, "index.json"); }, 3);
+    const json catalog = json::parse(lib.getCatalogJson());
+
+    EXPECT_EQ(world->misses(), 0) << "index fetches did not overlap";
+    EXPECT_EQ(packageNames(catalog),
+              (std::vector<std::string>{"pkg_a", "pkg_b", "pkg_official"}));
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(Concurrency, BrokenIndexIsIsolatedReportedAndRecovers) {
+    const fs::path cfg = concurrencyConfig();
+    auto world = threeRepoWorld();
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(world);
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoA).empty());
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoB).empty());
+
+    // b's logos-repo.json resolves but its index.json is down.
+    world->bodies.erase(kWorldIndexB);
+
+    // The other repos' packages are still served.
+    json catalog = json::parse(lib.getCatalogJson());
+    EXPECT_EQ(packageNames(catalog), (std::vector<std::string>{"pkg_a", "pkg_official"}));
+
+    // refreshCatalogs names the broken index, with the transport's reason,
+    // after fetching it once: the report is read back, not fetched again.
+    std::string summary = lib.refreshCatalogs();
+    EXPECT_NE(summary.find(kWorldRepoB), std::string::npos) << summary;
+    EXPECT_NE(summary.find("index fetch failed: " + std::string(kWorldIndexB)),
+              std::string::npos) << summary;
+    EXPECT_NE(summary.find("HTTP status 503"), std::string::npos) << summary;
+
+    // Once b's index is back, the next refresh is clean and the catalog is
+    // whole again: no stale failure sticks.
+    world->bodies[kWorldIndexB] = worldIndexWithOnePackage("pkg_b");
+    summary = lib.refreshCatalogs();
+    EXPECT_TRUE(summary.empty()) << summary;
+    catalog = json::parse(lib.getCatalogJson());
+    EXPECT_EQ(packageNames(catalog),
+              (std::vector<std::string>{"pkg_a", "pkg_b", "pkg_official"}));
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(Concurrency, BrokenRepoMetadataDoesNotHideTheOthers) {
+    const fs::path cfg = concurrencyConfig();
+    auto world = threeRepoWorld();
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(world);
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoA).empty());
+    ASSERT_TRUE(lib.registry().addRepository(kWorldRepoB).empty());
+
+    // b's logos-repo.json itself stops answering.
+    world->bodies.erase(kWorldRepoB);
+    const std::string summary = lib.refreshCatalogs();
+    EXPECT_NE(summary.find(kWorldRepoB), std::string::npos) << summary;
+
+    const json catalog = json::parse(lib.getCatalogJson());
+    EXPECT_EQ(packageNames(catalog), (std::vector<std::string>{"pkg_a", "pkg_official"}));
+    for (const auto& r : json::parse(lib.listRepositoriesJson())) {
+        const std::string url = r.value("url", "");
+        const std::string err = r.value("resolveError", "");
+        if (url == kWorldRepoB) EXPECT_FALSE(err.empty());
+        else EXPECT_TRUE(err.empty()) << url << ": " << err;
+    }
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(Concurrency, IncludedCatalogsAreFetchedAtOnceAndKeepTheirOrder) {
+    const fs::path cfg = concurrencyConfig();
+    constexpr const char* kIncludes = "https://test.local/includes.json";
+    auto world = std::make_shared<WorldFetcher>();
+    world->bodies[lgpd::kDefaultRepositoryUrl] =
+        worldRepoJson("official", kIndexUrl, kIncludes);
+    world->bodies[kIndexUrl] = worldIndexWithOnePackage("pkg_official");
+    world->bodies[kIncludes] =
+        json{{"schemaVersion", 1},
+             {"includes", json::array({json{{"repo", kWorldRepoA}},
+                                       json{{"repo", kWorldRepoB}}})}}.dump();
+    world->bodies[kWorldRepoA]  = worldRepoJson("a", kWorldIndexA);
+    world->bodies[kWorldIndexA] = worldIndexWithOnePackage("pkg_a");
+    world->bodies[kWorldRepoB]  = worldRepoJson("b", kWorldIndexB);
+    world->bodies[kWorldIndexB] = worldIndexWithOnePackage("pkg_b");
+
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(world);
+
+    // Both included catalogs' logos-repo.json must be in flight together.
+    world->arm([](const std::string& u) {
+        return u == kWorldRepoA || u == kWorldRepoB;
+    }, 2);
+    const std::string err = lib.registry().refresh();
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_EQ(world->misses(), 0) << "included catalogs were not fetched at once";
+
+    // The walk order, which is the merge precedence, is the declared one.
+    std::vector<std::string> derived;
+    for (const auto& r : lib.registry().listAll())
+        if (r.isDerived) derived.push_back(r.url);
+    EXPECT_EQ(derived, (std::vector<std::string>{kWorldRepoA, kWorldRepoB}));
+
+    const json catalog = json::parse(lib.getCatalogJson());
+    EXPECT_EQ(packageNames(catalog),
+              (std::vector<std::string>{"pkg_a", "pkg_b", "pkg_official"}));
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(Concurrency, AtMostEightFetchesRunAtOnce) {
+    // Many repositories (as includes can produce) must not mean as many
+    // threads and connections: the fetches overlap, but at most eight at a
+    // time, and every repository still resolves.
+    const fs::path cfg = concurrencyConfig();
+    auto world = std::make_shared<WorldFetcher>();
+    world->bodies[lgpd::kDefaultRepositoryUrl] = worldRepoJson("official", kIndexUrl);
+    world->bodies[kIndexUrl] = worldIndexWithOnePackage("pkg_official");
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(world);
+    std::vector<std::string> urls;
+    for (int i = 0; i < 20; ++i) {
+        const std::string host = "https://r" + std::to_string(i) + ".example/";
+        world->bodies[host + "logos-repo.json"] =
+            worldRepoJson("r" + std::to_string(i), host + "index.json");
+        world->bodies[host + "index.json"] =
+            worldIndexWithOnePackage("pkg_r" + std::to_string(i));
+        ASSERT_TRUE(lib.registry().addRepository(host + "logos-repo.json").empty());
+    }
+
+    world->delay = std::chrono::milliseconds(20);
+    const std::string err = lib.registry().refresh();
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_LE(world->maxInFlight(), 8);
+    EXPECT_GE(world->maxInFlight(), 2) << "fetches did not overlap";
+
+    const json catalog = json::parse(lib.getCatalogJson());
+    EXPECT_EQ(catalog.size(), 21u);
+    EXPECT_LE(world->maxInFlight(), 8);
+    std::error_code ec; fs::remove(cfg, ec);
 }

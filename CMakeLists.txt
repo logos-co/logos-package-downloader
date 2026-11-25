@@ -19,6 +19,10 @@ endif()
 # Find libcurl
 find_package(CURL REQUIRED)
 
+# std::thread: repository metadata and index fetches run one thread per
+# repository.
+find_package(Threads REQUIRED)
+
 # Find lgx library (logos-package). Used post-download to verify a
 # fetched .lgx against the catalog entry — see verifyDownloadAgainstIndex
 # in package_downloader_lib.cpp.
@@ -78,6 +82,7 @@ target_include_directories(package_downloader_lib PRIVATE
 target_link_libraries(package_downloader_lib PRIVATE
     nlohmann_json::nlohmann_json
     CURL::libcurl
+    Threads::Threads
     ${LGX_LIB}
 )
 

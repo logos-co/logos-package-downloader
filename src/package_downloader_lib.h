@@ -52,6 +52,11 @@ using TransportFn = std::function<void(const std::string& transport)>;
 
 /// Minimal HTTP(S) fetcher abstraction. The concrete implementation in the
 /// .cpp uses libcurl. Tests can inject their own implementation.
+///
+/// Thread-safety: the registry refresh and the catalog build call `get()`
+/// for several repositories at once (up to 8), from different threads, on
+/// ONE shared instance. Implementations must tolerate concurrent `get()`
+/// calls.
 class Fetcher {
 public:
     virtual ~Fetcher() = default;
@@ -63,6 +68,7 @@ public:
     virtual std::string network() const { return {}; }
 
     /// HTTP GET. Succeeds on 2xx with the response body in `out`.
+    /// May be called concurrently from several threads.
     virtual FetchResult get(const std::string& url, std::string& out) = 0;
 
     /// HTTP GET to a file. Succeeds on 2xx after writing all bytes.
@@ -261,10 +267,16 @@ public:
     std::string setEnabled(const std::string& url, bool enabled);
 
     /// Re-fetch `logos-repo.json` for every enabled repo (skips a disabled
-    /// default). After calling, `list()` returns entries with resolved
-    /// metadata fields populated. Returns an empty string on overall
-    /// success or a summary of fetch errors (the registry is best-effort:
-    /// failures are recorded per-entry in `resolveError` but do not abort).
+    /// default), then walk their includes. Repositories are fetched
+    /// concurrently (a bounded number at a time) with the registry unlocked,
+    /// so the call costs about the slowest fetch per batch rather than the
+    /// sum, and the registry's own readers (`list()`, `findByUrlOrName()`)
+    /// stay responsive meanwhile. `PackageDownloaderLib` still holds its own
+    /// lock across the first refresh it triggers (see ensureMetadata), so
+    /// other library calls wait for that one. After calling, `list()`
+    /// returns entries with resolved metadata fields populated. Returns an empty string on overall success or a summary of
+    /// fetch errors (the registry is best-effort: failures are recorded
+    /// per-entry in `resolveError` but do not abort).
     std::string refresh();
 
     /// Look up a repo by URL or by canonical name. Returns nullopt if no
@@ -350,8 +362,9 @@ public:
     /// Same shape as `getCatalogJson()` filtered to one source.
     std::string getCatalogForRepoJson(const std::string& urlOrName);
 
-    /// Force re-fetch of every enabled repo's `index.json`. Returns an
-    /// empty string on success or a summary of errors.
+    /// Force re-fetch of every enabled repo's `logos-repo.json` and
+    /// `index.json` (all repositories at once). Returns an empty string on
+    /// success or a summary of errors, one line per failed repo.
     std::string refreshCatalogs();
 
     /// A counter for callers that keep a copy of the catalog: when it

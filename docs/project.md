@@ -437,6 +437,12 @@ The test suite (`tests/test_downloader.cpp`, GoogleTest via CTest) covers:
 | `Registry.AddDefaultWhileDisabledClearsDisabledFlag` | `addRepository(default)` while the default is disabled (but not removed) flips it back to `enabled=true`. |
 | `Registry.RefreshSkipsDisabledAndRemovedDefault` | `refresh()` does not fetch (or error on) a disabled or removed default. |
 | `Catalog.ReturnsJsonArrayWhenNoNetwork` | `getCatalogJson()` parses to a JSON array even with no network (lazy fetch degrades to empty). |
+| `Concurrency.RefreshFetchesEveryRepoAtOnce` | `refresh()` fetches every configured repo's `logos-repo.json` at once (a rendezvous fetcher proves the gets overlap). |
+| `Concurrency.CatalogFetchesEveryIndexAtOnce` | `getCatalogJson()` fetches every `index.json` at once and merges every repo's packages. |
+| `Concurrency.BrokenIndexIsIsolatedReportedAndRecovers` | A repo whose `index.json` is down drops out of the catalog alone, is named with the transport's reason by `refreshCatalogs()`, and is back once the index answers again. |
+| `Concurrency.BrokenRepoMetadataDoesNotHideTheOthers` | A repo whose `logos-repo.json` is down is reported; the other repos' packages are still served. |
+| `Concurrency.IncludedCatalogsAreFetchedAtOnceAndKeepTheirOrder` | The include walk fetches sibling catalogs at once and keeps the declared order, which is the merge precedence. |
+| `Concurrency.AtMostEightFetchesRunAtOnce` | With twenty repositories, fetches overlap but never more than eight run at once, and every repository resolves. |
 | `FetchSelection.StorageCidIsPreferredOverTheHttpsMirror` | Logos Storage is used when it can download the package. |
 | `FetchSelection.StorageCidIsPreferredWhenListedAfterTheHttpsMirror` | Logos Storage is used first, whatever the order in `urls`. |
 | `FetchSelection.HttpsTakesOverWhenTheStorageDownloadFails` | https is used when Logos Storage fails. |
