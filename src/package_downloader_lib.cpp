@@ -720,6 +720,14 @@ bool parseLogosRepoJson(const std::string& body, Repository& dst, std::string& e
         dst.includes.clear();
         dst.includeWarnings.clear();
         dst.includesUrl.clear();
+        dst.indexUrls.clear();
+        if (j.contains("indexUrls") && j["indexUrls"].is_array()) {
+            for (const auto& u : j["indexUrls"]) {
+                if (u.is_string()) {
+                    dst.indexUrls.push_back(u.get<std::string>());
+                }
+            }
+        }
         if (j.contains("includesUrl")) {
             // Checked before value(): a non-string here would throw out of the
             // whole parse and drop a repository that is otherwise fine.
@@ -893,6 +901,7 @@ struct RepositoryRegistry::Impl {
         parsed.description.clear();
         parsed.homepage.clear();
         parsed.indexUrl.clear();
+        parsed.indexUrls.clear();
         parsed.includesUrl.clear();
         parsed.trustedSignerDids.clear();
         if (!parseLogosRepoJson(body, parsed, err)) {
@@ -1262,17 +1271,87 @@ struct PackageDownloaderLib::Impl {
             auto it = indexJsonByRepoUrl.find(r.url);
             if (it != indexJsonByRepoUrl.end()) return it->second;
         }
-        std::string body;
-        FetchResult result = fetcher->get(r.indexUrl, body);
+        std::shared_ptr<Fetcher> storage;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            storage = storageFetcher;
+        }
 
-        if (!result.ok) {
+        // Like a package download: keep the storage url
+        // and the http url as a fallback.
+        std::string storageUrl;
+        std::string httpsUrl = r.indexUrl;
+        for (const auto& u : r.indexUrls) {
+            if (storage && storage->canHandle(u)) {
+                storageUrl = u;
+            } else if (fetcher->canHandle(u)) {
+                httpsUrl = u;
+            }
+        }
+
+        // A repository without indexUrls has no storage address: its index
+        // comes from indexUrl over HTTP, whatever the source.
+        const DownloadSource source =
+            r.indexUrls.empty() ? DownloadSource::Http : registry.downloadSource();
+
+        // If source is logos only, we can remove the storage url.
+        if (source == DownloadSource::Http) {
+            storageUrl.clear();
+        }
+
+        // If source is logos only, we can remove the http fallback.
+        if (source == DownloadSource::Logos) {
+            httpsUrl.clear();
+        }
+
+        // If source is logos only, we can return early.
+        if (source == DownloadSource::Logos && storageUrl.empty()) {
             {
                 std::lock_guard<std::mutex> lock(mu);
                 failedIndexRepoUrls.insert(r.url);
             }
-            if (err)
-                *err = "index fetch failed: " + r.indexUrl +
-                       (result.error.empty() ? "" : " - " + result.error);
+
+            if (err) {
+                *err = "index fetch failed: storage url is empty (download source: logos)";
+            }
+
+            return {};
+        }
+
+        // Logos Storage first, then HTTP.
+        std::string body;
+        std::string error;
+        bool fetched = false;
+
+        if (!storageUrl.empty()) {
+            const FetchResult result = storage->get(storageUrl, body);
+            fetched = result.ok;
+            if (!fetched) {
+                error = storageUrl + " - " + result.error;
+            }
+        }
+
+        if (!fetched && !httpsUrl.empty()) {
+            body.clear();
+            const FetchResult result = fetcher->get(httpsUrl, body);
+            fetched = result.ok;
+            if (!fetched) {
+                if (!error.empty()) {
+                    error += "; ";
+                }
+
+                error += httpsUrl + (result.error.empty() ? "" : " - " + result.error);
+            }
+        }
+
+        if (!fetched) {
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                failedIndexRepoUrls.insert(r.url);
+            }
+            if (err) {
+                *err = "index fetch failed: " + error;
+            }
             return {};
         }
 

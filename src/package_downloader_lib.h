@@ -134,6 +134,10 @@ struct Repository {
     std::string description;
     std::string homepage;
     std::string indexUrl;
+    /// `indexUrls` from logos-repo.json: the addresses of the index, each one
+    /// `logos:<network>:<key>` or an HTTP URL. When it has no HTTP URL, the
+    /// client uses `indexUrl` as the HTTP address.
+    std::vector<std::string> indexUrls;
     /// `trustedSigners[].did` as ADVERTISED by the repository's own
     /// logos-repo.json. ADVISORY ONLY — parsed, stored, and echoed back in
     /// listRepositoriesJson(); consulted by nothing, deliberately.

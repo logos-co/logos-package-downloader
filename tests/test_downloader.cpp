@@ -3760,3 +3760,126 @@ TEST(DownloadBinding, AFileIsThePackageAskedForWithNoManifestToCompare) {
     EXPECT_NE(err.find("downloaded package is not other_app (its manifest names fixture_app)"),
               std::string::npos) << err;
 }
+
+// ─── Index addresses ──────────────────────────────────────────────────────────
+//
+// `logos-repo.json#indexUrls` gives a storage address and an HTTP address of
+// the index. The download source picks them (docs/index-addresses.md).
+
+namespace {
+
+constexpr const char* kIndexLogos = "logos:testnet:K";
+constexpr const char* kIndexHttp = "https://a/index.json";
+
+// A storage node on `testnet`. It serves `index`. When `index` is empty, it
+// fails like a name with no record.
+class IndexStorageFetcher : public lgpd::Fetcher {
+public:
+    std::string index;
+    int gets = 0;
+
+    bool canHandle(const std::string& url) const override {
+        return url.rfind("logos:testnet:", 0) == 0;
+    }
+
+    std::string network() const override { return "testnet"; }
+
+    lgpd::FetchResult get(const std::string&, std::string& out) override {
+        ++gets;
+        if (index.empty()) {
+            return {false, "no name record"};
+        }
+
+        out = index;
+        return {true, {}};
+    }
+
+    lgpd::FetchResult getToFile(const std::string&, const std::string&) override {
+        return {false, "not used"};
+    }
+};
+
+std::string indexBody(const char* package) {
+    return json{{"schemaVersion", 2}, {"repositoryName", "test"},
+                {"packages", onePackage(package, "1.0.0")}}.dump();
+}
+
+// The default repository, with `indexUrls` = [logos, https] unless `withIndexUrls`
+// is false. Both addresses and `indexUrl` serve their own package.
+void setUpIndexLib(lgpd::PackageDownloaderLib& lib, std::shared_ptr<IndexStorageFetcher> storage,
+                   lgpd::DownloadSource source, bool withIndexUrls = true) {
+    auto http = std::make_shared<MockFetcher>();
+    json repo = {{"schemaVersion", 1}, {"name", "test"}, {"displayName", "Test"},
+                 {"indexUrl", kIndexUrl}, {"trustedSigners", json::array()}};
+    if (withIndexUrls) {
+        repo["indexUrls"] = json::array({kIndexLogos, kIndexHttp});
+    }
+
+    http->repoJson = repo.dump();
+    http->indexJson = indexBody("index_url_module");
+    http->byUrl[kIndexHttp] = indexBody("http_module");
+
+    lib.setFetcher(http);
+    lib.setStorageFetcher(storage);
+    lib.registry().setDownloadSource(source);
+}
+
+bool catalogHas(lgpd::PackageDownloaderLib& lib, const char* package) {
+    return lib.getCatalogJson().find(package) != std::string::npos;
+}
+
+}  // namespace
+
+TEST(IndexAddresses, AnyPrefersLogosStorage) {
+    auto storage = std::make_shared<IndexStorageFetcher>();
+    storage->index = indexBody("storage_module");
+    lgpd::PackageDownloaderLib lib;
+    setUpIndexLib(lib, storage, lgpd::DownloadSource::Any);
+
+    EXPECT_EQ(lib.refreshCatalogs(), "");
+    EXPECT_TRUE(catalogHas(lib, "storage_module"));
+    EXPECT_FALSE(catalogHas(lib, "http_module"));
+}
+
+TEST(IndexAddresses, AnyFallsBackToHttpWhenTheNameDoesNotResolve) {
+    auto storage = std::make_shared<IndexStorageFetcher>();
+    lgpd::PackageDownloaderLib lib;
+    setUpIndexLib(lib, storage, lgpd::DownloadSource::Any);
+
+    EXPECT_EQ(lib.refreshCatalogs(), "");
+    EXPECT_EQ(storage->gets, 1);
+    EXPECT_TRUE(catalogHas(lib, "http_module"));
+}
+
+TEST(IndexAddresses, LogosNeverUsesHttpAndSaysWhichAddressFailed) {
+    auto storage = std::make_shared<IndexStorageFetcher>();
+    lgpd::PackageDownloaderLib lib;
+    setUpIndexLib(lib, storage, lgpd::DownloadSource::Logos);
+
+    const std::string errs = lib.refreshCatalogs();
+    EXPECT_NE(errs.find("logos:testnet:K - no name record"), std::string::npos) << errs;
+    EXPECT_FALSE(catalogHas(lib, "http_module"));
+}
+
+TEST(IndexAddresses, HttpNeverAsksTheStorageNode) {
+    auto storage = std::make_shared<IndexStorageFetcher>();
+    storage->index = indexBody("storage_module");
+    lgpd::PackageDownloaderLib lib;
+    setUpIndexLib(lib, storage, lgpd::DownloadSource::Http);
+
+    EXPECT_EQ(lib.refreshCatalogs(), "");
+    EXPECT_EQ(storage->gets, 0);
+    EXPECT_TRUE(catalogHas(lib, "http_module"));
+}
+
+TEST(IndexAddresses, WithoutIndexUrlsTheIndexComesFromIndexUrl) {
+    for (auto source : {lgpd::DownloadSource::Any, lgpd::DownloadSource::Logos,
+                        lgpd::DownloadSource::Http}) {
+        auto storage = std::make_shared<IndexStorageFetcher>();
+        lgpd::PackageDownloaderLib lib;
+        setUpIndexLib(lib, storage, source, false);
+
+        EXPECT_EQ(lib.refreshCatalogs(), "") << lgpd::downloadSourceName(source);
+        EXPECT_TRUE(catalogHas(lib, "index_url_module")) << lgpd::downloadSourceName(source);
+    }
+}
