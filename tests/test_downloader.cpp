@@ -3777,8 +3777,10 @@ class IndexStorageFetcher : public lgpd::Fetcher {
 public:
     std::string index;
     int gets = 0;
+    mutable int canHandles = 0;
 
     bool canHandle(const std::string& url) const override {
+        ++canHandles;
         return url.rfind("logos:testnet:", 0) == 0;
     }
 
@@ -3861,6 +3863,15 @@ TEST(IndexAddresses, LogosNeverUsesHttpAndSaysWhichAddressFailed) {
     EXPECT_FALSE(catalogHas(lib, "http_module"));
 }
 
+TEST(IndexAddresses, LogosWithoutAStorageAddressFails) {
+    lgpd::PackageDownloaderLib lib;
+    setUpIndexLib(lib, nullptr, lgpd::DownloadSource::Logos);
+
+    const std::string errs = lib.refreshCatalogs();
+    EXPECT_NE(errs.find("storage url is empty"), std::string::npos) << errs;
+    EXPECT_FALSE(catalogHas(lib, "http_module"));
+}
+
 TEST(IndexAddresses, HttpNeverAsksTheStorageNode) {
     auto storage = std::make_shared<IndexStorageFetcher>();
     storage->index = indexBody("storage_module");
@@ -3869,6 +3880,7 @@ TEST(IndexAddresses, HttpNeverAsksTheStorageNode) {
 
     EXPECT_EQ(lib.refreshCatalogs(), "");
     EXPECT_EQ(storage->gets, 0);
+    EXPECT_EQ(storage->canHandles, 0);
     EXPECT_TRUE(catalogHas(lib, "http_module"));
 }
 

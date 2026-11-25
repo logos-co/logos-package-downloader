@@ -1277,26 +1277,22 @@ struct PackageDownloaderLib::Impl {
             storage = storageFetcher;
         }
 
-        // Like a package download: keep the storage url
-        // and the http url as a fallback.
-        std::string storageUrl;
-        std::string httpsUrl = r.indexUrl;
-        for (const auto& u : r.indexUrls) {
-            if (storage && storage->canHandle(u)) {
-                storageUrl = u;
-            } else if (fetcher->canHandle(u)) {
-                httpsUrl = u;
-            }
-        }
-
         // A repository without indexUrls has no storage address: its index
         // comes from indexUrl over HTTP, whatever the source.
         const DownloadSource source =
             r.indexUrls.empty() ? DownloadSource::Http : registry.downloadSource();
 
-        // If source is logos only, we can remove the storage url.
-        if (source == DownloadSource::Http) {
-            storageUrl.clear();
+        // Like a package download: keep the storage url
+        // and the http url as a fallback.
+        // If source is http only, the storage node is not asked.
+        std::string storageUrl;
+        std::string httpsUrl = r.indexUrl;
+        for (const auto& u : r.indexUrls) {
+            if (source != DownloadSource::Http && storage && storage->canHandle(u)) {
+                storageUrl = u;
+            } else if (fetcher->canHandle(u)) {
+                httpsUrl = u;
+            }
         }
 
         // If source is logos only, we can remove the http fallback.
@@ -1327,7 +1323,7 @@ struct PackageDownloaderLib::Impl {
             const FetchResult result = storage->get(storageUrl, body);
             fetched = result.ok;
             if (!fetched) {
-                error = storageUrl + " - " + result.error;
+                error = storageUrl + (result.error.empty() ? "" : " - " + result.error);
             }
         }
 
